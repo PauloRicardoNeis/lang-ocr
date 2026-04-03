@@ -1,0 +1,16 @@
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+JP/data/*
+!JP/data/.gitkeep
+
+JP/exports/*
+!JP/exports/.gitkeep
+
+JP/desktop_capture_daemon/target/
+JP/desktop_capture_daemon/capture_daemon.toml

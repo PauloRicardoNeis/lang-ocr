@@ -1,0 +1,8 @@
+paddleocr
+paddlepaddle
+Pillow
+SudachiPy
+sudachidict_core
+manga-ocr
+opencv-python-headless
+easyocr
