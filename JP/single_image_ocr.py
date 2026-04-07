@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
+from ocr_backends import OCR_BACKEND_CHOICES, build_ocr_backend, filter_japanese_lines
 
 
 ROOT = Path(__file__).resolve().parent
@@ -56,81 +56,6 @@ class SingleImageOcrResult:
     @property
     def raw_text(self) -> str:
         return "\n\n".join(region.text for region in self.regions if region.text)
-
-
-class MangaOcrBackend:
-    name = "manga_ocr"
-
-    def __init__(self) -> None:
-        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-        try:
-            from manga_ocr import MangaOcr
-        except ImportError as exc:
-            raise SystemExit(
-                "Missing dependency `manga-ocr`. Install it in the Python 3.12 environment "
-                "before using single_image_ocr.py."
-            ) from exc
-
-        self._engine = MangaOcr()
-
-    def recognize(self, crop: Image.Image) -> str:
-        text = self._engine(crop)
-        return normalize_output_text(text)
-
-
-class EasyOcrBackend:
-    name = "easyocr"
-
-    def __init__(self) -> None:
-        os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-        try:
-            import easyocr
-        except ImportError as exc:
-            raise SystemExit(
-                "Missing dependency `easyocr`. Install it in the Python 3.12 environment "
-                "before using single_image_ocr.py with `--backend easyocr`."
-            ) from exc
-
-        self._reader = easyocr.Reader(["ja", "en"], gpu=False)
-
-    def recognize(self, crop: Image.Image) -> str:
-        lines = self._reader.readtext(np.array(crop), detail=0, paragraph=False)
-        return normalize_output_text("\n".join(str(line) for line in lines if str(line).strip()))
-
-
-def normalize_output_text(value: str | None) -> str:
-    if not value:
-        return ""
-    text = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
-    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-    return text
-
-
-def contains_japanese_chars(value: str) -> bool:
-    for char in value:
-        codepoint = ord(char)
-        if 0x3040 <= codepoint <= 0x309F:
-            return True
-        if 0x30A0 <= codepoint <= 0x30FF:
-            return True
-        if 0x4E00 <= codepoint <= 0x9FFF:
-            return True
-    return False
-
-
-def filter_japanese_lines(value: str) -> str:
-    lines = [line.strip() for line in value.splitlines() if line.strip()]
-    kept = [line for line in lines if contains_japanese_chars(line)]
-    return normalize_output_text("\n".join(kept))
-
-
-def build_backend(name: str) -> MangaOcrBackend | EasyOcrBackend:
-    if name == "manga_ocr":
-        return MangaOcrBackend()
-    if name == "easyocr":
-        return EasyOcrBackend()
-    raise SystemExit(f"Unsupported backend: {name}")
 
 
 def parse_roi(value: str, index: int) -> OcrRegion:
@@ -221,7 +146,7 @@ def annotate_debug_image(image: Image.Image, regions: list[RecognizedRegion]) ->
 
 
 def run_single_image_ocr(args: argparse.Namespace) -> SingleImageOcrResult:
-    backend = build_backend(args.backend)
+    backend = build_ocr_backend(args.backend)
     image = Image.open(args.image).convert("RGB")
     regions = load_regions(args, image)
     print(f"Using backend={backend.name} region_mode={args.region_mode} regions={len(regions)}")
@@ -297,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", type=Path, required=True, help="Absolute path to the image to OCR.")
     parser.add_argument(
         "--backend",
-        choices=["manga_ocr", "easyocr"],
+        choices=list(OCR_BACKEND_CHOICES),
         default="manga_ocr",
         help="OCR backend to use.",
     )

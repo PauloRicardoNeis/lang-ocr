@@ -28,12 +28,14 @@ python .\lang_jp.py rebuild-stats
 ```
 
 For a shorter Windows entry point, run `..\open_jp_catalog.cmd` from the repository root.
+For the passive-capture tray, run `..\open_jp_capture_tray.cmd` from the repository root. The launcher reuses an existing compiled daemon when available and otherwise builds `desktop_capture_daemon.exe` once before starting it.
+To follow the capture log live in a console window, run `..\open_jp_capture_logs.cmd` from the repository root.
 
 ## Passive capture workflow
 1. Prepare a dedicated Python 3.12 environment for the capture worker and install `requirements-capture.txt`.
-2. Start the Rust tray daemon from `desktop_capture_daemon` with `cargo run`.
-3. The daemon captures the primary monitor on interval, dedupes recent frames, writes spool PNGs, and enqueues `capture_jobs`.
-4. The Python worker consumes those jobs, runs OCR + Japanese draft analysis, and creates pending `sources`.
+2. Start the Rust tray daemon with `..\open_jp_capture_tray.cmd` from the repository root, or run `cargo run` inside `desktop_capture_daemon` if you want to launch it manually from a shell.
+3. The daemon captures the primary monitor either on a fixed interval or in an `after source ready` cadence, dedupes recent frames, writes spool PNGs, and enqueues `capture_jobs`.
+4. The Python worker consumes those jobs, runs `EasyOCR` with horizontal-box filtering + Japanese draft analysis, and creates pending `sources`.
 5. Review drafts with:
    - `python .\lang_jp.py review-sources`
    - `python .\lang_jp.py review-source --source-id N`
@@ -41,6 +43,13 @@ For a shorter Windows entry point, run `..\open_jp_catalog.cmd` from the reposit
    - `python .\lang_jp.py ignore-source --source-id N`
 
 The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example`.
+
+The tray menu now exposes both capture cadences:
+- `Cadence: Fixed interval`: uses the selected capture interval as before.
+- `Cadence: After source ready`: waits until the current capture job finishes turning into a source before taking the next screenshot. This mode works best with `auto_start_worker = false` and `auto_process_jobs = true`.
+- `manual_capture_hotkey` in `desktop_capture_daemon\capture_daemon.toml`: binds a global shortcut to the same `Capture now` action in the tray. Example: `Ctrl+Shift+F8`.
+
+At the moment, the automatic worker is optimized for normal horizontal text in screenshots. It is not tuned for manga-style vertical text.
 
 ## Single-image OCR
 For a working one-image-at-a-time OCR path, use `single_image_ocr.py`.

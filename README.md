@@ -51,6 +51,9 @@ O projeto nao e apenas um OCR nem apenas um gerador de flashcards. Ele funciona 
 
 - `README.md`: visao geral do projeto.
 - `AGENTS.md`: convencoes operacionais para agentes.
+- `open_jp_catalog.cmd`: atalho Windows para abrir a interface web local.
+- `open_jp_capture_tray.cmd`: atalho Windows para abrir o tray de captura passiva.
+- `open_jp_capture_logs.cmd`: atalho Windows para acompanhar o log de captura em tempo real.
 - `JP/README.md`: detalhes do catalogo JP, comandos e fluxo de uso.
 - `JP/ocr_capture_spec.md`: especificacao do pipeline de captura automatizada.
 - `JP/ocr_capture_review.md`: anotacoes de revisao do fluxo de OCR/captura.

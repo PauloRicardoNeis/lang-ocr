@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS sources (
     notes TEXT,
     captured_at TEXT,
     image_sha256 TEXT,
+    image_width INTEGER,
+    image_height INTEGER,
     ocr_text_hash TEXT,
     capture_job_id INTEGER REFERENCES capture_jobs(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -191,6 +193,28 @@ CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_segment_id
 
 CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_approval_status
     ON source_analysis_candidates(approval_status);
+
+CREATE TABLE IF NOT EXISTS source_translations (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    source_text_hash TEXT,
+    target_language TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'translated', 'failed', 'reviewed')
+    ),
+    translated_text TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_id, target_language, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_translations_source_id
+    ON source_translations(source_id);
+
+CREATE INDEX IF NOT EXISTS idx_source_translations_target_language
+    ON source_translations(target_language);
 
 CREATE TABLE IF NOT EXISTS term_stats (
     term_id INTEGER PRIMARY KEY REFERENCES terms(id) ON DELETE CASCADE,

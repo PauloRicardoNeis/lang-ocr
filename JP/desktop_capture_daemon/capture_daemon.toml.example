@@ -1,7 +1,22 @@
 interval_seconds = 60
+capture_after_source_ready = false
+manual_capture_hotkey = "Alt+Q"
+ocr_max_side = 1600
 dedupe_window = 12
+perceptual_dedupe_enabled = false
 phash_distance_threshold = 6
 auto_start_worker = false
+auto_process_jobs = true
+
+# When capture_after_source_ready = true, the daemon waits until the current
+# OCR/source pipeline is idle before taking the next capture. This works best
+# with auto_start_worker = false and auto_process_jobs = true.
+# manual_capture_hotkey is a global shortcut for "Capture now". Supported keys
+# include A-Z, 0-9, F1-F24, arrows, Insert/Delete/Home/End/PageUp/PageDown,
+# Space, Tab, Enter, Escape, Backspace, and PrintScreen.
+# perceptual_dedupe_enabled compares each new frame with the recent capture
+# window using pHash. Leave it off unless you explicitly want to discard
+# visually similar frames, since small but important UI changes can be skipped.
 
 # Optional overrides. If omitted, the daemon uses the repository-local defaults
 # under JP/data and launches the Python 3.12 worker from JP/capture_worker.py.

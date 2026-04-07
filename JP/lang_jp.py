@@ -5,14 +5,17 @@ import csv
 import hashlib
 import html
 import json
+import os
 import re
 import sqlite3
 import sys
+import unicodedata
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 from urllib.error import URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -26,6 +29,16 @@ DEFAULT_UI_PORT = 8766
 DEFAULT_ANKI_CONNECT_HOST = "127.0.0.1"
 DEFAULT_ANKI_CONNECT_PORT = 8765
 ANKI_CONNECT_VERSION = 6
+DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = (
+    os.environ.get("LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS", "1") != "0"
+)
+DEFAULT_TERM_TRANSLATION_TARGET = os.environ.get(
+    "LANG_JP_TERM_TRANSLATION_TARGET",
+    "pt",
+)
+DEFAULT_TERM_TRANSLATION_TIMEOUT_SECONDS = float(
+    os.environ.get("LANG_JP_TERM_TRANSLATION_TIMEOUT_SECONDS", "10")
+)
 KANJI_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kanji (
     id INTEGER PRIMARY KEY,
@@ -237,6 +250,30 @@ CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_approval_status
     ON source_analysis_candidates(approval_status);
 """
 
+SOURCE_TRANSLATION_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS source_translations (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    source_text_hash TEXT,
+    target_language TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'translated', 'failed', 'reviewed')
+    ),
+    translated_text TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_id, target_language, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_translations_source_id
+    ON source_translations(source_id);
+
+CREATE INDEX IF NOT EXISTS idx_source_translations_target_language
+    ON source_translations(target_language);
+"""
+
 TERM_VIEW_SQL = """
 DROP VIEW IF EXISTS v_terms_overview;
 
@@ -290,6 +327,121 @@ def normalize_token(value: str | None) -> str:
     if not value:
         return ""
     return " ".join(value.strip().split())
+
+
+BLACKLISTED_SINGLE_SYMBOL_TERMS = frozenset(
+    {
+        "ー",
+        "ｰ",
+        "〜",
+        "～",
+        "…",
+    }
+)
+
+
+class BlacklistedTermError(ValueError):
+    """Raised when a term should not be cataloged."""
+
+
+def is_single_kana_character(value: str) -> bool:
+    normalized = normalize_token(value)
+    if len(normalized) != 1:
+        return False
+
+    codepoint = ord(normalized)
+    return (
+        0x3041 <= codepoint <= 0x3096
+        or codepoint in (0x309D, 0x309E, 0x309F)
+        or 0x30A1 <= codepoint <= 0x30FA
+        or codepoint in (0x30FD, 0x30FE)
+        or 0xFF66 <= codepoint <= 0xFF9D
+    )
+
+
+def term_blacklist_reason(
+    lemma: str | None,
+    *,
+    reading: str | None = None,
+    pos: str | None = None,
+) -> str | None:
+    del reading
+    del pos
+    normalized_lemma = normalize_token(lemma)
+    if not normalized_lemma:
+        return None
+    if len(normalized_lemma) == 1 and (
+        unicodedata.category(normalized_lemma).startswith("P")
+        or normalized_lemma in BLACKLISTED_SINGLE_SYMBOL_TERMS
+    ):
+        return "placeholder_or_punctuation"
+    if is_single_kana_character(normalized_lemma):
+        return "single_kana_syllable"
+    return None
+
+
+def ensure_term_not_blacklisted(
+    lemma: str | None,
+    *,
+    reading: str | None = None,
+    pos: str | None = None,
+) -> None:
+    reason = term_blacklist_reason(lemma, reading=reading, pos=pos)
+    if reason is None:
+        return
+    normalized_lemma = normalize_token(lemma) or "<empty>"
+    raise BlacklistedTermError(f"Blocked blacklisted term '{normalized_lemma}' ({reason}).")
+
+
+def filter_blacklisted_term_rows(rows: Iterable[sqlite3.Row]) -> list[sqlite3.Row]:
+    visible_rows: list[sqlite3.Row] = []
+    for row in rows:
+        keys = set(row.keys())
+        reason = term_blacklist_reason(
+            row["lemma"] if "lemma" in keys else None,
+            reading=row["reading"] if "reading" in keys else None,
+            pos=row["pos"] if "pos" in keys else None,
+        )
+        if reason is None:
+            visible_rows.append(row)
+    return visible_rows
+
+
+def blacklisted_term_entries(
+    connection: sqlite3.Connection,
+) -> list[tuple[sqlite3.Row, str]]:
+    rows = connection.execute(
+        """
+        SELECT
+            t.id,
+            t.lemma,
+            t.reading,
+            t.pos,
+            COALESCE(ts.total_occurrences, 0) AS total_occurrences,
+            COALESCE(ts.priority_score, 0) AS priority_score,
+            (
+                SELECT COUNT(*)
+                FROM flashcards AS f
+                WHERE f.term_id = t.id
+            ) AS flashcard_count
+        FROM terms AS t
+        LEFT JOIN term_stats AS ts
+            ON ts.term_id = t.id
+        ORDER BY
+            COALESCE(ts.priority_score, 0) DESC,
+            t.id ASC
+        """
+    ).fetchall()
+    entries: list[tuple[sqlite3.Row, str]] = []
+    for row in rows:
+        reason = term_blacklist_reason(
+            row["lemma"],
+            reading=row["reading"],
+            pos=row["pos"],
+        )
+        if reason is not None:
+            entries.append((row, reason))
+    return entries
 
 
 def is_proper_name_meaning(value: str | None) -> bool:
@@ -357,6 +509,7 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(KANJI_FLASHCARD_SCHEMA_SQL)
     connection.executescript(SOURCE_SEGMENT_SCHEMA_SQL)
     connection.executescript(SOURCE_ANALYSIS_SCHEMA_SQL)
+    connection.executescript(SOURCE_TRANSLATION_SCHEMA_SQL)
     if table_exists(connection, "sources"):
         source_columns = table_columns(connection, "sources")
         if "ingest_mode" not in source_columns:
@@ -377,6 +530,12 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
             changed = True
         if "image_sha256" not in source_columns:
             connection.execute("ALTER TABLE sources ADD COLUMN image_sha256 TEXT")
+            changed = True
+        if "image_width" not in source_columns:
+            connection.execute("ALTER TABLE sources ADD COLUMN image_width INTEGER")
+            changed = True
+        if "image_height" not in source_columns:
+            connection.execute("ALTER TABLE sources ADD COLUMN image_height INTEGER")
             changed = True
         if "ocr_text_hash" not in source_columns:
             connection.execute("ALTER TABLE sources ADD COLUMN ocr_text_hash TEXT")
@@ -448,6 +607,138 @@ def stable_text_hash(value: str | None) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def normalize_image_dimension(value: object | None) -> int | None:
+    try:
+        normalized = int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    if normalized is None or normalized <= 0:
+        return None
+    return normalized
+
+
+def read_source_image_dimensions(
+    source_path: str | None,
+) -> tuple[int | None, int | None]:
+    if not source_path:
+        return (None, None)
+    path = Path(str(source_path))
+    if not path.exists():
+        return (None, None)
+    try:
+        from PIL import Image
+    except ImportError:
+        return (None, None)
+    try:
+        with Image.open(path) as image:
+            return (int(image.width), int(image.height))
+    except Exception:
+        return (None, None)
+
+
+def ensure_source_image_dimensions(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int | None,
+    source_path: str | None,
+    image_width: object | None,
+    image_height: object | None,
+) -> tuple[int | None, int | None]:
+    width = normalize_image_dimension(image_width)
+    height = normalize_image_dimension(image_height)
+    if width is not None and height is not None:
+        return (width, height)
+
+    resolved_width, resolved_height = read_source_image_dimensions(source_path)
+    if resolved_width is None or resolved_height is None:
+        return (width, height)
+
+    width = width or resolved_width
+    height = height or resolved_height
+    if source_id is not None:
+        connection.execute(
+            """
+            UPDATE sources
+            SET
+                image_width = COALESCE(image_width, ?),
+                image_height = COALESCE(image_height, ?)
+            WHERE id = ?
+            """,
+            (width, height, source_id),
+        )
+    return (width, height)
+
+
+def format_source_resolution(
+    image_width: object | None,
+    image_height: object | None,
+) -> str | None:
+    width = normalize_image_dimension(image_width)
+    height = normalize_image_dimension(image_height)
+    if width is None or height is None:
+        return None
+    return f"{width}x{height}"
+
+
+@lru_cache(maxsize=512)
+def google_gtx_translate_text(
+    text: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> str | None:
+    normalized = normalize_token(text)
+    if not normalized:
+        return None
+    params = urlencode(
+        {
+            "client": "gtx",
+            "sl": source_language,
+            "tl": target_language,
+            "dt": "t",
+            "q": normalized,
+        }
+    )
+    request = Request(
+        f"https://translate.googleapis.com/translate_a/single?{params}",
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=DEFAULT_TERM_TRANSLATION_TIMEOUT_SECONDS) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    segments = payload[0] if isinstance(payload, list) and payload else []
+    translated = normalize_token(
+        "".join(
+            str(segment[0])
+            for segment in segments
+            if isinstance(segment, list) and segment and segment[0] is not None
+        )
+    )
+    if not translated or translated == normalized:
+        return None
+    return translated
+
+
+def auto_translate_term_meaning_pt(
+    lemma: str,
+    *,
+    reading: str | None = None,
+) -> str | None:
+    del reading
+    if not DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS:
+        return None
+    try:
+        return google_gtx_translate_text(
+            lemma,
+            source_language="ja",
+            target_language=DEFAULT_TERM_TRANSLATION_TARGET,
+        )
+    except (OSError, TimeoutError, URLError, ValueError):
+        return None
+
+
 def find_source_by_image_sha256(
     connection: sqlite3.Connection,
     image_sha256: str | None,
@@ -475,9 +766,19 @@ def create_source_record(
     notes: str | None = None,
     captured_at: str | None = None,
     image_sha256: str | None = None,
+    image_width: int | None = None,
+    image_height: int | None = None,
     ocr_text_hash: str | None = None,
     capture_job_id: int | None = None,
 ) -> int:
+    if source_type == "image":
+        image_width, image_height = ensure_source_image_dimensions(
+            connection,
+            source_id=None,
+            source_path=source_path,
+            image_width=image_width,
+            image_height=image_height,
+        )
     cursor = connection.execute(
         """
         INSERT INTO sources (
@@ -493,10 +794,12 @@ def create_source_record(
             notes,
             captured_at,
             image_sha256,
+            image_width,
+            image_height,
             ocr_text_hash,
             capture_job_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             source_type,
@@ -511,6 +814,8 @@ def create_source_record(
             notes,
             captured_at,
             image_sha256,
+            image_width,
+            image_height,
             ocr_text_hash or stable_text_hash(raw_text),
             capture_job_id,
         ),
@@ -618,8 +923,8 @@ def claim_next_capture_job(
               AND attempt_count < ?
             ORDER BY
                 CASE status WHEN 'pending' THEN 0 ELSE 1 END,
-                created_at ASC,
-                id ASC
+                COALESCE(captured_at, created_at) DESC,
+                id DESC
             LIMIT 1
             """,
             (max_attempts,),
@@ -672,6 +977,51 @@ def update_capture_job_status(
         """,
         (status, last_error, final_image_path, raw_text, ocr_text_hash, job_id),
     )
+
+
+def claim_next_source_translation(
+    connection: sqlite3.Connection,
+    *,
+    target_language: str | None = None,
+    provider: str | None = None,
+) -> sqlite3.Row | None:
+    where_clauses = [
+        "st.status IN ('pending', 'failed')",
+        "COALESCE(s.raw_text, '') <> ''",
+    ]
+    params: list[object] = []
+    if target_language is not None:
+        where_clauses.append("st.target_language = ?")
+        params.append(target_language)
+    if provider is not None:
+        where_clauses.append("st.provider = ?")
+        params.append(provider)
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = connection.execute(
+            f"""
+            SELECT
+                st.*,
+                s.raw_text,
+                s.ocr_text_hash AS current_source_text_hash
+            FROM source_translations AS st
+            JOIN sources AS s
+              ON s.id = st.source_id
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY
+                CASE st.status WHEN 'pending' THEN 0 ELSE 1 END,
+                st.updated_at DESC,
+                st.id DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        connection.commit()
+        return row
+    except Exception:
+        connection.rollback()
+        raise
 
 
 def clear_source_analysis(connection: sqlite3.Connection, source_id: int) -> None:
@@ -792,6 +1142,73 @@ def create_source_analysis_candidate(
     return int(cursor.lastrowid)
 
 
+def upsert_source_translation(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    source_text_hash: str | None,
+    target_language: str,
+    provider: str,
+    status: str,
+    translated_text: str | None,
+    error_message: str | None,
+) -> int:
+    existing = connection.execute(
+        """
+        SELECT id
+        FROM source_translations
+        WHERE source_id = ? AND target_language = ? AND provider = ?
+        """,
+        (source_id, target_language, provider),
+    ).fetchone()
+    if existing is None:
+        cursor = connection.execute(
+            """
+            INSERT INTO source_translations (
+                source_id,
+                source_text_hash,
+                target_language,
+                provider,
+                status,
+                translated_text,
+                error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_id,
+                source_text_hash,
+                target_language,
+                provider,
+                status,
+                translated_text,
+                error_message,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    connection.execute(
+        """
+        UPDATE source_translations
+        SET
+            source_text_hash = ?,
+            status = ?,
+            translated_text = ?,
+            error_message = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            source_text_hash,
+            status,
+            translated_text,
+            error_message,
+            existing["id"],
+        ),
+    )
+    return int(existing["id"])
+
+
 def review_source_rows(
     connection: sqlite3.Connection,
     *,
@@ -810,8 +1227,10 @@ def review_source_rows(
             s.id,
             s.review_status,
             s.ingest_mode,
-            COALESCE(s.game, '-') AS game,
             COALESCE(s.scene, '-') AS scene,
+            s.source_path,
+            s.image_width,
+            s.image_height,
             COALESCE(s.captured_at, s.created_at) AS seen_at,
             COALESCE(s.raw_text, '') AS raw_text,
             (
@@ -851,8 +1270,35 @@ def source_review_payload(
             notes,
             captured_at,
             image_sha256,
+            image_width,
+            image_height,
             ocr_text_hash,
             capture_job_id,
+            (
+                SELECT translated_text
+                FROM source_translations AS st
+                WHERE st.source_id = sources.id
+                  AND st.target_language = 'en'
+                  AND st.status = 'translated'
+                ORDER BY st.updated_at DESC, st.id DESC
+                LIMIT 1
+            ) AS translated_text_en,
+            (
+                SELECT status
+                FROM source_translations AS st
+                WHERE st.source_id = sources.id
+                  AND st.target_language = 'en'
+                ORDER BY st.updated_at DESC, st.id DESC
+                LIMIT 1
+            ) AS translated_text_en_status,
+            (
+                SELECT provider
+                FROM source_translations AS st
+                WHERE st.source_id = sources.id
+                  AND st.target_language = 'en'
+                ORDER BY st.updated_at DESC, st.id DESC
+                LIMIT 1
+            ) AS translated_text_en_provider,
             created_at
         FROM sources
         WHERE id = ?
@@ -926,6 +1372,7 @@ def approve_source_analysis_candidates(
     *,
     source_id: int,
     candidate_ids: list[int] | None = None,
+    mark_reviewed: bool = True,
 ) -> tuple[int, int]:
     source_row = connection.execute(
         "SELECT id FROM sources WHERE id = ?",
@@ -965,6 +1412,21 @@ def approve_source_analysis_candidates(
         surface_form = normalize_token(row["surface_form"]) or lemma
         reading = normalize_token(row["reading"])
         if not lemma or not surface_form:
+            continue
+        blacklist_reason = term_blacklist_reason(
+            lemma,
+            reading=reading or None,
+            pos=row["pos"],
+        )
+        if blacklist_reason is not None:
+            connection.execute(
+                """
+                UPDATE source_analysis_candidates
+                SET approval_status = 'rejected', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (candidate_id,),
+            )
             continue
 
         term_id = row["matched_term_id"]
@@ -1031,14 +1493,15 @@ def approve_source_analysis_candidates(
         recalculate_term_stats(connection, term_id)
     if touched_term_ids:
         refresh_source_kanji(connection, source_id)
-    connection.execute(
-        """
-        UPDATE sources
-        SET review_status = 'reviewed'
-        WHERE id = ?
-        """,
-        (source_id,),
-    )
+    if mark_reviewed:
+        connection.execute(
+            """
+            UPDATE sources
+            SET review_status = 'reviewed'
+            WHERE id = ?
+            """,
+            (source_id,),
+        )
     return (promoted_terms, promoted_candidates)
 
 
@@ -1063,8 +1526,14 @@ def upsert_term_record(
 ) -> int:
     lemma = normalize_token(lemma)
     reading = normalize_token(reading)
+    meaning_pt = normalize_token(meaning_pt) or None
+    ensure_term_not_blacklisted(lemma, reading=reading or None, pos=pos)
     key = canonical_key(lemma, reading)
     existing = get_term_by_key(connection, key)
+    if meaning_pt is None and (
+        existing is None or not normalize_token(existing["meaning_pt"])
+    ):
+        meaning_pt = auto_translate_term_meaning_pt(lemma, reading=reading or None)
     if existing is None:
         cursor = connection.execute(
             """
@@ -1637,66 +2106,49 @@ def refresh_all_source_kanji(connection: sqlite3.Connection) -> int:
 
 
 def upsert_term_command(args: argparse.Namespace) -> None:
-    with db_connect(args.db) as connection:
-        term_id = upsert_term_record(
-            connection,
-            lemma=args.lemma,
-            reading=args.reading,
-            meaning_pt=args.meaning_pt,
-            pos=args.pos,
-            notes=args.notes,
-        )
+    try:
+        with db_connect(args.db) as connection:
+            term_id = upsert_term_record(
+                connection,
+                lemma=args.lemma,
+                reading=args.reading,
+                meaning_pt=args.meaning_pt,
+                pos=args.pos,
+                notes=args.notes,
+            )
+    except BlacklistedTermError as exc:
+        raise SystemExit(str(exc)) from exc
     print(f"Upserted term #{term_id}")
 
 
 def link_term(args: argparse.Namespace) -> None:
     surface_form = normalize_token(args.surface_form or args.lemma)
-    with db_connect(args.db) as connection:
-        source = connection.execute(
-            "SELECT id FROM sources WHERE id = ?",
-            (args.source_id,),
-        ).fetchone()
-        if source is None:
-            raise SystemExit(f"Source #{args.source_id} does not exist.")
+    try:
+        with db_connect(args.db) as connection:
+            source = connection.execute(
+                "SELECT id FROM sources WHERE id = ?",
+                (args.source_id,),
+            ).fetchone()
+            if source is None:
+                raise SystemExit(f"Source #{args.source_id} does not exist.")
 
-        term_id = upsert_term_record(
-            connection,
-            lemma=args.lemma,
-            reading=args.reading,
-            meaning_pt=args.meaning_pt,
-            pos=args.pos,
-            notes=args.term_notes,
-        )
-        term_form_id = ensure_term_form(
-            connection,
-            term_id=term_id,
-            surface_form=surface_form,
-            reading=args.reading,
-        )
-        upsert_source_term_link(
-            connection,
-            source_id=args.source_id,
-            term_id=term_id,
-            term_form_id=term_form_id,
-            surface_form=surface_form,
-            count=args.count,
-            confidence=args.confidence,
-            notes=args.link_notes,
-            mode=args.mode,
-        )
-
-        segment_text = normalize_token(args.segment_text)
-        if segment_text:
-            source_segment_id = ensure_source_segment(
+            term_id = upsert_term_record(
+                connection,
+                lemma=args.lemma,
+                reading=args.reading,
+                meaning_pt=args.meaning_pt,
+                pos=args.pos,
+                notes=args.term_notes,
+            )
+            term_form_id = ensure_term_form(
+                connection,
+                term_id=term_id,
+                surface_form=surface_form,
+                reading=args.reading,
+            )
+            upsert_source_term_link(
                 connection,
                 source_id=args.source_id,
-                segment_text=segment_text,
-                reading=args.segment_reading,
-                notes=args.segment_notes,
-            )
-            upsert_source_segment_term_link(
-                connection,
-                source_segment_id=source_segment_id,
                 term_id=term_id,
                 term_form_id=term_form_id,
                 surface_form=surface_form,
@@ -1705,13 +2157,36 @@ def link_term(args: argparse.Namespace) -> None:
                 notes=args.link_notes,
                 mode=args.mode,
             )
-        elif args.segment_reading or args.segment_notes:
-            raise SystemExit(
-                "--segment-reading and --segment-notes require --segment-text."
-            )
 
-        recalculate_term_stats(connection, term_id)
-        refresh_source_kanji(connection, args.source_id)
+            segment_text = normalize_token(args.segment_text)
+            if segment_text:
+                source_segment_id = ensure_source_segment(
+                    connection,
+                    source_id=args.source_id,
+                    segment_text=segment_text,
+                    reading=args.segment_reading,
+                    notes=args.segment_notes,
+                )
+                upsert_source_segment_term_link(
+                    connection,
+                    source_segment_id=source_segment_id,
+                    term_id=term_id,
+                    term_form_id=term_form_id,
+                    surface_form=surface_form,
+                    count=args.count,
+                    confidence=args.confidence,
+                    notes=args.link_notes,
+                    mode=args.mode,
+                )
+            elif args.segment_reading or args.segment_notes:
+                raise SystemExit(
+                    "--segment-reading and --segment-notes require --segment-text."
+                )
+
+            recalculate_term_stats(connection, term_id)
+            refresh_source_kanji(connection, args.source_id)
+    except BlacklistedTermError as exc:
+        raise SystemExit(str(exc)) from exc
 
     segment_suffix = f", segment='{segment_text}'" if segment_text else ""
     print(
@@ -1746,25 +2221,47 @@ def rebuild_stats(args: argparse.Namespace) -> None:
 
 def list_sources(args: argparse.Namespace) -> None:
     with db_connect(args.db) as connection:
-        rows = connection.execute(
+        raw_rows = connection.execute(
             """
             SELECT
                 id,
                 source_type,
                 review_status,
                 COALESCE(title, '(untitled)') AS title,
-                COALESCE(game, '-') AS game,
                 COALESCE(scene, '-') AS scene,
+                source_path,
+                image_width,
+                image_height,
                 COALESCE(captured_at, created_at) AS seen_at
             FROM sources
-            ORDER BY id DESC
+            ORDER BY seen_at DESC, id DESC
             LIMIT ?
             """,
             (args.limit,),
         ).fetchall()
+        rows = []
+        for row in raw_rows:
+            image_width, image_height = ensure_source_image_dimensions(
+                connection,
+                source_id=int(row["id"]),
+                source_path=row["source_path"],
+                image_width=row["image_width"],
+                image_height=row["image_height"],
+            )
+            rows.append(
+                {
+                    "id": row["id"],
+                    "source_type": row["source_type"],
+                    "review_status": row["review_status"],
+                    "title": row["title"],
+                    "resolution": format_source_resolution(image_width, image_height) or "-",
+                    "scene": row["scene"],
+                    "seen_at": row["seen_at"],
+                }
+            )
     print_rows(
         rows,
-        ("id", "source_type", "review_status", "title", "game", "scene", "seen_at"),
+        ("id", "source_type", "review_status", "title", "resolution", "scene", "seen_at"),
     )
 
 
@@ -1782,27 +2279,34 @@ def review_sources(args: argparse.Namespace) -> None:
             status=args.status,
             limit=args.limit,
         )
-    normalized_rows = []
-    for row in rows:
-        normalized_rows.append(
-            {
-                "id": row["id"],
-                "review_status": row["review_status"],
-                "ingest_mode": row["ingest_mode"],
-                "game": row["game"],
-                "scene": row["scene"],
-                "seen_at": row["seen_at"],
-                "pending_candidates": row["pending_candidates"],
-                "raw_preview": preview_text(row["raw_text"], size=64),
-            }
-        )
+        normalized_rows = []
+        for row in rows:
+            image_width, image_height = ensure_source_image_dimensions(
+                connection,
+                source_id=int(row["id"]),
+                source_path=row["source_path"],
+                image_width=row["image_width"],
+                image_height=row["image_height"],
+            )
+            normalized_rows.append(
+                {
+                    "id": row["id"],
+                    "review_status": row["review_status"],
+                    "ingest_mode": row["ingest_mode"],
+                    "resolution": format_source_resolution(image_width, image_height) or "-",
+                    "scene": row["scene"],
+                    "seen_at": row["seen_at"],
+                    "pending_candidates": row["pending_candidates"],
+                    "raw_preview": preview_text(row["raw_text"], size=64),
+                }
+            )
     print_rows(
         normalized_rows,
         (
             "id",
             "review_status",
             "ingest_mode",
-            "game",
+            "resolution",
             "scene",
             "seen_at",
             "pending_candidates",
@@ -1816,18 +2320,37 @@ def print_source_review_details(
     segments: list[sqlite3.Row],
     candidates: list[sqlite3.Row],
 ) -> None:
+    image_width = normalize_image_dimension(source_row["image_width"])
+    image_height = normalize_image_dimension(source_row["image_height"])
+    if image_width is None or image_height is None:
+        image_width, image_height = read_source_image_dimensions(source_row["source_path"])
     print(f"Source #{source_row['id']}")
     print(f"  type={source_row['source_type']}")
     print(f"  ingest_mode={source_row['ingest_mode']}")
     print(f"  review_status={source_row['review_status']}")
     print(f"  language={source_row['language_code']}")
-    print(f"  game={source_row['game'] or '-'}")
+    print(f"  resolution={format_source_resolution(image_width, image_height) or '-'}")
+    if normalize_token(source_row["game"]):
+        print(f"  game={source_row['game']}")
     print(f"  scene={source_row['scene'] or '-'}")
     print(f"  source_path={source_row['source_path'] or '-'}")
     print(f"  capture_job_id={source_row['capture_job_id'] or '-'}")
     print(f"  captured_at={source_row['captured_at'] or source_row['created_at']}")
     print(f"  image_sha256={source_row['image_sha256'] or '-'}")
     print(f"  raw_text={source_row['raw_text'] or '-'}")
+    if source_row["translated_text_en"]:
+        print(f"  translated_text_en={source_row['translated_text_en']}")
+        print(
+            "  translated_text_en_meta="
+            f"{source_row['translated_text_en_provider'] or '-'} "
+            f"status={source_row['translated_text_en_status'] or '-'}"
+        )
+    elif source_row["translated_text_en_status"]:
+        print(
+            "  translated_text_en_meta="
+            f"{source_row['translated_text_en_provider'] or '-'} "
+            f"status={source_row['translated_text_en_status'] or '-'}"
+        )
     if source_row["notes"]:
         print(f"  notes={source_row['notes']}")
     print("")
@@ -1949,6 +2472,7 @@ def list_terms(args: argparse.Namespace) -> None:
     """
     with db_connect(args.db) as connection:
         rows = connection.execute(query, (args.limit,)).fetchall()
+    rows = filter_blacklisted_term_rows(rows)
     print_rows(
         rows,
         (
@@ -2542,10 +3066,15 @@ def build_flashcard_payload(
     note_type: str,
     template_name: str,
 ) -> dict[str, str | int | None]:
-    surface_form = (
+    preferred_surface_form = (
         source_row["surface_form"]
         if source_row and source_row["surface_form"]
         else term_row["lemma"]
+    )
+    surface_form = (
+        term_row["lemma"]
+        if term_blacklist_reason(preferred_surface_form) is not None
+        else preferred_surface_form
     )
     front_text = build_front_text(surface_form, term_row["reading"])
     back_parts = []
@@ -2622,7 +3151,7 @@ def related_terms_for_kanji(
     *,
     limit: int = 6,
 ) -> list[sqlite3.Row]:
-    return connection.execute(
+    rows = connection.execute(
         """
         SELECT
             t.id,
@@ -2660,6 +3189,7 @@ def related_terms_for_kanji(
         """,
         (kanji_id, limit),
     ).fetchall()
+    return filter_blacklisted_term_rows(rows)
 
 
 def build_kanji_flashcard_payload(
@@ -2818,6 +3348,7 @@ def upsert_flashcards(
     refresh_all_source_kanji(connection)
     query, params = flashcard_candidates(args)
     term_rows = connection.execute(query, params).fetchall()
+    term_rows = filter_blacklisted_term_rows(term_rows)
 
     for term_row in term_rows:
         source_row = best_source_for_term(connection, int(term_row["id"]))
@@ -3124,6 +3655,7 @@ def list_flashcards(args: argparse.Namespace) -> None:
     params.append(args.limit)
     with db_connect(args.db) as connection:
         rows = connection.execute(query, params).fetchall()
+    rows = filter_blacklisted_term_rows(rows)
     print_rows(
         rows,
         (
@@ -3153,6 +3685,7 @@ def export_anki_tsv(args: argparse.Namespace) -> None:
     query = f"""
         SELECT
             f.id,
+            t.lemma,
             f.front_text,
             f.back_text,
             f.tags
@@ -3167,6 +3700,7 @@ def export_anki_tsv(args: argparse.Namespace) -> None:
     """
     with db_connect(args.db) as connection:
         rows = connection.execute(query, params).fetchall()
+        rows = filter_blacklisted_term_rows(rows)
         with args.output.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle, delimiter="\t")
             if args.include_header:
@@ -3535,6 +4069,7 @@ def reprioritize_anki_learning_path(
         """,
         (DEFAULT_JP_DECK_NAME,),
     ).fetchall()
+    term_rows = filter_blacklisted_term_rows(term_rows)
     kanji_rows = connection.execute(
         """
         SELECT
@@ -3726,7 +4261,8 @@ def reprioritize_anki_deck(
     rows = connection.execute(
         f"""
         SELECT
-            f.anki_note_id
+            f.anki_note_id,
+            t.lemma
         FROM flashcards AS f
         JOIN terms AS t
             ON t.id = f.term_id
@@ -3738,6 +4274,7 @@ def reprioritize_anki_deck(
         """,
         (deck_name,),
     ).fetchall()
+    rows = filter_blacklisted_term_rows(rows)
 
     if not rows:
         return 0
@@ -3896,6 +4433,7 @@ def sync_anki(args: argparse.Namespace) -> None:
             SELECT
                 f.id,
                 f.term_id,
+                t.lemma,
                 f.template_name,
                 f.deck_name,
                 f.note_type,
@@ -3915,6 +4453,7 @@ def sync_anki(args: argparse.Namespace) -> None:
             """,
             params,
         ).fetchall()
+        rows = filter_blacklisted_term_rows(rows)
 
         sync_deck_names = sorted({str(row["deck_name"]) for row in rows})
         front_note_lookup = anki_front_note_lookup(
@@ -3923,17 +4462,24 @@ def sync_anki(args: argparse.Namespace) -> None:
             port=args.port,
             front_field=args.front_field,
         )
-        reprioritize_deck_names = [
-            str(row["deck_name"])
-            for row in connection.execute(
+        reprioritize_deck_names = sorted(
+            {
+                str(row["deck_name"])
+                for row in connection.execute(
                 """
-                SELECT DISTINCT deck_name
+                SELECT DISTINCT
+                    deck_name,
+                    t.lemma
                 FROM flashcards
+                JOIN terms AS t
+                    ON t.id = flashcards.term_id
                 WHERE anki_note_id IS NOT NULL
                 ORDER BY deck_name COLLATE NOCASE ASC
                 """
             ).fetchall()
-        ]
+                if term_blacklist_reason(row["lemma"]) is None
+            }
+        )
 
         created = 0
         updated = 0
@@ -4155,6 +4701,136 @@ def sync_anki_words(args: argparse.Namespace) -> None:
         f"updated={generated_updated}, template={args.template_name}."
     )
     sync_anki(args)
+
+
+def prune_blacklisted_terms(
+    connection: sqlite3.Connection,
+    *,
+    delete_anki_notes: bool = False,
+    host: str = DEFAULT_ANKI_CONNECT_HOST,
+    port: int = DEFAULT_ANKI_CONNECT_PORT,
+) -> dict[str, object]:
+    entries = blacklisted_term_entries(connection)
+    if not entries:
+        return {
+            "term_count": 0,
+            "flashcard_count": 0,
+            "anki_note_count": 0,
+            "source_term_count": 0,
+            "source_segment_term_count": 0,
+            "term_form_count": 0,
+            "sample": [],
+        }
+
+    term_ids = [int(row["id"]) for row, _ in entries]
+    placeholders = ", ".join("?" for _ in term_ids)
+    sample = [str(row["lemma"]) for row, _ in entries[:10]]
+    flashcard_count = connection.execute(
+        f"SELECT COUNT(*) FROM flashcards WHERE term_id IN ({placeholders})",
+        term_ids,
+    ).fetchone()[0]
+    source_term_count = connection.execute(
+        f"SELECT COUNT(*) FROM source_terms WHERE term_id IN ({placeholders})",
+        term_ids,
+    ).fetchone()[0]
+    source_segment_term_count = connection.execute(
+        f"SELECT COUNT(*) FROM source_segment_terms WHERE term_id IN ({placeholders})",
+        term_ids,
+    ).fetchone()[0]
+    term_form_count = connection.execute(
+        f"SELECT COUNT(*) FROM term_forms WHERE term_id IN ({placeholders})",
+        term_ids,
+    ).fetchone()[0]
+    anki_note_ids = [
+        int(row["anki_note_id"])
+        for row in connection.execute(
+            f"""
+            SELECT DISTINCT anki_note_id
+            FROM flashcards
+            WHERE
+                term_id IN ({placeholders})
+                AND anki_note_id IS NOT NULL
+            ORDER BY anki_note_id ASC
+            """,
+            term_ids,
+        ).fetchall()
+    ]
+    if delete_anki_notes and anki_note_ids:
+        anki_connect_request(
+            host=host,
+            port=port,
+            action="deleteNotes",
+            params={"notes": anki_note_ids},
+        )
+    connection.execute(
+        f"DELETE FROM terms WHERE id IN ({placeholders})",
+        term_ids,
+    )
+    return {
+        "term_count": len(term_ids),
+        "flashcard_count": flashcard_count,
+        "anki_note_count": len(anki_note_ids),
+        "source_term_count": source_term_count,
+        "source_segment_term_count": source_segment_term_count,
+        "term_form_count": term_form_count,
+        "sample": sample,
+    }
+
+
+def prune_blacklisted_terms_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        entries = blacklisted_term_entries(connection)
+        if args.dry_run:
+            print(
+                "Blacklisted terms queued for removal: "
+                f"{len(entries)}"
+            )
+            preview_rows = [
+                {
+                    "id": int(row["id"]),
+                    "lemma": row["lemma"],
+                    "reading": normalize_token(row["reading"]) or "-",
+                    "pos": normalize_token(row["pos"]) or "-",
+                    "reason": reason,
+                    "priority_score": row["priority_score"],
+                    "flashcard_count": row["flashcard_count"],
+                }
+                for row, reason in entries[: args.limit]
+            ]
+            print_rows(
+                preview_rows,
+                (
+                    "id",
+                    "lemma",
+                    "reading",
+                    "pos",
+                    "reason",
+                    "priority_score",
+                    "flashcard_count",
+                ),
+            )
+            return
+
+        summary = prune_blacklisted_terms(
+            connection,
+            delete_anki_notes=args.delete_anki_notes,
+            host=args.host,
+            port=args.port,
+        )
+    sample = ", ".join(summary["sample"]) if summary["sample"] else "-"
+    anki_note_label = (
+        "anki_notes_deleted" if args.delete_anki_notes else "anki_notes_linked"
+    )
+    print(
+        "Pruned blacklisted terms: "
+        f"terms={summary['term_count']}, "
+        f"flashcards={summary['flashcard_count']}, "
+        f"source_links={summary['source_term_count']}, "
+        f"segment_links={summary['source_segment_term_count']}, "
+        f"term_forms={summary['term_form_count']}, "
+        f"{anki_note_label}={summary['anki_note_count']}, "
+        f"sample={sample}"
+    )
 
 
 def sync_anki_kanji(args: argparse.Namespace) -> None:
@@ -4547,6 +5223,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recalculate term_stats from source_terms.",
     )
     rebuild_parser.set_defaults(func=rebuild_stats)
+
+    prune_blacklisted_terms_parser = subparsers.add_parser(
+        "prune-blacklisted-terms",
+        help="Remove placeholder and single-kana terms plus their derived links/cards.",
+    )
+    prune_blacklisted_terms_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview blacklisted terms without deleting anything.",
+    )
+    prune_blacklisted_terms_parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Preview row limit for --dry-run.",
+    )
+    prune_blacklisted_terms_parser.add_argument(
+        "--delete-anki-notes",
+        action="store_true",
+        help="Also delete linked Anki notes for removed flashcards via AnkiConnect.",
+    )
+    prune_blacklisted_terms_parser.add_argument(
+        "--host",
+        default=DEFAULT_ANKI_CONNECT_HOST,
+    )
+    prune_blacklisted_terms_parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_ANKI_CONNECT_PORT,
+    )
+    prune_blacklisted_terms_parser.set_defaults(func=prune_blacklisted_terms_command)
 
     list_sources_parser = subparsers.add_parser(
         "list-sources",

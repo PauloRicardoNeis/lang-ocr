@@ -1,16 +1,30 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 import html
+import json
 import mimetypes
+import os
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 import webbrowser
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
+from uuid import uuid4
+
+from lang_jp import (
+    ensure_runtime_schema,
+    ensure_source_image_dimensions,
+    format_source_resolution,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -196,6 +210,12 @@ PAGE_STYLE = """
     flex-wrap: wrap;
   }
 
+  .search-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
   input[type="search"],
   input[type="number"],
   select {
@@ -225,8 +245,56 @@ PAGE_STYLE = """
     background: linear-gradient(135deg, var(--accent) 0%, #ca7a4d 100%);
   }
 
+  button[disabled] {
+    cursor: wait;
+    opacity: 0.78;
+  }
+
   .button-link { text-decoration: none; }
   .button-link:hover { text-decoration: none; }
+
+  .secondary-link,
+  .pagination-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    padding: 0 16px;
+    border-radius: 999px;
+    border: 1px solid rgba(51, 92, 103, 0.16);
+    background: rgba(255, 252, 247, 0.92);
+    color: var(--accent-cool);
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .secondary-link:hover,
+  .pagination-link:hover {
+    text-decoration: none;
+    border-color: rgba(51, 92, 103, 0.3);
+    background: rgba(255, 248, 239, 0.98);
+  }
+
+  .pagination-link.is-current {
+    border-color: rgba(178, 92, 56, 0.28);
+    background: linear-gradient(135deg, rgba(178, 92, 56, 0.14), rgba(202, 122, 77, 0.2));
+    color: var(--accent);
+  }
+
+  .pagination-link.is-disabled {
+    color: rgba(95, 101, 95, 0.7);
+    border-style: dashed;
+    background: rgba(255, 252, 247, 0.72);
+  }
+
+  .pagination-gap {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    padding: 0 4px;
+    color: var(--muted);
+  }
 
   .chips {
     display: flex;
@@ -363,6 +431,40 @@ PAGE_STYLE = """
     font-size: 0.92rem;
   }
 
+  .results-toolbar {
+    display: flex;
+    gap: 14px;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 14px 0 16px;
+  }
+
+  .results-summary {
+    margin: 0;
+    color: var(--muted);
+  }
+
+  .pagination {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .pagination-status {
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+
+  .pagination-links {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
   .notice-banner {
     margin-bottom: 16px;
     padding: 14px 16px;
@@ -387,6 +489,91 @@ PAGE_STYLE = """
 
   form.inline-action {
     margin: 0;
+  }
+
+  .anki-sync-root {
+    display: grid;
+    gap: 10px;
+  }
+
+  .anki-sync-progress {
+    display: grid;
+    gap: 8px;
+    width: min(720px, 100%);
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(51, 92, 103, 0.16);
+    background: rgba(255, 252, 247, 0.9);
+  }
+
+  .anki-sync-progress[hidden] {
+    display: none;
+  }
+
+  .anki-sync-progress-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .anki-sync-progress-title {
+    font-weight: 700;
+  }
+
+  .anki-sync-progress-value {
+    color: var(--accent-cool);
+    font-weight: 700;
+  }
+
+  .anki-sync-progress-track {
+    position: relative;
+    height: 12px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(51, 92, 103, 0.12);
+  }
+
+  .anki-sync-progress-fill {
+    position: relative;
+    height: 100%;
+    width: 0%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--accent-cool) 0%, var(--accent) 100%);
+    transition: width 0.35s ease;
+  }
+
+  .anki-sync-root.is-running .anki-sync-progress-fill::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(120deg, transparent 20%, rgba(255, 255, 255, 0.45) 50%, transparent 80%);
+    transform: translateX(-100%);
+    animation: anki-sync-sheen 1.35s linear infinite;
+  }
+
+  .anki-sync-root.is-complete .anki-sync-progress-fill {
+    background: linear-gradient(90deg, #335c67 0%, #5b8c73 100%);
+  }
+
+  .anki-sync-root.is-error .anki-sync-progress {
+    border-color: rgba(178, 44, 44, 0.24);
+    background: rgba(255, 236, 232, 0.92);
+  }
+
+  .anki-sync-root.is-error .anki-sync-progress-fill {
+    background: linear-gradient(90deg, #a64331 0%, #cf7754 100%);
+  }
+
+  .anki-sync-progress-message {
+    color: var(--muted);
+    line-height: 1.45;
+  }
+
+  @keyframes anki-sync-sheen {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(100%); }
   }
 
   @media (max-width: 900px) {
@@ -478,7 +665,44 @@ PAGE_SCRIPT = """
       tbody.replaceChildren(...rows.map((item) => item.row));
     }
 
-    document.querySelectorAll("table.sortable-table").forEach((table) => {
+    function readSortState(table) {
+      if (!table) {
+        return null;
+      }
+      const headers = Array.from(table.querySelectorAll("thead th"));
+      for (let index = 0; index < headers.length; index += 1) {
+        const direction = headers[index].getAttribute("aria-sort");
+        if (direction === "ascending") {
+          return { index, direction: "asc" };
+        }
+        if (direction === "descending") {
+          return { index, direction: "desc" };
+        }
+      }
+      return null;
+    }
+
+    function applySortState(table, state) {
+      if (!table || !state || !Number.isInteger(state.index)) {
+        return false;
+      }
+      const headers = Array.from(table.querySelectorAll("thead th"));
+      const tbody = table.querySelector("tbody");
+      if (!headers.length || !tbody || !headers[state.index]) {
+        return false;
+      }
+      const direction = state.direction === "asc" ? "asc" : state.direction === "desc" ? "desc" : "";
+      if (!direction) {
+        return false;
+      }
+      sortTable(table, headers, tbody, state.index, direction);
+      return true;
+    }
+
+    function initializeSortableTable(table) {
+      if (table.dataset.sortReady === "1") {
+        return;
+      }
       const headers = Array.from(table.querySelectorAll("thead th"));
       const tbody = table.querySelector("tbody");
       if (!headers.length || !tbody) {
@@ -511,24 +735,526 @@ PAGE_SCRIPT = """
         });
       });
 
+      table.dataset.sortReady = "1";
       const defaultSortColumn = Number.parseInt(table.dataset.defaultSortColumn || "", 10);
       const defaultSortDirection = table.dataset.defaultSortDirection || "desc";
       if (Number.isInteger(defaultSortColumn) && headers[defaultSortColumn]) {
         sortTable(table, headers, tbody, defaultSortColumn, defaultSortDirection);
       }
+    }
+
+    function initSortableTables(root = document) {
+      root.querySelectorAll("table.sortable-table").forEach((table) => {
+        initializeSortableTable(table);
+      });
+    }
+
+    window.jpCatalog = Object.assign(window.jpCatalog || {}, {
+      initSortableTables,
+      readSortState,
+      applySortState,
+    });
+
+    initSortableTables(document);
+  })();
+
+  (() => {
+    const pollIntervalMs = 900;
+    const syncState = {
+      active: false,
+    };
+
+    function setSyncingAnki(nextActive) {
+      syncState.active = Boolean(nextActive);
+    }
+
+    function isSyncingAnki() {
+      return syncState.active;
+    }
+
+    function appendNoticeToPath(path, message, level) {
+      const url = new URL(path || "/", window.location.origin);
+      url.searchParams.set("notice", message);
+      url.searchParams.set("level", level);
+      return `${url.pathname}${url.search}${url.hash}`;
+    }
+
+    function syncStatusTitle(status) {
+      if (status === "completed") {
+        return "Sincronizacao concluida";
+      }
+      if (status === "failed") {
+        return "Falha na sincronizacao";
+      }
+      return "Sincronizando com o Anki";
+    }
+
+    function setRootState(root, status) {
+      root.classList.toggle("is-running", status === "running");
+      root.classList.toggle("is-complete", status === "completed");
+      root.classList.toggle("is-error", status === "failed");
+    }
+
+    function updateProgressUI(root, payload) {
+      const panel = root.querySelector("[data-anki-sync-progress]");
+      const titleNode = root.querySelector("[data-anki-sync-title]");
+      const valueNode = root.querySelector("[data-anki-sync-value]");
+      const messageNode = root.querySelector("[data-anki-sync-message]");
+      const fillNode = root.querySelector("[data-anki-sync-fill]");
+      if (!panel || !titleNode || !valueNode || !messageNode || !fillNode) {
+        return;
+      }
+
+      const progress = Math.max(0, Math.min(100, Number(payload.progress) || 0));
+      panel.hidden = false;
+      panel.setAttribute("aria-valuenow", String(Math.round(progress)));
+      titleNode.textContent = syncStatusTitle(payload.status);
+      valueNode.textContent = `${Math.round(progress)}%`;
+      messageNode.textContent = payload.message || "";
+      fillNode.style.width = `${progress}%`;
+      setRootState(root, payload.status);
+    }
+
+    async function startSync(root, form, submitButton) {
+      if (root.dataset.syncBusy === "1") {
+        return;
+      }
+
+      root.dataset.syncBusy = "1";
+      submitButton.disabled = true;
+      submitButton.textContent = "Sincronizando...";
+      setSyncingAnki(true);
+      updateProgressUI(root, {
+        status: "running",
+        progress: 4,
+        message: "Preparando sincronizacao com o Anki...",
+      });
+
+      const formData = new FormData(form);
+      const nextPath = String(formData.get("next") || window.location.pathname || "/");
+
+      try {
+        const startResponse = await fetch(form.action, {
+          method: "POST",
+          headers: {
+            "Accept": "application/json",
+            "X-Requested-With": "fetch",
+          },
+          body: new URLSearchParams(formData),
+          cache: "no-store",
+        });
+        const startPayload = await startResponse.json();
+        if (!startResponse.ok || !startPayload || !startPayload.job_id) {
+          throw new Error(startPayload && startPayload.message ? startPayload.message : "Nao foi possivel iniciar a sincronizacao.");
+        }
+
+        updateProgressUI(root, startPayload);
+        const pollUrl = startPayload.poll_url;
+        let completed = false;
+
+        while (!completed) {
+          await new Promise((resolve) => window.setTimeout(resolve, pollIntervalMs));
+          const statusResponse = await fetch(pollUrl, {
+            headers: { "Accept": "application/json" },
+            cache: "no-store",
+          });
+          const statusPayload = await statusResponse.json();
+          if (!statusResponse.ok) {
+            throw new Error(statusPayload && statusPayload.message ? statusPayload.message : "Nao foi possivel consultar o andamento da sincronizacao.");
+          }
+          updateProgressUI(root, statusPayload);
+          if (statusPayload.status === "completed" || statusPayload.status === "failed") {
+            completed = true;
+            const noticeMessage = statusPayload.notice_message || statusPayload.message || "Sincronizacao finalizada.";
+            const noticeLevel = statusPayload.notice_level || (statusPayload.status === "failed" ? "error" : "info");
+            window.setTimeout(() => {
+              window.location.assign(appendNoticeToPath(nextPath, noticeMessage, noticeLevel));
+            }, 320);
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Falha ao sincronizar com o Anki.";
+        updateProgressUI(root, {
+          status: "failed",
+          progress: 100,
+          message,
+        });
+        root.dataset.syncBusy = "0";
+        submitButton.disabled = false;
+        submitButton.textContent = "Sincronizar com o Anki";
+        setSyncingAnki(false);
+      }
+    }
+
+    function initAnkiSync(root) {
+      if (!root || root.dataset.syncReady === "1") {
+        return;
+      }
+      const form = root.querySelector("[data-anki-sync-form]");
+      const submitButton = root.querySelector("[data-anki-sync-submit]");
+      if (!form || !submitButton) {
+        return;
+      }
+
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        startSync(root, form, submitButton);
+      });
+
+      root.dataset.syncReady = "1";
+    }
+
+    document.querySelectorAll("[data-anki-sync-root]").forEach((root) => {
+      initAnkiSync(root);
+    });
+
+    window.jpCatalog = Object.assign(window.jpCatalog || {}, {
+      isSyncingAnki,
+      setSyncingAnki,
     });
   })();
 </script>
 """
 
 
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback) -> bool | None:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def db_connect(db_path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(db_path, timeout=30)
+    connection = sqlite3.connect(db_path, timeout=30, factory=ClosingConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA busy_timeout = 30000")
     connection.execute("PRAGMA foreign_keys = ON")
+    ensure_runtime_schema(connection)
     return connection
+
+
+def database_revision_token(db_path: Path) -> str:
+    parts: list[str] = []
+    for candidate in (db_path, db_path.parent / f"{db_path.name}-wal"):
+        if not candidate.exists():
+            parts.append(f"{candidate.name}:missing")
+            continue
+        stat = candidate.stat()
+        parts.append(f"{candidate.name}:{stat.st_size}:{stat.st_mtime_ns}")
+    return "|".join(parts)
+
+
+def live_revision_payload(db_path: Path) -> dict[str, str]:
+    return {"revision": database_revision_token(db_path)}
+
+
+SYNC_JOB_TTL_SECONDS = 30 * 60
+SYNC_JOB_LOCK = threading.Lock()
+SYNC_JOB_STATES: dict[str, dict[str, object]] = {}
+
+
+def build_notice_path(path: str, *, message: str, level: str) -> str:
+    parsed = urlparse(path or "/")
+    query = parse_qs(parsed.query)
+    query["notice"] = [message]
+    query["level"] = [level]
+    encoded = urlencode(
+        [(key, value) for key, values in query.items() for value in values]
+    )
+    target = parsed.path or "/"
+    return f"{target}?{encoded}" if encoded else target
+
+
+def build_catalog_command(db_path: Path, *command_parts: str) -> list[str]:
+    return [
+        sys.executable,
+        "-u",
+        str(ROOT / "lang_jp.py"),
+        "--db",
+        str(db_path),
+        *command_parts,
+    ]
+
+
+def run_catalog_command_for_db(
+    db_path: Path,
+    *command_parts: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        build_catalog_command(db_path, *command_parts),
+        cwd=str(ROOT.parent),
+        capture_output=True,
+        text=True,
+    )
+
+
+def stream_catalog_command_for_db(
+    db_path: Path,
+    *command_parts: str,
+    on_output: Callable[[str], None] | None = None,
+) -> tuple[int, list[str]]:
+    process = subprocess.Popen(
+        build_catalog_command(db_path, *command_parts),
+        cwd=str(ROOT.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    lines: list[str] = []
+    if process.stdout is not None:
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                lines.append(line)
+                if on_output is not None:
+                    on_output(line)
+        finally:
+            process.stdout.close()
+    return process.wait(), lines
+
+
+def command_output_lines(*, stdout: str, stderr: str) -> list[str]:
+    return [
+        line.strip()
+        for line in (stdout + "\n" + stderr).splitlines()
+        if line.strip()
+    ]
+
+
+def sync_result_message(lines: list[str], fallback: str) -> str:
+    return next(
+        (line for line in reversed(lines) if line.startswith("Synced ")),
+        fallback,
+    )
+
+
+def sync_failure_message(lines: list[str], fallback: str) -> str:
+    return lines[-1] if lines else fallback
+
+
+def prune_sync_jobs(*, now: float | None = None) -> None:
+    cutoff = (now if now is not None else time.time()) - SYNC_JOB_TTL_SECONDS
+    stale_job_ids = [
+        job_id
+        for job_id, state in SYNC_JOB_STATES.items()
+        if state.get("status") != "running"
+        and float(state.get("updated_at") or 0.0) < cutoff
+    ]
+    for job_id in stale_job_ids:
+        SYNC_JOB_STATES.pop(job_id, None)
+
+
+def sync_job_payload(state: dict[str, object]) -> dict[str, object]:
+    job_id = str(state["job_id"])
+    return {
+        "job_id": job_id,
+        "status": str(state.get("status") or "running"),
+        "step": str(state.get("step") or "queued"),
+        "progress": int(state.get("progress") or 0),
+        "message": str(state.get("message") or ""),
+        "notice_message": str(state.get("notice_message") or ""),
+        "notice_level": str(state.get("notice_level") or "info"),
+        "poll_url": f"/actions/sync-anki/status?{urlencode([('job_id', job_id)])}",
+    }
+
+
+def get_sync_job_state(job_id: str) -> dict[str, object] | None:
+    with SYNC_JOB_LOCK:
+        prune_sync_jobs()
+        state = SYNC_JOB_STATES.get(job_id)
+        return dict(state) if state is not None else None
+
+
+def set_sync_job_state(job_id: str, **changes: object) -> None:
+    with SYNC_JOB_LOCK:
+        state = SYNC_JOB_STATES.get(job_id)
+        if state is None:
+            return
+        state.update(changes)
+        state["updated_at"] = time.time()
+
+
+def advance_sync_job(
+    job_id: str,
+    *,
+    progress: int,
+    message: str,
+    status: str | None = None,
+    step: str | None = None,
+    notice_message: str | None = None,
+    notice_level: str | None = None,
+) -> None:
+    current_state = get_sync_job_state(job_id)
+    current_progress = 0
+    if current_state is not None:
+        try:
+            current_progress = int(current_state.get("progress") or 0)
+        except (TypeError, ValueError):
+            current_progress = 0
+    changes: dict[str, object] = {
+        "progress": max(progress, current_progress),
+        "message": message,
+    }
+    if status is not None:
+        changes["status"] = status
+    if step is not None:
+        changes["step"] = step
+    if notice_message is not None:
+        changes["notice_message"] = notice_message
+    if notice_level is not None:
+        changes["notice_level"] = notice_level
+    set_sync_job_state(job_id, **changes)
+
+
+def run_sync_anki_job(db_path: Path, job_id: str) -> None:
+    term_lines: list[str] = []
+    kanji_lines: list[str] = []
+
+    try:
+        advance_sync_job(
+            job_id,
+            progress=10,
+            step="sync_terms",
+            message="Sincronizando termos com o Anki...",
+        )
+
+        def handle_term_output(line: str) -> None:
+            progress = 24
+            if line.startswith("Prepared flashcards:"):
+                progress = 38
+            elif line.startswith("Synced "):
+                progress = 56
+            advance_sync_job(job_id, progress=progress, step="sync_terms", message=line)
+
+        term_returncode, term_lines = stream_catalog_command_for_db(
+            db_path,
+            "sync-anki-words",
+            on_output=handle_term_output,
+        )
+        if term_returncode != 0:
+            message = sync_failure_message(
+                term_lines,
+                "Falha ao sincronizar termos com o Anki.",
+            )
+            advance_sync_job(
+                job_id,
+                progress=100,
+                status="failed",
+                step="failed",
+                message=message,
+                notice_message=message,
+                notice_level="error",
+            )
+            return
+
+        term_message = sync_result_message(term_lines, "Termos sincronizados.")
+        advance_sync_job(
+            job_id,
+            progress=62,
+            step="sync_kanji",
+            message=f"{term_message} Iniciando sincronizacao de kanji...",
+        )
+
+        def handle_kanji_output(line: str) -> None:
+            progress = 74
+            if line.startswith("Prepared kanji flashcards:"):
+                progress = 84
+            elif line.startswith("Synced "):
+                progress = 96
+            advance_sync_job(job_id, progress=progress, step="sync_kanji", message=line)
+
+        kanji_returncode, kanji_lines = stream_catalog_command_for_db(
+            db_path,
+            "sync-anki-kanji",
+            on_output=handle_kanji_output,
+        )
+        if kanji_returncode != 0:
+            message = sync_failure_message(
+                kanji_lines,
+                "Falha ao sincronizar kanji com o Anki.",
+            )
+            advance_sync_job(
+                job_id,
+                progress=100,
+                status="failed",
+                step="failed",
+                message=message,
+                notice_message=message,
+                notice_level="error",
+            )
+            return
+
+        kanji_message = sync_result_message(kanji_lines, "Kanji sincronizados.")
+        final_message = f"{term_message} {kanji_message}"
+        advance_sync_job(
+            job_id,
+            progress=100,
+            status="completed",
+            step="completed",
+            message=final_message,
+            notice_message=final_message,
+            notice_level="info",
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        message = str(exc).strip() or "Falha inesperada ao sincronizar com o Anki."
+        advance_sync_job(
+            job_id,
+            progress=100,
+            status="failed",
+            step="failed",
+            message=message,
+            notice_message=message,
+            notice_level="error",
+        )
+
+
+def start_sync_anki_job(db_path: Path) -> dict[str, object]:
+    with SYNC_JOB_LOCK:
+        prune_sync_jobs()
+        active_state = next(
+            (
+                dict(state)
+                for state in SYNC_JOB_STATES.values()
+                if state.get("status") == "running"
+            ),
+            None,
+        )
+        if active_state is not None:
+            payload = sync_job_payload(active_state)
+            payload["existing"] = True
+            return payload
+
+        job_id = uuid4().hex
+        state = {
+            "job_id": job_id,
+            "status": "running",
+            "step": "queued",
+            "progress": 4,
+            "message": "Preparando sincronizacao com o Anki...",
+            "notice_message": "",
+            "notice_level": "info",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+        SYNC_JOB_STATES[job_id] = state
+
+    worker = threading.Thread(
+        target=run_sync_anki_job,
+        args=(db_path, job_id),
+        daemon=True,
+        name="anki-sync-job",
+    )
+    worker.start()
+
+    payload = sync_job_payload(state)
+    payload["existing"] = False
+    return payload
 
 
 def first_value(params: dict[str, list[str]], key: str, default: str = "") -> str:
@@ -544,6 +1270,163 @@ def parse_limit(raw_value: str, default: int = 50, *, maximum: int = 200) -> int
     return max(1, min(value, maximum))
 
 
+def parse_page(raw_value: str, default: int = 1) -> int:
+    try:
+        value = int(raw_value or default)
+    except ValueError:
+        return default
+    return max(1, value)
+
+
+@dataclass(frozen=True)
+class PaginationState:
+    page: int
+    limit: int
+    total_count: int
+    total_pages: int
+    offset: int
+    page_start: int
+    page_end: int
+
+    @property
+    def has_previous(self) -> bool:
+        return self.page > 1
+
+    @property
+    def has_next(self) -> bool:
+        return self.page < self.total_pages
+
+
+def build_query_path(path: str, params: dict[str, object | None]) -> str:
+    query_parts: list[tuple[str, str]] = []
+    for key, value in params.items():
+        if value is None:
+            continue
+        text_value = str(value).strip()
+        if not text_value:
+            continue
+        query_parts.append((key, text_value))
+    encoded = urlencode(query_parts)
+    return f"{path}?{encoded}" if encoded else path
+
+
+def build_pagination(*, total_count: int, limit: int, page: int) -> PaginationState:
+    total_pages = max(1, (total_count + limit - 1) // limit) if total_count else 1
+    safe_page = min(max(1, page), total_pages)
+    offset = (safe_page - 1) * limit
+    if total_count:
+        page_start = offset + 1
+        page_end = min(offset + limit, total_count)
+    else:
+        page_start = 0
+        page_end = 0
+    return PaginationState(
+        page=safe_page,
+        limit=limit,
+        total_count=total_count,
+        total_pages=total_pages,
+        offset=offset,
+        page_start=page_start,
+        page_end=page_end,
+    )
+
+
+def pagination_window(pagination: PaginationState) -> list[int | None]:
+    if pagination.total_pages <= 7:
+        return list(range(1, pagination.total_pages + 1))
+
+    pages = {1, pagination.total_pages}
+    for candidate in range(pagination.page - 1, pagination.page + 2):
+        if 1 <= candidate <= pagination.total_pages:
+            pages.add(candidate)
+
+    items: list[int | None] = []
+    previous_page = None
+    for page_number in sorted(pages):
+        if previous_page is not None and page_number - previous_page > 1:
+            items.append(None)
+        items.append(page_number)
+        previous_page = page_number
+    return items
+
+
+def pagination_link_html(
+    label: str,
+    *,
+    href: str | None = None,
+    current: bool = False,
+    disabled: bool = False,
+) -> str:
+    classes = ["pagination-link"]
+    if current:
+        classes.append("is-current")
+    if disabled:
+        classes.append("is-disabled")
+    class_attr = " ".join(classes)
+    if current:
+        return f'<span class="{class_attr}" aria-current="page">{html.escape(label)}</span>'
+    if disabled or not href:
+        return f'<span class="{class_attr}" aria-disabled="true">{html.escape(label)}</span>'
+    return f'<a class="{class_attr}" href="{html.escape(href, quote=True)}">{html.escape(label)}</a>'
+
+
+def pagination_nav(
+    *,
+    path: str,
+    base_params: dict[str, object | None],
+    pagination: PaginationState,
+) -> str:
+    if pagination.total_pages <= 1:
+        return ""
+
+    def page_href(page_number: int) -> str:
+        params = dict(base_params)
+        params["page"] = page_number if page_number > 1 else None
+        return build_query_path(path, params)
+
+    link_parts = [
+        pagination_link_html(
+            "Anterior",
+            href=page_href(pagination.page - 1) if pagination.has_previous else None,
+            disabled=not pagination.has_previous,
+        )
+    ]
+    for item in pagination_window(pagination):
+        if item is None:
+            link_parts.append('<span class="pagination-gap" aria-hidden="true">...</span>')
+            continue
+        link_parts.append(
+            pagination_link_html(
+                str(item),
+                href=page_href(item),
+                current=item == pagination.page,
+            )
+        )
+    link_parts.append(
+        pagination_link_html(
+            "Proxima",
+            href=page_href(pagination.page + 1) if pagination.has_next else None,
+            disabled=not pagination.has_next,
+        )
+    )
+    return f"""
+    <nav class="pagination" aria-label="Paginacao">
+      <span class="pagination-status">Pagina {pagination.page} de {pagination.total_pages}</span>
+      <div class="pagination-links">{''.join(link_parts)}</div>
+    </nav>
+    """
+
+
+def results_summary_text(pagination: PaginationState) -> str:
+    if pagination.total_count == 0:
+        return "Nenhum resultado encontrado."
+    result_label = "resultado" if pagination.total_count == 1 else "resultados"
+    return (
+        f"Mostrando {pagination.page_start} a {pagination.page_end} "
+        f"de {pagination.total_count} {result_label}."
+    )
+
+
 def sql_like(value: str) -> str:
     return f"%{value.strip()}%"
 
@@ -557,6 +1440,66 @@ def text(value: object | None, fallback: str = "-") -> str:
 
 def escape(value: object | None, fallback: str = "-") -> str:
     return html.escape(text(value, fallback))
+
+
+def normalize_iso_datetime(value: str) -> str:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    match = re.fullmatch(
+        r"(?P<base>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})"
+        r"(?P<fraction>\.\d+)?"
+        r"(?P<timezone>[+-]\d{2}:\d{2})?",
+        normalized,
+    )
+    if not match:
+        return normalized
+    fraction = match.group("fraction")
+    if fraction:
+        fraction = "." + fraction[1:7].ljust(6, "0")
+    return f"{match.group('base')}{fraction or ''}{match.group('timezone') or ''}"
+
+
+def format_datetime_display(value: object | None) -> str:
+    raw_value = text(value, "")
+    if not raw_value or raw_value == "-":
+        return "-"
+    normalized = normalize_iso_datetime(raw_value)
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            parsed = datetime.strptime(normalized, "%Y-%m-%d")
+            return parsed.strftime("%d/%m/%Y")
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return raw_value
+    return parsed.strftime("%d/%m/%Y %H:%M:%S")
+
+
+def sort_value_cell(display_value: str, sort_value: object | None) -> tuple[str, str]:
+    return (display_value, text(sort_value, ""))
+
+
+def datetime_cell(value: object | None) -> tuple[str, str]:
+    return sort_value_cell(escape(format_datetime_display(value)), value)
+
+
+def source_resolution_label(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> str:
+    row_keys = set(row.keys())
+    source_id = int(row["id"]) if "id" in row_keys else None
+    source_path = row["source_path"] if "source_path" in row_keys else None
+    image_width = row["image_width"] if "image_width" in row_keys else None
+    image_height = row["image_height"] if "image_height" in row_keys else None
+    image_width, image_height = ensure_source_image_dimensions(
+        connection,
+        source_id=source_id,
+        source_path=source_path,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    return format_source_resolution(image_width, image_height) or "-"
 
 
 def truncate(value: str | None, *, size: int = 100) -> str:
@@ -639,7 +1582,7 @@ def nav_link(path: str, label: str, active_path: str) -> str:
     return f'<a class="{active_class}" href="{path}">{html.escape(label)}</a>'
 
 
-def layout(*, title: str, body: str, active_path: str) -> str:
+def layout(*, title: str, body: str, active_path: str, extra_scripts: str = "") -> str:
     nav = "".join(
         (
             nav_link("/", "Visao geral", active_path),
@@ -667,12 +1610,13 @@ def layout(*, title: str, body: str, active_path: str) -> str:
       {body}
     </div>
     {PAGE_SCRIPT}
+    {extra_scripts}
   </body>
 </html>
 """
 
 
-def table_html(headers: list[str], rows: list[list[str]]) -> str:
+def table_html(headers: list[str], rows: list[list[str | tuple[str, str]]]) -> str:
     if not rows:
         return '<div class="empty">Nenhum resultado encontrado.</div>'
 
@@ -697,7 +1641,14 @@ def table_html(headers: list[str], rows: list[list[str]]) -> str:
     )
     body_parts: list[str] = []
     for row in rows:
-        body_cells = "".join(f"<td>{cell}</td>" for cell in row)
+        body_cells = "".join(
+            (
+                f'<td data-sort-value="{html.escape(cell[1], quote=True)}">{cell[0]}</td>'
+                if isinstance(cell, tuple)
+                else f"<td>{cell}</td>"
+            )
+            for cell in row
+        )
         body_parts.append(f"<tr>{body_cells}</tr>")
     return (
         "<div style=\"overflow:auto;\">"
@@ -713,14 +1664,23 @@ def search_form(
     placeholder: str,
     q: str = "",
     extras: str = "",
+    reset_href: str | None = None,
 ) -> str:
+    reset_link = (
+        f'<a class="secondary-link" href="{html.escape(reset_href, quote=True)}">Limpar filtros</a>'
+        if reset_href
+        else ""
+    )
     return f"""
     <form class="search" action="{action}" method="get">
       <label>{html.escape(label)}</label>
       <div class="inputs">
         <input type="search" name="q" value="{html.escape(q)}" placeholder="{html.escape(placeholder)}">
         {extras}
-        <button type="submit">Buscar</button>
+        <div class="search-actions">
+          <button type="submit">Buscar</button>
+          {reset_link}
+        </div>
       </div>
     </form>
     """
@@ -744,12 +1704,33 @@ def notice_banner(params: dict[str, list[str]]) -> str:
 def sync_anki_action(*, next_path: str = "/") -> str:
     safe_next = html.escape(next_path, quote=True)
     return f"""
-    <div class="action-row">
-      <form class="inline-action" action="/actions/sync-anki" method="post">
-        <input type="hidden" name="next" value="{safe_next}">
-        <button type="submit">Sincronizar com o Anki</button>
-      </form>
-      <span class="muted">A acao sincroniza termos e kanji com o Anki, atualizando os decks e a prioridade dos cards novos.</span>
+    <div class="anki-sync-root" data-anki-sync-root>
+      <div class="action-row">
+        <form class="inline-action" action="/actions/sync-anki" method="post" data-anki-sync-form>
+          <input type="hidden" name="next" value="{safe_next}">
+          <button type="submit" data-anki-sync-submit>Sincronizar com o Anki</button>
+        </form>
+        <span class="muted">A acao sincroniza termos e kanji com o Anki, atualizando os decks e a prioridade dos cards novos.</span>
+      </div>
+      <div
+        class="anki-sync-progress"
+        data-anki-sync-progress
+        role="progressbar"
+        aria-live="polite"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="0"
+        hidden
+      >
+        <div class="anki-sync-progress-head">
+          <span class="anki-sync-progress-title" data-anki-sync-title>Sincronizando com o Anki</span>
+          <span class="anki-sync-progress-value" data-anki-sync-value>0%</span>
+        </div>
+        <div class="anki-sync-progress-track">
+          <div class="anki-sync-progress-fill" data-anki-sync-fill></div>
+        </div>
+        <div class="anki-sync-progress-message" data-anki-sync-message>Preparando sincronizacao com o Anki...</div>
+      </div>
     </div>
     """
 
@@ -807,14 +1788,26 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             SELECT
                 id,
                 COALESCE(title, '(sem titulo)') AS title,
-                COALESCE(game, '-') AS game,
                 COALESCE(scene, '-') AS scene,
+                source_path,
+                image_width,
+                image_height,
                 COALESCE(captured_at, created_at) AS seen_at
             FROM sources
-            ORDER BY id DESC
+            ORDER BY seen_at DESC, id DESC
             LIMIT 8
             """
         ).fetchall()
+        recent_source_rows = [
+            [
+                f'<a href="/sources/{row["id"]}">#{row["id"]}</a>',
+                escape(row["title"]),
+                escape(source_resolution_label(connection, row)),
+                escape(row["scene"]),
+                datetime_cell(row["seen_at"]),
+            ]
+            for row in recent_sources
+        ]
         recent_cards = connection.execute(
             """
             SELECT
@@ -855,16 +1848,6 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             escape(row["priority_score"]),
         ]
         for row in top_kanji
-    ]
-    source_rows = [
-        [
-            f'<a href="/sources/{row["id"]}">#{row["id"]}</a>',
-            escape(row["title"]),
-            escape(row["game"]),
-            escape(row["scene"]),
-            escape(row["seen_at"]),
-        ]
-        for row in recent_sources
     ]
     card_rows = [
         [
@@ -919,7 +1902,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
 
       <section class="panel panel-wide">
         <h2>Fontes recentes</h2>
-        {table_html(["ID", "Titulo", "Game", "Cena", "Quando"], source_rows)}
+        {table_html(["ID", "Titulo", "Resolucao", "Cena", "Quando"], recent_source_rows)}
       </section>
 
       <section class="panel panel-side">
@@ -933,13 +1916,19 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
       </section>
     </div>
     """
-    return layout(title="JP Catalog", body=body, active_path="/")
+    return layout(
+        title="JP Catalog",
+        body=body,
+        active_path="/",
+        extra_scripts=auto_reload_script(db_path),
+    )
 
 
 def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
     q = first_value(params, "q")
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
+    page = parse_page(first_value(params, "page", "1"))
     order_clause = {
         "priority": TERM_PRIORITY_ORDER_SQL.strip(),
         "recent": "last_seen_at DESC, id DESC",
@@ -960,6 +1949,15 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         where_clause = "WHERE " + " AND ".join(filters)
 
     with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM v_terms_overview
+            {where_clause}
+            """,
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
         rows = connection.execute(
             f"""
             SELECT
@@ -974,11 +1972,22 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
             FROM v_terms_overview
             {where_clause}
             ORDER BY {order_clause}
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            [*sql_params, limit],
+            [*sql_params, pagination.limit, pagination.offset],
         ).fetchall()
 
+    base_params = {
+        "q": q.strip() or None,
+        "order": order if order != "priority" else None,
+        "limit": limit if limit != 50 else None,
+    }
+    pagination_markup = pagination_nav(
+        path="/terms",
+        base_params=base_params,
+        pagination=pagination,
+    )
+    reset_href = "/terms" if any(value is not None for value in base_params.values()) or pagination.page > 1 else None
     extras = f"""
       <div class="filters">
         <select name="order">
@@ -997,7 +2006,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
             escape(row["priority_score"]),
-            escape(row["last_seen_at"]),
+            datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
     ]
@@ -1005,19 +2014,28 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
     <div class="grid">
       <section class="panel">
         <h2>Termos</h2>
-        {search_form(action="/terms", label="Buscar no catalogo", placeholder="Ex.: 回復, かいふく, cura", q=q, extras=extras)}
-        <p>{len(rows)} resultado(s) exibidos. Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
+        {search_form(action="/terms", label="Buscar no catalogo", placeholder="Ex.: 回復, かいふく, cura", q=q, extras=extras, reset_href=reset_href)}
+        <div class="results-toolbar">
+          <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
+          {pagination_markup}
+        </div>
         {table_html(["Termo", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
       </section>
     </div>
     """
-    return layout(title="Termos", body=body, active_path="/terms")
+    return layout(
+        title="Termos",
+        body=body,
+        active_path="/terms",
+        extra_scripts=auto_reload_script(db_path),
+    )
 
 
 def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
     q = first_value(params, "q")
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
+    page = parse_page(first_value(params, "page", "1"))
     order_clause = {
         "priority": "priority_score DESC, id DESC",
         "recent": "last_seen_at DESC, id DESC",
@@ -1036,6 +2054,15 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         where_clause = "WHERE " + " AND ".join(filters)
 
     with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM v_kanji_overview
+            {where_clause}
+            """,
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
         rows = connection.execute(
             f"""
             SELECT
@@ -1050,11 +2077,22 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
             FROM v_kanji_overview
             {where_clause}
             ORDER BY {order_clause}
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            [*sql_params, limit],
+            [*sql_params, pagination.limit, pagination.offset],
         ).fetchall()
 
+    base_params = {
+        "q": q.strip() or None,
+        "order": order if order != "priority" else None,
+        "limit": limit if limit != 50 else None,
+    }
+    pagination_markup = pagination_nav(
+        path="/kanji",
+        base_params=base_params,
+        pagination=pagination,
+    )
+    reset_href = "/kanji" if any(value is not None for value in base_params.values()) or pagination.page > 1 else None
     extras = f"""
       <div class="filters">
         <select name="order">
@@ -1073,7 +2111,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
             escape(row["priority_score"]),
-            escape(row["last_seen_at"]),
+            datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
     ]
@@ -1083,13 +2121,21 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         {notice_banner(params)}
         <h2>Kanji</h2>
         {sync_anki_action(next_path="/kanji")}
-        {search_form(action="/kanji", label="Buscar no catalogo", placeholder="Ex.: 魔, 学, 回", q=q, extras=extras)}
-        <p>{len(rows)} resultado(s) exibidos. Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
+        {search_form(action="/kanji", label="Buscar no catalogo", placeholder="Ex.: 魔, 学, 回", q=q, extras=extras, reset_href=reset_href)}
+        <div class="results-toolbar">
+          <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
+          {pagination_markup}
+        </div>
         {table_html(["Kanji", "Significado", "Palavras", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
       </section>
     </div>
     """
-    return layout(title="Kanji", body=body, active_path="/kanji")
+    return layout(
+        title="Kanji",
+        body=body,
+        active_path="/kanji",
+        extra_scripts=auto_reload_script(db_path),
+    )
 
 
 def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
@@ -1192,7 +2238,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
             escape(row["title"]),
             escape(row["game"]),
             escape(row["scene"]),
-            escape(row["seen_at"]),
+            datetime_cell(row["seen_at"]),
         ]
         for row in source_rows
     ]
@@ -1228,10 +2274,10 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
       <section class="panel panel-side">
         <h3>Resumo</h3>
         <ul class="meta-list">
-          <li><strong>Primeira vez</strong>{escape(kanji["first_seen_at"])}</li>
-          <li><strong>Ultima vez</strong>{escape(kanji["last_seen_at"])}</li>
-          <li><strong>Criado em</strong>{escape(kanji["created_at"])}</li>
-          <li><strong>Atualizado em</strong>{escape(kanji["updated_at"])}</li>
+          <li><strong>Primeira vez</strong>{escape(format_datetime_display(kanji["first_seen_at"]))}</li>
+          <li><strong>Ultima vez</strong>{escape(format_datetime_display(kanji["last_seen_at"]))}</li>
+          <li><strong>Criado em</strong>{escape(format_datetime_display(kanji["created_at"]))}</li>
+          <li><strong>Atualizado em</strong>{escape(format_datetime_display(kanji["updated_at"]))}</li>
         </ul>
       </section>
 
@@ -1375,7 +2421,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             escape(row["confidence"]),
             escape(row["title"]),
             escape(row["scene"]),
-            escape(row["seen_at"]),
+            datetime_cell(row["seen_at"]),
         ]
         for row in occurrences
     ]
@@ -1389,7 +2435,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             escape(row["confidence"]),
             escape(row["title"]),
             escape(row["scene"]),
-            escape(row["seen_at"]),
+            datetime_cell(row["seen_at"]),
         ]
         for row in segment_occurrences
     ]
@@ -1457,10 +2503,10 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
         <div class="chips">{form_chips}</div>
         <div style="height: 14px;"></div>
         <ul class="meta-list">
-          <li><strong>Primeira vez</strong>{escape(term["first_seen_at"])}</li>
-          <li><strong>Ultima vez</strong>{escape(term["last_seen_at"])}</li>
-          <li><strong>Criado em</strong>{escape(term["created_at"])}</li>
-          <li><strong>Atualizado em</strong>{escape(term["updated_at"])}</li>
+          <li><strong>Primeira vez</strong>{escape(format_datetime_display(term["first_seen_at"]))}</li>
+          <li><strong>Ultima vez</strong>{escape(format_datetime_display(term["last_seen_at"]))}</li>
+          <li><strong>Criado em</strong>{escape(format_datetime_display(term["created_at"]))}</li>
+          <li><strong>Atualizado em</strong>{escape(format_datetime_display(term["updated_at"]))}</li>
         </ul>
       </section>
 
@@ -1478,9 +2524,15 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
     return layout(title=f"Termo {term['lemma']}", body=body, active_path="/terms")
 
 
-def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
+SOURCES_TABLE_HEADERS = ["ID", "Tipo", "Titulo", "Resolucao", "Cena", "Termos", "Quando", "Texto"]
+
+
+def load_sources_rows(
+    db_path: Path, params: dict[str, list[str]]
+) -> tuple[str, int, PaginationState, list[dict[str, object]]]:
     q = first_value(params, "q")
     limit = parse_limit(first_value(params, "limit", "50"))
+    page = parse_page(first_value(params, "page", "1"))
 
     filters = []
     sql_params: list[object] = []
@@ -1503,14 +2555,25 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
         where_clause = "WHERE " + " AND ".join(part.strip() for part in filters)
 
     with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM sources AS s
+            {where_clause}
+            """,
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
         rows = connection.execute(
             f"""
             SELECT
                 s.id,
                 s.source_type,
                 COALESCE(s.title, '(sem titulo)') AS title,
-                COALESCE(s.game, '-') AS game,
                 COALESCE(s.scene, '-') AS scene,
+                s.source_path,
+                s.image_width,
+                s.image_height,
                 COALESCE(s.captured_at, s.created_at) AS seen_at,
                 COALESCE(s.raw_text, '') AS raw_text,
                 (
@@ -1520,36 +2583,308 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 ) AS linked_terms
             FROM sources AS s
             {where_clause}
-            ORDER BY s.id DESC
-            LIMIT ?
+            ORDER BY seen_at DESC, s.id DESC
+            LIMIT ? OFFSET ?
             """,
-            [*sql_params, limit],
+            [*sql_params, pagination.limit, pagination.offset],
         ).fetchall()
+        normalized_rows = []
+        for row in rows:
+            normalized_rows.append(
+                {
+                    "id": row["id"],
+                    "source_type": row["source_type"],
+                    "title": row["title"],
+                    "resolution": source_resolution_label(connection, row),
+                    "scene": row["scene"],
+                    "linked_terms": row["linked_terms"],
+                    "seen_at": row["seen_at"],
+                    "raw_text": row["raw_text"],
+                }
+            )
+    return q, limit, pagination, normalized_rows
 
-    extras = f'<input type="number" name="limit" value="{limit}" min="1" max="200">'
-    table_rows = [
+
+def sources_table_rows(rows: list[dict[str, object]]) -> list[list[str]]:
+    return [
         [
             f'<a href="/sources/{row["id"]}">#{row["id"]}</a>',
             escape(row["source_type"]),
             escape(row["title"]),
+            escape(row["resolution"]),
             escape(row["scene"]),
             escape(row["linked_terms"]),
-            escape(row["seen_at"]),
+            datetime_cell(row["seen_at"]),
             escape(truncate(text(row["raw_text"], ""), size=72)),
         ]
         for row in rows
     ]
+
+
+def sources_table_markup(rows: list[dict[str, object]]) -> str:
+    return table_html(SOURCES_TABLE_HEADERS, sources_table_rows(rows))
+
+
+def build_sources_payload(
+    *,
+    db_path: Path,
+    q: str,
+    limit: int,
+    pagination: PaginationState,
+    rows: list[dict[str, object]],
+) -> dict[str, object]:
+    base_params = {
+        "q": q.strip() or None,
+        "limit": limit if limit != 50 else None,
+    }
+    revision = (
+        f"{database_revision_token(db_path)}:{pagination.page}:{pagination.total_count}:"
+        + ",".join(str(row["id"]) for row in rows)
+    )
+    return {
+        "revision": revision,
+        "count_label": results_summary_text(pagination),
+        "pagination_html": pagination_nav(
+            path="/sources",
+            base_params=base_params,
+            pagination=pagination,
+        ),
+        "table_html": sources_table_markup(rows),
+    }
+
+
+def sources_live_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    q, limit, pagination, rows = load_sources_rows(db_path, params)
+    return build_sources_payload(
+        db_path=db_path,
+        q=q,
+        limit=limit,
+        pagination=pagination,
+        rows=rows,
+    )
+
+
+def auto_reload_script(db_path: Path, endpoint: str = "/live/revision", interval_ms: int = 4000) -> str:
+    endpoint_literal = json.dumps(endpoint, ensure_ascii=False)
+    revision_literal = json.dumps(database_revision_token(db_path), ensure_ascii=False)
+    interval_literal = json.dumps(interval_ms)
+    return f"""
+<script>
+  (() => {{
+    const endpoint = {endpoint_literal};
+    const pollIntervalMs = {interval_literal};
+    const sortStateKey =
+      "jpCatalog:auto-sort:" + window.location.pathname + window.location.search;
+    let currentRevision = {revision_literal};
+    let inFlight = false;
+
+    function hasFocusedField() {{
+      const active = document.activeElement;
+      return Boolean(active && active.matches("input, textarea, select"));
+    }}
+
+    function saveSortStates() {{
+      if (!window.jpCatalog || typeof window.jpCatalog.readSortState !== "function") {{
+        return;
+      }}
+      try {{
+        const states = Array.from(document.querySelectorAll("table.sortable-table")).map((table) =>
+          window.jpCatalog.readSortState(table)
+        );
+        window.sessionStorage.setItem(sortStateKey, JSON.stringify(states));
+      }} catch (_error) {{
+      }}
+    }}
+
+    function restoreSortStates() {{
+      if (!window.jpCatalog || typeof window.jpCatalog.applySortState !== "function") {{
+        return;
+      }}
+      try {{
+        const rawStates = window.sessionStorage.getItem(sortStateKey);
+        if (!rawStates) {{
+          return;
+        }}
+        window.sessionStorage.removeItem(sortStateKey);
+        const states = JSON.parse(rawStates);
+        if (!Array.isArray(states)) {{
+          return;
+        }}
+        const tables = Array.from(document.querySelectorAll("table.sortable-table"));
+        states.forEach((state, index) => {{
+          window.jpCatalog.applySortState(tables[index], state);
+        }});
+      }} catch (_error) {{
+      }}
+    }}
+
+    async function refreshPage() {{
+      if (
+        inFlight
+        || document.hidden
+        || hasFocusedField()
+        || (
+          window.jpCatalog
+          && typeof window.jpCatalog.isSyncingAnki === "function"
+          && window.jpCatalog.isSyncingAnki()
+        )
+      ) {{
+        return;
+      }}
+      inFlight = true;
+      try {{
+        const response = await fetch(endpoint, {{
+          headers: {{ "Accept": "application/json" }},
+          cache: "no-store",
+        }});
+        if (!response.ok) {{
+          return;
+        }}
+        const payload = await response.json();
+        const nextRevision = payload && typeof payload.revision === "string" ? payload.revision : "";
+        if (!nextRevision || nextRevision === currentRevision) {{
+          return;
+        }}
+        currentRevision = nextRevision;
+        saveSortStates();
+        window.location.reload();
+      }} catch (_error) {{
+      }} finally {{
+        inFlight = false;
+      }}
+    }}
+
+    restoreSortStates();
+    const timer = window.setInterval(refreshPage, pollIntervalMs);
+    document.addEventListener("visibilitychange", () => {{
+      if (!document.hidden) {{
+        refreshPage();
+      }}
+    }});
+    window.addEventListener("beforeunload", () => {{
+      window.clearInterval(timer);
+    }}, {{ once: true }});
+  }})();
+</script>
+"""
+
+
+def sources_live_script(endpoint: str) -> str:
+    endpoint_literal = json.dumps(endpoint, ensure_ascii=False)
+    return f"""
+<script>
+  (() => {{
+    const root = document.querySelector("[data-sources-live-root]");
+    if (!root) {{
+      return;
+    }}
+    const endpoint = {endpoint_literal};
+    const countNode = root.querySelector("[data-sources-count]");
+    const paginationNode = root.querySelector("[data-sources-pagination]");
+    const tableNode = root.querySelector("[data-sources-table]");
+    let currentRevision = root.dataset.liveRevision || "";
+    let inFlight = false;
+
+    async function refreshSources() {{
+      if (inFlight || document.hidden) {{
+        return;
+      }}
+      inFlight = true;
+      const existingTable = tableNode ? tableNode.querySelector("table.sortable-table") : null;
+      const previousSortState =
+        window.jpCatalog && typeof window.jpCatalog.readSortState === "function"
+          ? window.jpCatalog.readSortState(existingTable)
+          : null;
+      try {{
+        const response = await fetch(endpoint, {{
+          headers: {{ "Accept": "application/json" }},
+          cache: "no-store",
+        }});
+        if (!response.ok) {{
+          return;
+        }}
+        const payload = await response.json();
+        if (!payload || payload.revision === currentRevision) {{
+          return;
+        }}
+        currentRevision = payload.revision || "";
+        root.dataset.liveRevision = currentRevision;
+        if (countNode) {{
+          countNode.textContent = payload.count_label || "";
+        }}
+        if (paginationNode) {{
+          paginationNode.innerHTML = payload.pagination_html || "";
+        }}
+        if (tableNode) {{
+          tableNode.innerHTML = payload.table_html || "";
+          if (window.jpCatalog && typeof window.jpCatalog.initSortableTables === "function") {{
+            window.jpCatalog.initSortableTables(tableNode);
+            if (previousSortState && typeof window.jpCatalog.applySortState === "function") {{
+              const nextTable = tableNode.querySelector("table.sortable-table");
+              window.jpCatalog.applySortState(nextTable, previousSortState);
+            }}
+          }}
+        }}
+      }} catch (_error) {{
+      }} finally {{
+        inFlight = false;
+      }}
+    }}
+
+    const timer = window.setInterval(refreshSources, 4000);
+    document.addEventListener("visibilitychange", () => {{
+      if (!document.hidden) {{
+        refreshSources();
+      }}
+    }});
+    window.addEventListener("beforeunload", () => {{
+      window.clearInterval(timer);
+    }}, {{ once: true }});
+  }})();
+</script>
+"""
+
+
+def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    q, limit, pagination, rows = load_sources_rows(db_path, params)
+
+    extras = f'<input type="number" name="limit" value="{limit}" min="1" max="200">'
+    payload = build_sources_payload(
+        db_path=db_path,
+        q=q,
+        limit=limit,
+        pagination=pagination,
+        rows=rows,
+    )
+    reset_href = "/sources" if q.strip() or limit != 50 or pagination.page > 1 else None
+    live_params = {
+        "q": q.strip() or None,
+        "limit": limit if limit != 50 else None,
+        "page": pagination.page if pagination.page > 1 else None,
+    }
+    live_query = urlencode(
+        [(key, str(value)) for key, value in live_params.items() if value is not None]
+    )
+    live_endpoint = f"/sources/live?{live_query}" if live_query else "/sources/live"
     body = f"""
     <div class="grid">
-      <section class="panel">
+      <section class="panel" data-sources-live-root data-live-revision="{html.escape(str(payload["revision"]))}">
         <h2>Fontes</h2>
-        {search_form(action="/sources", label="Buscar em fontes", placeholder="Ex.: battle menu, config, texto OCR", q=q, extras=extras)}
-        <p>{len(rows)} resultado(s) exibidos.</p>
-        {table_html(["ID", "Tipo", "Titulo", "Cena", "Termos", "Quando", "Texto"], table_rows)}
+        {search_form(action="/sources", label="Buscar em fontes", placeholder="Ex.: battle menu, config, texto OCR", q=q, extras=extras, reset_href=reset_href)}
+        <div class="results-toolbar">
+          <p class="results-summary" data-sources-count>{html.escape(str(payload["count_label"]))}</p>
+          <div data-sources-pagination>{payload["pagination_html"]}</div>
+        </div>
+        <div data-sources-table>{payload["table_html"]}</div>
       </section>
     </div>
     """
-    return layout(title="Fontes", body=body, active_path="/sources")
+    return layout(
+        title="Fontes",
+        body=body,
+        active_path="/sources",
+        extra_scripts=sources_live_script(live_endpoint),
+    )
 
 
 def source_detail_page(db_path: Path, source_id: int) -> str | None:
@@ -1564,10 +2899,37 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
                 game,
                 scene,
                 source_path,
+                image_width,
+                image_height,
                 raw_text,
                 notes,
                 captured_at,
-                created_at
+                created_at,
+                (
+                    SELECT translated_text
+                    FROM source_translations AS st
+                    WHERE st.source_id = sources.id
+                      AND st.target_language = 'en'
+                      AND st.status = 'translated'
+                    ORDER BY st.updated_at DESC, st.id DESC
+                    LIMIT 1
+                ) AS translated_text_en,
+                (
+                    SELECT status
+                    FROM source_translations AS st
+                    WHERE st.source_id = sources.id
+                      AND st.target_language = 'en'
+                    ORDER BY st.updated_at DESC, st.id DESC
+                    LIMIT 1
+                ) AS translated_text_en_status,
+                (
+                    SELECT provider
+                    FROM source_translations AS st
+                    WHERE st.source_id = sources.id
+                      AND st.target_language = 'en'
+                    ORDER BY st.updated_at DESC, st.id DESC
+                    LIMIT 1
+                ) AS translated_text_en_provider
             FROM sources
             WHERE id = ?
             """,
@@ -1575,6 +2937,7 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
         ).fetchone()
         if source is None:
             return None
+        resolution_label = source_resolution_label(connection, source)
 
         term_rows = connection.execute(
             """
@@ -1714,9 +3077,9 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
         <ul class="meta-list">
           <li><strong>Tipo</strong>{escape(source["source_type"])}</li>
           <li><strong>Idioma</strong>{escape(source["language_code"])}</li>
-          <li><strong>Game</strong>{escape(source["game"] or "-")}</li>
+          <li><strong>Resolucao original</strong>{escape(resolution_label)}</li>
           <li><strong>Cena</strong>{escape(source["scene"] or "-")}</li>
-          <li><strong>Capturado em</strong>{escape(source["captured_at"] or source["created_at"])}</li>
+          <li><strong>Capturado em</strong>{escape(format_datetime_display(source["captured_at"] or source["created_at"]))}</li>
           <li><strong>Arquivo</strong><span class="mono">{escape(source["source_path"] or "-")}</span></li>
         </ul>
       </section>
@@ -1736,6 +3099,13 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
       <section class="panel panel-wide">
         <h3>Texto bruto</h3>
         <pre>{html.escape(text(source["raw_text"], "(sem texto bruto)"))}</pre>
+      </section>
+
+      <section class="panel panel-side">
+        <h3>Tradução EN</h3>
+        <p><strong>Status:</strong> {escape(source["translated_text_en_status"] or "missing")}</p>
+        <p><strong>Provider:</strong> {escape(source["translated_text_en_provider"] or "-")}</p>
+        <pre>{html.escape(text(source["translated_text_en"], "(sem tradução em inglês)"))}</pre>
       </section>
 
       <section class="panel panel-side">
@@ -1771,6 +3141,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
     q = first_value(params, "q")
     status = first_value(params, "status", "all")
     limit = parse_limit(first_value(params, "limit", "50"))
+    page = parse_page(first_value(params, "page", "1"))
 
     filters = []
     sql_params: list[object] = []
@@ -1797,6 +3168,17 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         where_clause = "WHERE " + " AND ".join(part.strip() for part in filters)
 
     with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM flashcards AS f
+            JOIN terms AS t
+                ON t.id = f.term_id
+            {where_clause}
+            """,
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
         rows = connection.execute(
             f"""
             SELECT
@@ -1818,11 +3200,22 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
             {where_clause}
             ORDER BY
             """ + FLASHCARD_PRIORITY_ORDER_SQL + """
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            [*sql_params, limit],
+            [*sql_params, pagination.limit, pagination.offset],
         ).fetchall()
 
+    base_params = {
+        "q": q.strip() or None,
+        "status": status if status != "all" else None,
+        "limit": limit if limit != 50 else None,
+    }
+    pagination_markup = pagination_nav(
+        path="/flashcards",
+        base_params=base_params,
+        pagination=pagination,
+    )
+    reset_href = "/flashcards" if any(value is not None for value in base_params.values()) or pagination.page > 1 else None
     extras = f"""
       <div class="filters">
         <select name="status">
@@ -1852,13 +3245,21 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         {notice_banner(params)}
         <h2>Flashcards</h2>
         {sync_anki_action(next_path="/flashcards")}
-        {search_form(action="/flashcards", label="Buscar cards", placeholder="Ex.: guardar, persona, progress", q=q, extras=extras)}
-        <p>{len(rows)} resultado(s) exibidos.</p>
+        {search_form(action="/flashcards", label="Buscar cards", placeholder="Ex.: guardar, persona, progress", q=q, extras=extras, reset_href=reset_href)}
+        <div class="results-toolbar">
+          <p class="results-summary">{results_summary_text(pagination)}</p>
+          {pagination_markup}
+        </div>
         {table_html(["Termo", "Leitura", "Score", "Template", "Deck", "Status", "Fonte", "Frente"], table_rows)}
       </section>
     </div>
     """
-    return layout(title="Flashcards", body=body, active_path="/flashcards")
+    return layout(
+        title="Flashcards",
+        body=body,
+        active_path="/flashcards",
+        extra_scripts=auto_reload_script(db_path),
+    )
 
 
 class CatalogRequestHandler(BaseHTTPRequestHandler):
@@ -1871,6 +3272,12 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             self.respond_html(dashboard_page(self.db_path, params))
+            return
+        if path == "/live/revision":
+            self.respond_json(live_revision_payload(self.db_path))
+            return
+        if path == "/actions/sync-anki/status":
+            self.respond_sync_anki_job_status(params)
             return
         if path == "/terms":
             self.respond_html(terms_page(self.db_path, params))
@@ -1902,6 +3309,9 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/sources":
             self.respond_html(sources_page(self.db_path, params))
+            return
+        if path == "/sources/live":
+            self.respond_json(sources_live_payload(self.db_path, params))
             return
         if path.startswith("/sources/") and path.endswith("/image"):
             source_id = self.parse_int_tail(path[:-6], "/sources/")
@@ -1949,10 +3359,25 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             return None
 
+    def prefers_json_response(self) -> bool:
+        accept = (self.headers.get("Accept") or "").lower()
+        requested_with = (self.headers.get("X-Requested-With") or "").lower()
+        return "application/json" in accept or requested_with == "fetch"
+
     def respond_html(self, payload: str, *, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = payload.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def respond_json(self, payload: object, *, status: HTTPStatus = HTTPStatus.OK) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -2002,65 +3427,65 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         return parse_qs(raw_body)
 
     def run_catalog_command(self, *command_parts: str) -> subprocess.CompletedProcess[str]:
-        command = [
-            sys.executable,
-            str(ROOT / "lang_jp.py"),
-            "--db",
-            str(self.db_path),
-            *command_parts,
-        ]
-        return subprocess.run(
-            command,
-            cwd=str(ROOT.parent),
-            capture_output=True,
-            text=True,
-        )
+        return run_catalog_command_for_db(self.db_path, *command_parts)
 
     def append_notice(self, path: str, *, message: str, level: str) -> str:
-        parsed = urlparse(path or "/")
-        query = parse_qs(parsed.query)
-        query["notice"] = [message]
-        query["level"] = [level]
-        encoded = urlencode(
-            [(key, value) for key, values in query.items() for value in values]
-        )
-        target = parsed.path or "/"
-        return f"{target}?{encoded}" if encoded else target
+        return build_notice_path(path, message=message, level=level)
+
+    def respond_sync_anki_job_status(self, params: dict[str, list[str]]) -> None:
+        job_id = first_value(params, "job_id", "").strip()
+        if not job_id:
+            self.respond_json(
+                {"message": "Job de sincronizacao nao informado."},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        state = get_sync_job_state(job_id)
+        if state is None:
+            self.respond_json(
+                {"message": "Job de sincronizacao nao encontrado."},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+
+        self.respond_json(sync_job_payload(state))
 
     def run_sync_anki_action(self) -> None:
         form_data = self.read_form_data()
-        next_path = first_value(form_data, "next", "/") or "/"
+        if self.prefers_json_response():
+            self.respond_json(start_sync_anki_job(self.db_path))
+            return
 
+        next_path = first_value(form_data, "next", "/") or "/"
         term_result = self.run_catalog_command("sync-anki-words")
-        term_lines = [
-            line.strip()
-            for line in (term_result.stdout + "\n" + term_result.stderr).splitlines()
-            if line.strip()
-        ]
+        term_lines = command_output_lines(
+            stdout=term_result.stdout,
+            stderr=term_result.stderr,
+        )
         if term_result.returncode != 0:
-            message = term_lines[-1] if term_lines else "Falha ao sincronizar termos com o Anki."
+            message = sync_failure_message(
+                term_lines,
+                "Falha ao sincronizar termos com o Anki.",
+            )
             self.redirect(self.append_notice(next_path, message=message, level="error"))
             return
 
         kanji_result = self.run_catalog_command("sync-anki-kanji")
-        kanji_lines = [
-            line.strip()
-            for line in (kanji_result.stdout + "\n" + kanji_result.stderr).splitlines()
-            if line.strip()
-        ]
+        kanji_lines = command_output_lines(
+            stdout=kanji_result.stdout,
+            stderr=kanji_result.stderr,
+        )
         if kanji_result.returncode != 0:
-            message = kanji_lines[-1] if kanji_lines else "Falha ao sincronizar kanji com o Anki."
+            message = sync_failure_message(
+                kanji_lines,
+                "Falha ao sincronizar kanji com o Anki.",
+            )
             self.redirect(self.append_notice(next_path, message=message, level="error"))
             return
 
-        term_message = next(
-            (line for line in reversed(term_lines) if line.startswith("Synced ")),
-            "Termos sincronizados.",
-        )
-        kanji_message = next(
-            (line for line in reversed(kanji_lines) if line.startswith("Synced ")),
-            "Kanji sincronizados.",
-        )
+        term_message = sync_result_message(term_lines, "Termos sincronizados.")
+        kanji_message = sync_result_message(kanji_lines, "Kanji sincronizados.")
         message = f"{term_message} {kanji_message}"
         self.redirect(self.append_notice(next_path, message=message, level="info"))
 
