@@ -1,8 +1,9 @@
-paddleocr
-paddlepaddle
 Pillow
 SudachiPy
 sudachidict_core
+meikiocr
+onnxruntime
 manga-ocr
 opencv-python-headless
 easyocr
+# The ocr_bench `paddle_v5_post` engine also needs paddleocr + paddlepaddle; install them by hand.

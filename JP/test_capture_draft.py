@@ -4,6 +4,7 @@ import struct
 import tempfile
 import sys
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 import zlib
@@ -30,6 +31,7 @@ from lang_jp import (
     create_capture_job,
     create_source_record,
     db_connect,
+    recover_stale_capture_jobs,
     upsert_source_translation,
 )
 from ocr_backends import OcrBlock, sort_ocr_blocks_reading_order
@@ -372,6 +374,114 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_recover_stale_capture_jobs_only_resets_old_processing_rows(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            stale_job_id = create_capture_job(
+                connection,
+                captured_at="2026-04-05T10:00:00-03:00",
+                temp_image_path="C:/tmp/capture-stale.png",
+                image_sha256="sha-capture-stale",
+                image_phash=None,
+            )
+            fresh_processing_job_id = create_capture_job(
+                connection,
+                captured_at="2026-04-05T10:10:00-03:00",
+                temp_image_path="C:/tmp/capture-fresh-processing.png",
+                image_sha256="sha-capture-fresh-processing",
+                image_phash=None,
+            )
+            old_but_recently_claimed_job_id = create_capture_job(
+                connection,
+                captured_at="2026-04-05T10:20:00-03:00",
+                temp_image_path="C:/tmp/capture-recently-claimed.png",
+                image_sha256="sha-capture-recently-claimed",
+                image_phash=None,
+            )
+            pending_job_id = create_capture_job(
+                connection,
+                captured_at="2026-04-05T10:30:00-03:00",
+                temp_image_path="C:/tmp/capture-pending.png",
+                image_sha256="sha-capture-pending",
+                image_phash=None,
+            )
+            connection.execute(
+                """
+                UPDATE capture_jobs
+                SET status = 'processing', created_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("2026-04-05 09:00:00", "2026-04-05 09:00:00", stale_job_id),
+            )
+            connection.execute(
+                """
+                UPDATE capture_jobs
+                SET status = 'processing', created_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "2026-04-05 12:30:00",
+                    "2026-04-05 12:30:00",
+                    fresh_processing_job_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE capture_jobs
+                SET status = 'processing', created_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "2026-04-05 08:00:00",
+                    "2026-04-05 13:30:00",
+                    old_but_recently_claimed_job_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE capture_jobs
+                SET created_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("2026-04-05 07:00:00", "2026-04-05 07:00:00", pending_job_id),
+            )
+            connection.commit()
+
+            recovered = recover_stale_capture_jobs(
+                connection,
+                older_than_hours=2,
+                to_status="failed",
+                now=datetime(2026, 4, 5, 14, 0, 0),
+                note="worker startup recovery",
+            )
+            connection.commit()
+
+            self.assertEqual([int(row["id"]) for row in recovered], [stale_job_id])
+            stale_row = connection.execute(
+                "SELECT status, last_error FROM capture_jobs WHERE id = ?",
+                (stale_job_id,),
+            ).fetchone()
+            fresh_row = connection.execute(
+                "SELECT status FROM capture_jobs WHERE id = ?",
+                (fresh_processing_job_id,),
+            ).fetchone()
+            recently_claimed_row = connection.execute(
+                "SELECT status FROM capture_jobs WHERE id = ?",
+                (old_but_recently_claimed_job_id,),
+            ).fetchone()
+            pending_row = connection.execute(
+                "SELECT status FROM capture_jobs WHERE id = ?",
+                (pending_job_id,),
+            ).fetchone()
+
+            self.assertEqual(stale_row["status"], "failed")
+            self.assertEqual(stale_row["last_error"], "worker startup recovery")
+            self.assertEqual(fresh_row["status"], "processing")
+            self.assertEqual(recently_claimed_row["status"], "processing")
+            self.assertEqual(pending_row["status"], "pending")
+        finally:
+            connection.close()
+
     def test_process_pending_translation_once_translates_backlog_row(self) -> None:
         translator = StubSourceTranslator(target_language="en")
         connection = db_connect(self.db_path)
@@ -497,6 +607,7 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
             translate_mock.assert_called_once_with(
                 "回復アイテム",
                 reading="かいふくアイテム",
+                pos="名詞",
             )
         finally:
             connection.close()

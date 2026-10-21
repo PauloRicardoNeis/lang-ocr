@@ -10,9 +10,20 @@ import numpy as np
 from PIL import Image
 
 
-OCR_BACKEND_CHOICES = ("manga_ocr", "easyocr")
+OCR_BACKEND_CHOICES = ("manga_ocr", "easyocr", "meikiocr")
+CAPTURE_OCR_BACKEND_CHOICES = ("meikiocr", "easyocr")
+DEFAULT_CAPTURE_OCR_BACKEND = "meikiocr"
 DEFAULT_EASYOCR_LANGUAGES = ("ja", "en")
 DEFAULT_EASYOCR_GPU_MODE = "auto"
+# Post-filter thresholds tuned on JP/ocr_bench (see ocr-precision-research.md).
+DEFAULT_MEIKIOCR_MIN_CHAR_CONFIDENCE = 0.3  # stray punctuation in word gaps scores ~0.1-0.2
+MIN_LINE_JAPANESE_CHARS = 2
+MIN_LINE_JAPANESE_RATIO = 0.3
+CONTAINED_BOX_MIN_COVERAGE = 0.7
+FURIGANA_MAX_HEIGHT_RATIO = 0.85
+FURIGANA_MIN_HORIZONTAL_OVERLAP = 0.4
+ROOT = Path(__file__).resolve().parent
+MODEL_CACHE_ROOT = ROOT / "data" / "model_cache"
 
 
 @dataclass(slots=True)
@@ -55,6 +66,19 @@ def resolve_easyocr_languages(value: str | None = None) -> tuple[str, ...]:
     return parse_csv_env(raw_value, fallback=DEFAULT_EASYOCR_LANGUAGES)
 
 
+def resolve_capture_ocr_backend(value: str | None = None) -> str:
+    raw_value = value
+    if raw_value is None:
+        raw_value = os.environ.get("LANG_JP_OCR_BACKEND", DEFAULT_CAPTURE_OCR_BACKEND)
+    normalized = str(raw_value).strip().lower() or DEFAULT_CAPTURE_OCR_BACKEND
+    if normalized not in CAPTURE_OCR_BACKEND_CHOICES:
+        raise ValueError(
+            f"Unsupported LANG_JP_OCR_BACKEND={raw_value!r}; "
+            f"expected one of {', '.join(CAPTURE_OCR_BACKEND_CHOICES)}."
+        )
+    return normalized
+
+
 def torch_cuda_is_available() -> bool:
     try:
         import torch
@@ -76,6 +100,12 @@ def resolve_easyocr_use_gpu(value: str | None = None) -> bool:
     if normalized in {"0", "false", "no", "off", "cpu"}:
         return False
     return torch_cuda_is_available()
+
+
+def ensure_repo_cache_dir(*parts: str) -> Path:
+    path = MODEL_CACHE_ROOT.joinpath(*parts)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def normalize_output_text(value: str | None) -> str:
@@ -389,12 +419,186 @@ def group_ocr_blocks_into_regions(
     return sorted(regions, key=lambda region: (region.top, region.left))
 
 
+def is_japanese_text_char(char: str) -> bool:
+    """Kana, kanji, ー and 々: the characters the OCR benchmark scores."""
+    codepoint = ord(char)
+    return (
+        0x3041 <= codepoint <= 0x3096
+        or 0x30A1 <= codepoint <= 0x30FA
+        or codepoint in (0x30FC, 0x3005)
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0x3400 <= codepoint <= 0x4DBF
+    )
+
+
+def is_kanji_text_char(char: str) -> bool:
+    codepoint = ord(char)
+    return 0x4E00 <= codepoint <= 0x9FFF or 0x3400 <= codepoint <= 0x4DBF
+
+
+@dataclass(slots=True)
+class OcrLineBox:
+    """One detected text line with an axis-aligned box, before reading-order grouping."""
+
+    text: str
+    confidence: float | None
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+    @property
+    def width(self) -> float:
+        return max(1.0, self.right - self.left)
+
+    @property
+    def height(self) -> float:
+        return max(1.0, self.bottom - self.top)
+
+
+def meikiocr_line_to_box(
+    line: dict,
+    *,
+    min_char_confidence: float = DEFAULT_MEIKIOCR_MIN_CHAR_CONFIDENCE,
+) -> OcrLineBox | None:
+    """Drop low-confidence characters and rebuild the line box from the ones left."""
+    chars = [
+        char
+        for char in line.get("chars") or []
+        if float(char["conf"]) >= min_char_confidence
+    ]
+    if not chars:
+        return None
+    return OcrLineBox(
+        text="".join(char["char"] for char in chars),
+        confidence=min(float(char["conf"]) for char in chars),
+        left=float(min(char["bbox"][0] for char in chars)),
+        top=float(min(char["bbox"][1] for char in chars)),
+        right=float(max(char["bbox"][2] for char in chars)),
+        bottom=float(max(char["bbox"][3] for char in chars)),
+    )
+
+
+def is_plausible_japanese_line(text: str) -> bool:
+    """Reject icon and Latin garbage: need 2+ Japanese chars making up 30%+ of the line."""
+    visible = [char for char in text if not char.isspace()]
+    japanese = sum(1 for char in visible if is_japanese_text_char(char))
+    return japanese >= MIN_LINE_JAPANESE_CHARS and japanese >= MIN_LINE_JAPANESE_RATIO * len(visible)
+
+
+def drop_contained_boxes(boxes: list[OcrLineBox]) -> list[OcrLineBox]:
+    """Drop a box mostly covered by a larger one (duplicate detections of the same text)."""
+    kept: list[OcrLineBox] = []
+    for box in boxes:
+        area = box.width * box.height
+        covered = False
+        for other in boxes:
+            if other is box or other.width * other.height <= area:
+                continue
+            overlap_width = min(box.right, other.right) - max(box.left, other.left)
+            overlap_height = min(box.bottom, other.bottom) - max(box.top, other.top)
+            if (
+                overlap_width > 0
+                and overlap_height > 0
+                and overlap_width * overlap_height >= CONTAINED_BOX_MIN_COVERAGE * area
+            ):
+                covered = True
+                break
+        if not covered:
+            kept.append(box)
+    return kept
+
+
+def is_furigana_box(box: OcrLineBox, boxes: list[OcrLineBox]) -> bool:
+    """owocr-style ruby rule: a kana-only box just above a taller kanji box it overlaps."""
+    core = [char for char in box.text if is_japanese_text_char(char)]
+    if not core or any(is_kanji_text_char(char) for char in core):
+        return False
+    for other in boxes:
+        if other is box or not any(is_kanji_text_char(char) for char in other.text):
+            continue
+        if box.height >= FURIGANA_MAX_HEIGHT_RATIO * other.height:
+            continue
+        center_gap = (other.top + other.bottom) / 2 - (box.top + box.bottom) / 2
+        if not (abs(other.height - box.height) / 2 <= center_gap <= other.height + box.height / 2):
+            continue
+        overlap_width = min(box.right, other.right) - max(box.left, other.left)
+        if overlap_width > FURIGANA_MIN_HORIZONTAL_OVERLAP * box.width:
+            return True
+    return False
+
+
+def drop_furigana_boxes(boxes: list[OcrLineBox]) -> list[OcrLineBox]:
+    return [box for box in boxes if not is_furigana_box(box, boxes)]
+
+
+def filter_ocr_line_boxes(boxes: list[OcrLineBox]) -> tuple[list[OcrLineBox], dict[str, int]]:
+    """Apply the line, duplicate and furigana filters in that order."""
+    plausible = [box for box in boxes if is_plausible_japanese_line(box.text)]
+    deduplicated = drop_contained_boxes(plausible)
+    kept = drop_furigana_boxes(deduplicated)
+    stats = {
+        "detected": len(boxes),
+        "kept": len(kept),
+        "non_japanese": len(boxes) - len(plausible),
+        "contained": len(plausible) - len(deduplicated),
+        "furigana": len(deduplicated) - len(kept),
+    }
+    return kept, stats
+
+
+def group_ocr_line_boxes_into_rows(boxes: list[OcrLineBox]) -> list[list[OcrLineBox]]:
+    """Group boxes of similar height that share a horizontal band, in reading order."""
+    rows: list[list[OcrLineBox]] = []
+    for box in sorted(boxes, key=lambda item: (item.top, item.left)):
+        center_y = (box.top + box.bottom) / 2
+        for row in rows:
+            row_top = min(item.top for item in row)
+            row_bottom = max(item.bottom for item in row)
+            row_height = max(item.height for item in row)
+            same_band = row_top - 0.25 * row_height <= center_y <= row_bottom + 0.25 * row_height
+            if same_band and abs(box.height - row_height) < 0.5 * max(box.height, row_height):
+                row.append(box)
+                break
+        else:
+            rows.append([box])
+    for row in rows:
+        row.sort(key=lambda item: item.left)
+    rows.sort(key=lambda row: (min(item.top for item in row), min(item.left for item in row)))
+    return rows
+
+
+def ocr_row_to_block(row: list[OcrLineBox]) -> OcrBlock:
+    left = min(box.left for box in row)
+    top = min(box.top for box in row)
+    right = max(box.right for box in row)
+    bottom = max(box.bottom for box in row)
+    confidences = [box.confidence for box in row if box.confidence is not None]
+    return OcrBlock(
+        text=" ".join(box.text for box in row),
+        confidence=min(confidences) if confidences else None,
+        bbox=[[left, top], [right, top], [right, bottom], [left, bottom]],
+    )
+
+
+def ocr_line_boxes_to_blocks(boxes: list[OcrLineBox]) -> list[OcrBlock]:
+    return [ocr_row_to_block(row) for row in group_ocr_line_boxes_into_rows(boxes)]
+
+
 class MangaOcrBackend:
     name = "manga_ocr"
 
     def __init__(self) -> None:
+        huggingface_cache = ensure_repo_cache_dir("huggingface")
+        modelscope_cache = ensure_repo_cache_dir("modelscope")
+        torch_cache = ensure_repo_cache_dir("torch")
+        os.environ.setdefault("HF_HOME", str(huggingface_cache))
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(huggingface_cache / "hub"))
+        os.environ.setdefault("TRANSFORMERS_CACHE", str(huggingface_cache / "transformers"))
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        os.environ.setdefault("MODELSCOPE_CACHE", str(modelscope_cache))
+        os.environ.setdefault("TORCH_HOME", str(torch_cache))
         try:
             from manga_ocr import MangaOcr
         except ImportError as exc:
@@ -415,6 +619,9 @@ class EasyOcrBackend:
 
     def __init__(self) -> None:
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        easyocr_cache = ensure_repo_cache_dir("easyocr")
+        user_network_dir = ensure_repo_cache_dir("easyocr", "user_network")
+        os.environ.setdefault("EASYOCR_MODULE_PATH", str(easyocr_cache))
         try:
             import easyocr
         except ImportError as exc:
@@ -426,7 +633,13 @@ class EasyOcrBackend:
         self.languages = resolve_easyocr_languages()
         self.gpu_mode = os.environ.get("LANG_JP_EASYOCR_GPU", DEFAULT_EASYOCR_GPU_MODE)
         self.gpu_enabled = resolve_easyocr_use_gpu(self.gpu_mode)
-        self._reader = easyocr.Reader(list(self.languages), gpu=self.gpu_enabled)
+        self._reader = easyocr.Reader(
+            list(self.languages),
+            gpu=self.gpu_enabled,
+            model_storage_directory=str(easyocr_cache),
+            user_network_directory=str(user_network_dir),
+            verbose=False,
+        )
 
     def recognize(self, crop: Image.Image) -> str:
         blocks = self.read_blocks(crop)
@@ -467,9 +680,64 @@ class EasyOcrBackend:
         return blocks
 
 
+class MeikiOcrBackend:
+    """meikiocr (detector + recognizer trained on game text) plus the benchmark post-filters.
+
+    Runs on the full-resolution image: meikiocr resizes internally for detection and
+    recognizes from full-resolution crops, so the input should not be downscaled.
+    """
+
+    name = "meikiocr"
+
+    def __init__(
+        self,
+        *,
+        min_char_confidence: float = DEFAULT_MEIKIOCR_MIN_CHAR_CONFIDENCE,
+    ) -> None:
+        huggingface_cache = ensure_repo_cache_dir("huggingface")
+        os.environ.setdefault("HF_HOME", str(huggingface_cache))
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(huggingface_cache / "hub"))
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        try:
+            from meikiocr import MeikiOCR
+        except ImportError as exc:
+            raise SystemExit(
+                "Missing dependency `meikiocr`. Install it in the Python 3.12 environment "
+                "before using the OCR tooling."
+            ) from exc
+
+        self.min_char_confidence = min_char_confidence
+        self._engine = MeikiOCR()
+        self.provider = getattr(self._engine, "active_provider", None)
+
+    def read_line_boxes(self, source: Image.Image | str | Path) -> list[OcrLineBox]:
+        """One box per detected line, after dropping low-confidence characters."""
+        if isinstance(source, Image.Image):
+            rgb = np.array(source.convert("RGB"))
+        else:
+            with Image.open(source) as image:
+                rgb = np.array(image.convert("RGB"))
+        boxes: list[OcrLineBox] = []
+        for line in self._engine.run_ocr(rgb[:, :, ::-1].copy()):  # meikiocr expects BGR
+            box = meikiocr_line_to_box(line, min_char_confidence=self.min_char_confidence)
+            if box is not None:
+                boxes.append(box)
+        return boxes
+
+    def read_blocks(self, source: Image.Image | str | Path) -> list[OcrBlock]:
+        kept, _ = filter_ocr_line_boxes(self.read_line_boxes(source))
+        return ocr_line_boxes_to_blocks(kept)
+
+    def recognize(self, crop: Image.Image) -> str:
+        return normalize_output_text("\n".join(block.text for block in self.read_blocks(crop)))
+
+
 def build_ocr_backend(name: str) -> OcrBackend:
     if name == "manga_ocr":
         return MangaOcrBackend()
     if name == "easyocr":
         return EasyOcrBackend()
+    if name == "meikiocr":
+        return MeikiOcrBackend()
     raise SystemExit(f"Unsupported backend: {name}")

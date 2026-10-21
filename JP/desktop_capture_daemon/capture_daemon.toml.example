@@ -20,10 +20,12 @@ auto_process_jobs = true
 
 # Optional overrides. If omitted, the daemon uses the repository-local defaults
 # under JP/data and launches the Python 3.12 worker from JP/capture_worker.py.
+# Relative paths are resolved from the JP/ directory, so they keep working if
+# the Windows username or workspace root changes.
 #
-# db_path = "C:/Users/paulorn/work/Lang/JP/data/lang_jp.sqlite3"
-# spool_dir = "C:/Users/paulorn/work/Lang/JP/data/capture_spool"
-# log_path = "C:/Users/paulorn/work/Lang/JP/data/capture_daemon.log"
-# python_executable = "py"
+# db_path = "data/lang_jp.sqlite3"
+# spool_dir = "data/capture_spool"
+# log_path = "data/capture_daemon.log"
+# python_executable = "../.venv-capture312/Scripts/python.exe"
 # python_args = ["-3.12"]
-# worker_script = "C:/Users/paulorn/work/Lang/JP/capture_worker.py"
+# worker_script = "capture_worker.py"

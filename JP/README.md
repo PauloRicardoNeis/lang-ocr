@@ -7,9 +7,32 @@ Minimal local foundation for cataloging Japanese vocabulary from game screenshot
 - `lang_jp.py`: CLI for sources, terms, and recurrence.
 - `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs.
 - `requirements-capture.txt`: Python worker dependencies for the dedicated 3.12 environment.
+- `requirements-main.txt`: small helper dependencies for the main catalog environment.
 - `desktop_capture_daemon/`: Rust tray daemon for passive full-screen capture and job enqueueing.
 - `data/lang_jp.sqlite3`: local database file after initialization.
+- `jmdict.py`: imports JMdict into `data/jmdict.sqlite3` (git-ignored) and looks up term meanings.
 - `ocr_capture_spec.md`: spec and implementation plan for automated screenshot capture + OCR ingestion.
+
+## Fresh Windows setup
+For a clean Windows rebuild after formatting the machine:
+
+1. Install Python 3.12 x64.
+2. Install Git.
+3. Install Rust/Cargo if you want passive capture.
+4. From the repository root, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1 `
+  -PythonExe "C:\Path\To\Python312\python.exe" `
+  -CapturePythonExe "C:\Path\To\Python312\python.exe" `
+  -InstallCaptureDeps `
+  -BuildDaemon `
+  -RunSmokeTests
+```
+
+This creates a fresh `.venv` for the catalog, an optional `.venv-capture312` for OCR/capture, installs the project requirements, and runs a small smoke-test pass.
+
+If you use Anki sync, also install Anki Desktop and the AnkiConnect add-on separately.
 
 ## Quick start
 ```powershell
@@ -51,6 +74,31 @@ The tray menu now exposes both capture cadences:
 
 At the moment, the automatic worker is optimized for normal horizontal text in screenshots. It is not tuned for manga-style vertical text.
 
+## Term meanings (JMdict)
+When a new term is created without `--meaning-pt`, its meaning comes from a local copy of JMdict: the first 1-3 English glosses of the best-matching sense are translated to Portuguese. Only when JMdict has no match is the bare lemma machine-translated, as before. The term's part of speech (Sudachi's first field, or an older English label) is a preference when picking the JMdict entry and sense, so kana grammar words resolve correctly: ます with `助動詞` is the polite auxiliary, not 鱒 "trout".
+
+One-time setup (re-run to refresh; stop `browse` first so the file is not locked):
+
+1. Download `JMdict_e.gz` (about 10 MB) from https://www.edrdg.org/pub/Nihongo/JMdict_e.gz into its own folder, for example `data\jmdict_src\`.
+2. Import it:
+
+```powershell
+python -I .\jmdict.py import .\data\jmdict_src\JMdict_e.gz
+python .\jmdict.py lookup 優しい --reading ヤサシク
+python .\jmdict.py lookup ます --pos 助動詞
+```
+
+Without `data\jmdict.sqlite3` everything keeps working with the old lemma translation. `LANG_JP_JMDICT_DB_PATH` points to another file.
+
+To compare stored meanings with the JMdict-derived ones (read-only, nothing is written):
+
+```powershell
+python .\lang_jp.py jmdict-meaning-report --limit 50
+python .\lang_jp.py jmdict-meaning-report --missing-only --no-translate --limit 200
+```
+
+Attribution: this project uses the JMdict dictionary files. These files are the property of the [Electronic Dictionary Research and Development Group](https://www.edrdg.org/) and are used in conformance with the Group's [licence](https://www.edrdg.org/edrdg/licence.html) (CC BY-SA 4.0).
+
 ## Single-image OCR
 For a working one-image-at-a-time OCR path, use `single_image_ocr.py`.
 
@@ -58,11 +106,11 @@ Example with visible green overlay boxes already present in the screenshot:
 
 ```powershell
 py -3.12 .\single_image_ocr.py `
-  --image "C:\Users\paulorn\work\Lang\JP\data\capture_spool\20260329-215354-e140e16cbace.png" `
+  --image "D:\work\Lang\JP\data\capture_spool\20260329-215354-e140e16cbace.png" `
   --region-mode overlay_boxes `
-  --output-text "C:\Users\paulorn\work\Lang\JP\data\single_image_ocr.txt" `
-  --output-json "C:\Users\paulorn\work\Lang\JP\data\single_image_ocr.json" `
-  --debug-image "C:\Users\paulorn\work\Lang\JP\data\single_image_ocr_debug.png"
+  --output-text "D:\work\Lang\JP\data\single_image_ocr.txt" `
+  --output-json "D:\work\Lang\JP\data\single_image_ocr.json" `
+  --debug-image "D:\work\Lang\JP\data\single_image_ocr_debug.png"
 ```
 
 This path uses a region-first flow with swappable OCR backends:
@@ -73,14 +121,14 @@ Example for a UI-like screenshot with a manual ROI around the center content col
 
 ```powershell
 py -3.12 .\single_image_ocr.py `
-  --image "C:\Users\paulorn\work\Lang\JP\data\capture_spool\zzzlaston e.png" `
+  --image "D:\work\Lang\JP\data\capture_spool\zzzlaston e.png" `
   --backend easyocr `
   --region-mode manual `
   --roi "1300,1260,2420,1760" `
   --japanese-only `
-  --output-text "C:\Users\paulorn\work\Lang\JP\data\single_image_ocr_zzz_easyocr.txt" `
-  --output-json "C:\Users\paulorn\work\Lang\JP\data\single_image_ocr_zzz_easyocr.json" `
-  --debug-image "C:\Users\paulorn\work\Lang\JP\data\single_image_ocr_zzz_easyocr_debug.png"
+  --output-text "D:\work\Lang\JP\data\single_image_ocr_zzz_easyocr.txt" `
+  --output-json "D:\work\Lang\JP\data\single_image_ocr_zzz_easyocr.json" `
+  --debug-image "D:\work\Lang\JP\data\single_image_ocr_zzz_easyocr_debug.png"
 ```
 
 ## Current workflow

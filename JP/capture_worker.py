@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import threading
 import time
+import traceback
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from dataclasses import asdict, dataclass
@@ -32,16 +33,22 @@ from lang_jp import (
     form_key,
     is_kanji_char,
     normalize_token,
+    recover_stale_capture_jobs,
+    resolve_repo_local_path,
     stable_text_hash,
     upsert_source_translation,
     update_capture_job_status,
 )
 from ocr_backends import (
     EasyOcrBackend,
+    MeikiOcrBackend,
     OcrBlock,
     contains_japanese_chars,
+    filter_ocr_line_boxes,
     group_ocr_blocks_into_regions,
     is_horizontal_bbox,
+    ocr_line_boxes_to_blocks,
+    resolve_capture_ocr_backend,
     sort_ocr_blocks_reading_order,
 )
 
@@ -49,7 +56,12 @@ from ocr_backends import (
 DEFAULT_CAPTURE_DIR = ROOT / "data" / "captures"
 DEFAULT_LOG_PATH = ROOT / "data" / "capture_daemon.log"
 DEFAULT_POLL_INTERVAL = 2.0
+DEFAULT_STALE_CAPTURE_JOB_HOURS = float(
+    os.environ.get("LANG_JP_CAPTURE_STALE_JOB_HOURS", "4")
+)
 DEBUG_ENABLED = os.environ.get("LANG_JP_CAPTURE_DEBUG") == "1"
+# LANG_JP_OCR_BACKEND picks the engine (meikiocr by default, easyocr for comparison).
+# The downscale, confidence, orientation and region settings below apply to EasyOCR only.
 DEFAULT_OCR_MAX_SIDE = int(os.environ.get("LANG_JP_OCR_MAX_SIDE", "1600"))
 DEFAULT_OCR_PROGRESS_INTERVAL = float(os.environ.get("LANG_JP_OCR_PROGRESS_INTERVAL", "5"))
 DEFAULT_OCR_MIN_CONFIDENCE = float(os.environ.get("LANG_JP_OCR_MIN_CONFIDENCE", "0.30"))
@@ -451,6 +463,42 @@ def append_worker_log(message: str) -> None:
         handle.write(f"[{timestamp}] {normalized_message}\n")
 
 
+def recover_stale_capture_jobs_on_startup(
+    db_path: Path,
+    *,
+    older_than_hours: float,
+) -> int:
+    if older_than_hours <= 0:
+        return 0
+
+    connection = db_connect(db_path)
+    try:
+        stale_rows = recover_stale_capture_jobs(
+            connection,
+            older_than_hours=older_than_hours,
+            to_status="failed",
+            note=(
+                "Worker startup recovered a stale capture job "
+                f"after exceeding the {older_than_hours:g}h threshold."
+            ),
+        )
+        if stale_rows:
+            connection.commit()
+    finally:
+        connection.close()
+
+    recovered_count = len(stale_rows)
+    if recovered_count:
+        preview_ids = ",".join(str(int(row["id"])) for row in stale_rows[:10])
+        suffix = ",..." if recovered_count > 10 else ""
+        append_worker_log(
+            "capture worker recovered stale capture jobs "
+            f"count={recovered_count} threshold_hours={older_than_hours:g} "
+            f"job_ids={preview_ids}{suffix}"
+        )
+    return recovered_count
+
+
 def build_job_log_banner(
     *,
     job_id: int,
@@ -705,6 +753,8 @@ def read_existing_kanji_match(connection, literal: str) -> int | None:
 
 
 class EasyOcrAdapter:
+    downscales_input = True
+
     def __init__(self) -> None:
         self._engine = EasyOcrBackend()
         append_worker_log(
@@ -853,6 +903,65 @@ class EasyOcrAdapter:
                 delete_if_exists(cleanup_path)
 
 
+class MeikiOcrAdapter:
+    # One pass on the full-resolution capture; meikiocr resizes internally for detection.
+    downscales_input = False
+
+    def __init__(self) -> None:
+        self._engine = MeikiOcrBackend()
+        append_worker_log(
+            build_log_event(
+                "worker",
+                step="ocr_init",
+                engine="meikiocr",
+                provider=self._engine.provider,
+                min_char_conf=self._engine.min_char_confidence,
+            )
+        )
+
+    def extract_blocks(
+        self,
+        image_path: Path,
+        *,
+        prepared: bool = False,
+        progress_label: str | None = None,
+        echo_stdout: bool = False,
+    ) -> list[OcrBlock]:
+        # `prepared` is accepted for parity with EasyOcrAdapter; there is no input to prepare.
+        def do_read():
+            return self._engine.read_line_boxes(image_path)
+
+        label = progress_label or build_log_event("step=ocr", image=image_path)
+        line_boxes = run_with_progress_logs(label, do_read, echo_stdout=echo_stdout)
+        kept_boxes, stats = filter_ocr_line_boxes(line_boxes)
+        blocks = [
+            OcrBlock(text=normalize_token(block.text), confidence=block.confidence, bbox=block.bbox)
+            for block in ocr_line_boxes_to_blocks(kept_boxes)
+        ]
+        append_worker_log(
+            build_log_event(
+                label,
+                status="filter",
+                boxes=stats["detected"],
+                kept=stats["kept"],
+                rows=len(blocks),
+                drop_non_jp=stats["non_japanese"],
+                drop_contained=stats["contained"],
+                drop_furigana=stats["furigana"],
+            )
+        )
+        return blocks
+
+
+CaptureOcrAdapter = EasyOcrAdapter | MeikiOcrAdapter
+
+
+def build_capture_ocr_adapter(name: str | None = None) -> CaptureOcrAdapter:
+    if resolve_capture_ocr_backend(name) == "easyocr":
+        return EasyOcrAdapter()
+    return MeikiOcrAdapter()
+
+
 class SudachiAnalyzer:
     def __init__(self) -> None:
         try:
@@ -957,7 +1066,7 @@ class SudachiAnalyzer:
 def process_job_once(
     db_path: Path,
     *,
-    ocr: EasyOcrAdapter,
+    ocr: CaptureOcrAdapter,
     analyzer: SudachiAnalyzer,
     translator: GoogleGtxSourceTranslator | None,
 ) -> bool:
@@ -971,7 +1080,9 @@ def process_job_once(
 
     job_id = int(job["id"])
     probe = WorkerJobProbe(job_id)
-    temp_image_path = Path(str(job["temp_image_path"]))
+    temp_image_path = resolve_repo_local_path(job["temp_image_path"])
+    if temp_image_path is None:
+        temp_image_path = Path(str(job["temp_image_path"]))
     image_sha256 = job["image_sha256"]
     captured_at = job["captured_at"]
     append_job_log_banner(
@@ -1360,11 +1471,14 @@ def diagnose_image(
         probe.mark("image_decoded", note=f"size={image.width}x{image.height} mode={image.mode}")
 
     probe.mark("before_ocr_init")
-    ocr = EasyOcrAdapter()
+    ocr = build_capture_ocr_adapter()
     probe.mark("after_ocr_init")
 
     probe.mark("before_ocr_predict")
-    ocr_input_path, resize_note, cleanup_path = prepare_ocr_input_image(image_path)
+    if ocr.downscales_input:
+        ocr_input_path, resize_note, cleanup_path = prepare_ocr_input_image(image_path)
+    else:
+        ocr_input_path, resize_note, cleanup_path = image_path, None, None
     if resize_note:
         probe.mark("ocr_input_prepared", note=resize_note)
     try:
@@ -1424,6 +1538,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_POLL_INTERVAL,
         help="Seconds to wait between queue polls in loop mode.",
     )
+    parser.add_argument(
+        "--recover-stale-after-hours",
+        type=float,
+        default=DEFAULT_STALE_CAPTURE_JOB_HOURS,
+        help="Recover processing jobs older than this threshold before starting normal work.",
+    )
+    parser.add_argument(
+        "--no-recover-stale-jobs",
+        action="store_true",
+        help="Skip stale capture-job recovery during worker startup.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     once_parser = subparsers.add_parser("once", help="Process a single pending capture job.")
@@ -1476,7 +1601,13 @@ def main() -> None:
         )
         return
 
-    ocr = EasyOcrAdapter()
+    if not args.no_recover_stale_jobs:
+        recover_stale_capture_jobs_on_startup(
+            args.db,
+            older_than_hours=args.recover_stale_after_hours,
+        )
+
+    ocr = build_capture_ocr_adapter()
     analyzer = SudachiAnalyzer()
     translator = (
         GoogleGtxSourceTranslator(target_language=DEFAULT_SOURCE_TRANSLATION_TARGET)
@@ -1542,4 +1673,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        append_worker_log("capture worker crashed with an unhandled exception")
+        for line in traceback.format_exc().rstrip().splitlines():
+            append_worker_log(f"traceback {line}")
+        raise

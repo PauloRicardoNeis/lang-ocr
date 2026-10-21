@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone, tzinfo
 import html
+from html.parser import HTMLParser
 import json
 import mimetypes
 import os
@@ -24,6 +25,7 @@ from lang_jp import (
     ensure_runtime_schema,
     ensure_source_image_dimensions,
     format_source_resolution,
+    resolve_repo_local_path,
 )
 
 
@@ -31,13 +33,13 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = ROOT / "data" / "lang_jp.sqlite3"
 TERM_PRIORITY_ORDER_SQL = """
             COALESCE(priority_score, 0) DESC,
-            COALESCE(last_seen_at, first_seen_at) DESC,
+            julianday(COALESCE(last_seen_at, first_seen_at)) DESC,
             lemma COLLATE NOCASE ASC,
             id ASC
 """
 FLASHCARD_PRIORITY_ORDER_SQL = """
             COALESCE(ts.priority_score, 0) DESC,
-            COALESCE(ts.last_seen_at, ts.first_seen_at) DESC,
+            julianday(COALESCE(ts.last_seen_at, ts.first_seen_at)) DESC,
             t.lemma COLLATE NOCASE ASC,
             f.id ASC
 """
@@ -736,11 +738,6 @@ PAGE_SCRIPT = """
       });
 
       table.dataset.sortReady = "1";
-      const defaultSortColumn = Number.parseInt(table.dataset.defaultSortColumn || "", 10);
-      const defaultSortDirection = table.dataset.defaultSortDirection || "desc";
-      if (Number.isInteger(defaultSortColumn) && headers[defaultSortColumn]) {
-        sortTable(table, headers, tbody, defaultSortColumn, defaultSortDirection);
-      }
     }
 
     function initSortableTables(root = document) {
@@ -1417,6 +1414,15 @@ def pagination_nav(
     """
 
 
+DETAIL_TABLE_LIMIT = 100
+
+
+def truncation_note(shown: int, total: int) -> str:
+    if total <= shown:
+        return ""
+    return f'<p class="muted">Mostrando {shown} de {total}.</p>'
+
+
 def results_summary_text(pagination: PaginationState) -> str:
     if pagination.total_count == 0:
         return "Nenhum resultado encontrado."
@@ -1442,6 +1448,14 @@ def escape(value: object | None, fallback: str = "-") -> str:
     return html.escape(text(value, fallback))
 
 
+def format_score(value: object | None) -> str:
+    # Scores stay numeric in SQL so ORDER BY never compares formatted text.
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def normalize_iso_datetime(value: str) -> str:
     normalized = value.strip()
     if normalized.endswith("Z"):
@@ -1460,19 +1474,42 @@ def normalize_iso_datetime(value: str) -> str:
     return f"{match.group('base')}{fraction or ''}{match.group('timezone') or ''}"
 
 
-def format_datetime_display(value: object | None) -> str:
+def parse_stored_datetime(value: object | None) -> datetime | None:
+    # Naive values come from SQLite CURRENT_TIMESTAMP, which is UTC; captured_at
+    # values carry their own offset.
+    raw_value = text(value, "")
+    if not raw_value or raw_value == "-":
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalize_iso_datetime(raw_value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def format_datetime_display(value: object | None, *, tz: tzinfo | None = None) -> str:
     raw_value = text(value, "")
     if not raw_value or raw_value == "-":
         return "-"
     normalized = normalize_iso_datetime(raw_value)
-    try:
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
-            parsed = datetime.strptime(normalized, "%Y-%m-%d")
-            return parsed.strftime("%d/%m/%Y")
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+        try:
+            return datetime.strptime(normalized, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except ValueError:
+            return raw_value
+    parsed = parse_stored_datetime(raw_value)
+    if parsed is None:
         return raw_value
-    return parsed.strftime("%d/%m/%Y %H:%M:%S")
+    return parsed.astimezone(tz).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def datetime_sort_value(value: object | None) -> str:
+    parsed = parse_stored_datetime(value)
+    if parsed is None:
+        return text(value, "")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def sort_value_cell(display_value: str, sort_value: object | None) -> tuple[str, str]:
@@ -1480,7 +1517,7 @@ def sort_value_cell(display_value: str, sort_value: object | None) -> tuple[str,
 
 
 def datetime_cell(value: object | None) -> tuple[str, str]:
-    return sort_value_cell(escape(format_datetime_display(value)), value)
+    return sort_value_cell(escape(format_datetime_display(value)), datetime_sort_value(value))
 
 
 def source_resolution_label(
@@ -1500,6 +1537,39 @@ def source_resolution_label(
         image_height=image_height,
     )
     return format_source_resolution(image_width, image_height) or "-"
+
+
+HTML_BLOCK_TAGS = frozenset(
+    {"br", "div", "p", "li", "ul", "ol", "tr", "td", "th", "table", "hr", "h1", "h2", "h3", "h4", "h5", "h6"}
+)
+
+
+class VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in HTML_BLOCK_TAGS:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in HTML_BLOCK_TAGS:
+            self.parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def html_fragment_text(value: object | None) -> str:
+    # Flashcard fronts/backs are stored as Anki HTML; show and search only what the card displays.
+    raw_value = text(value, "")
+    if not raw_value:
+        return ""
+    parser = VisibleTextParser()
+    parser.feed(raw_value)
+    parser.close()
+    return " ".join("".join(parser.parts).split())
 
 
 def truncate(value: str | None, *, size: int = 100) -> str:
@@ -1620,16 +1690,8 @@ def table_html(headers: list[str], rows: list[list[str | tuple[str, str]]]) -> s
     if not rows:
         return '<div class="empty">Nenhum resultado encontrado.</div>'
 
-    default_sort_column = next(
-        (index for index, header in enumerate(headers) if header.lower() == "score"),
-        None,
-    )
+    # Rows arrive in the server's chosen order; the browser only re-sorts on a header click.
     table_attrs = ' class="sortable-table"'
-    if default_sort_column is not None:
-        table_attrs += (
-            f' data-default-sort-column="{default_sort_column}"'
-            ' data-default-sort-direction="desc"'
-        )
 
     head_html = "".join(
         (
@@ -1757,7 +1819,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 COALESCE(meaning_pt, '-') AS meaning_pt,
                 total_occurrences,
                 distinct_sources,
-                printf('%.1f', priority_score) AS priority_score
+                priority_score
             FROM v_terms_overview
             WHERE
                 COALESCE(priority_score, 0) > 0
@@ -1777,7 +1839,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 total_occurrences,
                 distinct_sources,
                 distinct_terms,
-                printf('%.1f', priority_score) AS priority_score
+                priority_score
             FROM v_kanji_overview
             ORDER BY priority_score DESC, id DESC
             LIMIT 8
@@ -1794,7 +1856,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 image_height,
                 COALESCE(captured_at, created_at) AS seen_at
             FROM sources
-            ORDER BY seen_at DESC, id DESC
+            ORDER BY julianday(seen_at) DESC, id DESC
             LIMIT 8
             """
         ).fetchall()
@@ -1813,7 +1875,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             SELECT
                 f.id,
                 t.lemma,
-                printf('%.1f', COALESCE(ts.priority_score, 0)) AS priority_score,
+                COALESCE(ts.priority_score, 0) AS priority_score,
                 f.template_name,
                 f.export_status,
                 f.front_text
@@ -1835,7 +1897,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
         ]
         for row in top_terms
     ]
@@ -1845,17 +1907,17 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             escape(row["distinct_terms"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
         ]
         for row in top_kanji
     ]
     card_rows = [
         [
             f'<a href="/flashcards?q={quote(str(row["lemma"]))}">{escape(row["lemma"])}</a>',
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
             escape(row["template_name"]),
             status_chip(text(row["export_status"])),
-            escape(truncate(text(row["front_text"], ""), size=44)),
+            escape(truncate(html_fragment_text(row["front_text"]), size=44)),
         ]
         for row in recent_cards
     ]
@@ -1878,7 +1940,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
         <h2>Busca rapida</h2>
         <div class="search-row">
           {search_form(action="/terms", label="Buscar termos", placeholder="Japones, leitura ou significado")}
-          {search_form(action="/kanji", label="Buscar kanji", placeholder="Ex.: 魔, 学, 回")}
+          {search_form(action="/kanji", label="Buscar kanji", placeholder="Ex.: 魔, 学, river")}
           {search_form(action="/sources", label="Buscar fontes", placeholder="Titulo, cena ou texto bruto")}
           {search_form(action="/flashcards", label="Buscar cards", placeholder="Frente, termo ou significado")}
         </div>
@@ -1931,7 +1993,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
     page = parse_page(first_value(params, "page", "1"))
     order_clause = {
         "priority": TERM_PRIORITY_ORDER_SQL.strip(),
-        "recent": "last_seen_at DESC, id DESC",
+        "recent": "julianday(last_seen_at) DESC, id DESC",
         "lemma": "lemma COLLATE NOCASE ASC, id ASC",
     }.get(order, TERM_PRIORITY_ORDER_SQL.strip())
 
@@ -1967,7 +2029,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 COALESCE(meaning_pt, '-') AS meaning_pt,
                 total_occurrences,
                 distinct_sources,
-                printf('%.1f', priority_score) AS priority_score,
+                priority_score,
                 COALESCE(last_seen_at, '-') AS last_seen_at
             FROM v_terms_overview
             {where_clause}
@@ -2005,7 +2067,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
             datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
@@ -2038,16 +2100,18 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
     page = parse_page(first_value(params, "page", "1"))
     order_clause = {
         "priority": "priority_score DESC, id DESC",
-        "recent": "last_seen_at DESC, id DESC",
+        "recent": "julianday(last_seen_at) DESC, id DESC",
         "literal": "literal COLLATE NOCASE ASC, id ASC",
     }.get(order, "priority_score DESC, id DESC")
 
     filters = []
     sql_params: list[object] = []
     if q.strip():
-        filters.append("(literal LIKE ? OR COALESCE(meaning_pt, '') LIKE ?)")
+        filters.append(
+            "(literal LIKE ? OR COALESCE(meaning_pt, '') LIKE ? OR COALESCE(canonical_meanings, '') LIKE ?)"
+        )
         like = sql_like(q)
-        sql_params.extend([like, like])
+        sql_params.extend([like, like, like])
 
     where_clause = ""
     if filters:
@@ -2072,7 +2136,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 total_occurrences,
                 distinct_sources,
                 distinct_terms,
-                printf('%.1f', priority_score) AS priority_score,
+                priority_score,
                 COALESCE(last_seen_at, '-') AS last_seen_at
             FROM v_kanji_overview
             {where_clause}
@@ -2110,7 +2174,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
             escape(row["distinct_terms"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
             datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
@@ -2121,7 +2185,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         {notice_banner(params)}
         <h2>Kanji</h2>
         {sync_anki_action(next_path="/kanji")}
-        {search_form(action="/kanji", label="Buscar no catalogo", placeholder="Ex.: 魔, 学, 回", q=q, extras=extras, reset_href=reset_href)}
+        {search_form(action="/kanji", label="Buscar no catalogo", placeholder="Ex.: 魔, 学, river", q=q, extras=extras, reset_href=reset_href)}
         <div class="results-toolbar">
           <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
           {pagination_markup}
@@ -2151,7 +2215,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
                 total_occurrences,
                 distinct_sources,
                 distinct_terms,
-                printf('%.1f', priority_score) AS priority_score,
+                priority_score,
                 COALESCE(first_seen_at, '-') AS first_seen_at,
                 COALESCE(last_seen_at, '-') AS last_seen_at,
                 created_at,
@@ -2173,7 +2237,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
                 COALESCE(t.meaning_pt, '-') AS meaning_pt,
                 SUM(st.count_in_source) AS total_occurrences,
                 COUNT(DISTINCT st.source_id) AS distinct_sources,
-                printf('%.1f', COALESCE(ts.priority_score, 0)) AS priority_score
+                COALESCE(ts.priority_score, 0) AS priority_score
             FROM source_kanji AS sk
             JOIN source_terms AS st
                 ON st.source_id = sk.source_id
@@ -2197,10 +2261,15 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
                 total_occurrences DESC,
                 COALESCE(ts.priority_score, 0) DESC,
                 t.lemma COLLATE NOCASE ASC
-            LIMIT 50
             """,
             (kanji_id, kanji["literal"], kanji["literal"]),
         ).fetchall()
+        related_terms_total = len(term_rows)
+        term_rows = term_rows[:DETAIL_TABLE_LIMIT]
+        related_sources_total = connection.execute(
+            "SELECT COUNT(*) FROM source_kanji WHERE kanji_id = ?",
+            (kanji_id,),
+        ).fetchone()[0]
         source_rows = connection.execute(
             """
             SELECT
@@ -2214,10 +2283,10 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
             JOIN sources AS s
                 ON s.id = sk.source_id
             WHERE sk.kanji_id = ?
-            ORDER BY sk.count_in_source DESC, seen_at DESC, sk.id DESC
-            LIMIT 50
+            ORDER BY sk.count_in_source DESC, julianday(seen_at) DESC, sk.id DESC
+            LIMIT ?
             """,
-            (kanji_id,),
+            (kanji_id, DETAIL_TABLE_LIMIT),
         ).fetchall()
 
     related_term_rows = [
@@ -2227,7 +2296,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
         ]
         for row in term_rows
     ]
@@ -2253,7 +2322,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
           <span class="chip">Palavras: {escape(kanji["distinct_terms"], "0")}</span>
           <span class="chip">Ocorrencias: {escape(kanji["total_occurrences"], "0")}</span>
           <span class="chip">Fontes: {escape(kanji["distinct_sources"], "0")}</span>
-          <span class="chip">Score: {escape(kanji["priority_score"], "0")}</span>
+          <span class="chip">Score: {escape(format_score(kanji["priority_score"]))}</span>
         </div>
       </section>
 
@@ -2268,6 +2337,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
 
       <section class="panel panel-wide">
         <h3>Termos relacionados</h3>
+        {truncation_note(len(term_rows), related_terms_total)}
         {table_html(["Termo", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], related_term_rows)}
       </section>
 
@@ -2283,6 +2353,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
 
       <section class="panel">
         <h3>Fontes que contem este kanji</h3>
+        {truncation_note(len(source_rows), related_sources_total)}
         {table_html(["Fonte", "Count", "Titulo", "Game", "Cena", "Quando"], related_source_rows)}
       </section>
     </div>
@@ -2306,7 +2377,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
                 COALESCE(ts.total_occurrences, 0) AS total_occurrences,
                 COALESCE(ts.distinct_sources, 0) AS distinct_sources,
                 COALESCE(ts.distinct_forms, 0) AS distinct_forms,
-                printf('%.1f', COALESCE(ts.priority_score, 0)) AS priority_score,
+                COALESCE(ts.priority_score, 0) AS priority_score,
                 COALESCE(ts.first_seen_at, '-') AS first_seen_at,
                 COALESCE(ts.last_seen_at, '-') AS last_seen_at
             FROM terms AS t
@@ -2345,10 +2416,22 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             JOIN sources AS s
                 ON s.id = st.source_id
             WHERE st.term_id = ?
-            ORDER BY st.count_in_source DESC, seen_at DESC, st.id DESC
+            ORDER BY st.count_in_source DESC, julianday(seen_at) DESC, st.id DESC
+            LIMIT ?
             """,
-            (term_id,),
+            (term_id, DETAIL_TABLE_LIMIT),
         ).fetchall()
+        occurrences_total = connection.execute(
+            "SELECT COUNT(*) FROM source_terms WHERE term_id = ?",
+            (term_id,),
+        ).fetchone()[0]
+        occurrence_surface_forms = [
+            row["surface_form"]
+            for row in connection.execute(
+                "SELECT DISTINCT surface_form FROM source_terms WHERE term_id = ?",
+                (term_id,),
+            )
+        ]
         segment_occurrences = connection.execute(
             """
             SELECT
@@ -2367,10 +2450,15 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             JOIN sources AS s
                 ON s.id = ss.source_id
             WHERE sst.term_id = ?
-            ORDER BY seen_at DESC, ss.id DESC, sst.id DESC
+            ORDER BY julianday(seen_at) DESC, ss.id DESC, sst.id DESC
+            LIMIT ?
             """,
-            (term_id,),
+            (term_id, DETAIL_TABLE_LIMIT),
         ).fetchall()
+        segment_occurrences_total = connection.execute(
+            "SELECT COUNT(*) FROM source_segment_terms WHERE term_id = ?",
+            (term_id,),
+        ).fetchone()[0]
         flashcards = connection.execute(
             """
             SELECT
@@ -2388,7 +2476,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
         kanji_literals = extract_kanji_sequence(
             term["lemma"],
             *(row["surface_form"] for row in forms),
-            *(row["surface_form"] for row in occurrences),
+            *occurrence_surface_forms,
         )
         if kanji_literals:
             placeholders = ", ".join("?" for _ in kanji_literals)
@@ -2400,7 +2488,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
                     total_occurrences,
                     distinct_sources,
                     distinct_terms,
-                    printf('%.1f', priority_score) AS priority_score
+                    priority_score
                 FROM v_kanji_overview
                 WHERE literal IN ({placeholders})
                 """,
@@ -2445,7 +2533,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             escape(row["template_name"]),
             escape(row["deck_name"]),
             status_chip(text(row["export_status"])),
-            escape(truncate(text(row["front_text"], ""), size=52)),
+            escape(truncate(html_fragment_text(row["front_text"]), size=52)),
         ]
         for row in flashcards
     ]
@@ -2463,7 +2551,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             escape(row["distinct_terms"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
         ]
         for row in ordered_kanji_rows
     ]
@@ -2484,17 +2572,19 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
           <div class="stat"><span class="label">Ocorrencias</span><span class="value">{escape(term["total_occurrences"], "0")}</span></div>
           <div class="stat"><span class="label">Fontes</span><span class="value">{escape(term["distinct_sources"], "0")}</span></div>
           <div class="stat"><span class="label">Formas</span><span class="value">{escape(term["distinct_forms"], "0")}</span></div>
-          <div class="stat"><span class="label">Score</span><span class="value">{escape(term["priority_score"], "0")}</span></div>
+          <div class="stat"><span class="label">Score</span><span class="value">{escape(format_score(term["priority_score"]))}</span></div>
         </div>
       </section>
 
       <section class="panel panel-wide">
         <h3>Onde apareceu</h3>
+        {truncation_note(len(occurrences), occurrences_total)}
         {table_html(["Fonte", "Forma vista", "Count", "Confianca", "Titulo", "Cena", "Quando"], occurrence_rows)}
       </section>
 
       <section class="panel panel-wide">
         <h3>Segmentacao revisada</h3>
+        {truncation_note(len(segment_occurrences), segment_occurrences_total)}
         {table_html(["Fonte", "Segmento bruto", "Leitura do segmento", "Forma ligada", "Count", "Confianca", "Titulo", "Cena", "Quando"], segment_occurrence_rows)}
       </section>
 
@@ -2583,7 +2673,7 @@ def load_sources_rows(
                 ) AS linked_terms
             FROM sources AS s
             {where_clause}
-            ORDER BY seen_at DESC, s.id DESC
+            ORDER BY julianday(seen_at) DESC, s.id DESC
             LIMIT ? OFFSET ?
             """,
             [*sql_params, pagination.limit, pagination.offset],
@@ -3004,7 +3094,7 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
                 k.id,
                 k.literal,
                 sk.count_in_source,
-                printf('%.1f', COALESCE(ks.priority_score, 0)) AS priority_score
+                COALESCE(ks.priority_score, 0) AS priority_score
             FROM source_kanji AS sk
             JOIN kanji AS k
                 ON k.id = sk.kanji_id
@@ -3021,7 +3111,8 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
 
     image_block = ""
     source_path = text(source["source_path"], "")
-    if source_path and Path(source_path).exists():
+    resolved_source_path = resolve_repo_local_path(source_path)
+    if resolved_source_path is not None and resolved_source_path.exists():
         image_block = f"""
         <section class="panel">
           <h3>Imagem</h3>
@@ -3066,7 +3157,7 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
         [
             f'<a href="/kanji/{row["id"]}">{escape(row["literal"])}</a>',
             escape(row["count_in_source"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
         ]
         for row in kanji_rows
     ]
@@ -3152,8 +3243,8 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         filters.append(
             """
             (
-                f.front_text LIKE ?
-                OR f.back_text LIKE ?
+                html_text(f.front_text) LIKE ?
+                OR html_text(f.back_text) LIKE ?
                 OR t.lemma LIKE ?
                 OR COALESCE(t.reading, '') LIKE ?
                 OR COALESCE(t.meaning_pt, '') LIKE ?
@@ -3168,6 +3259,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         where_clause = "WHERE " + " AND ".join(part.strip() for part in filters)
 
     with db_connect(db_path) as connection:
+        connection.create_function("html_text", 1, html_fragment_text, deterministic=True)
         total_count = connection.execute(
             f"""
             SELECT COUNT(*)
@@ -3186,7 +3278,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 t.id AS term_id,
                 t.lemma,
                 COALESCE(t.reading, '-') AS reading,
-                printf('%.1f', COALESCE(ts.priority_score, 0)) AS priority_score,
+                COALESCE(ts.priority_score, 0) AS priority_score,
                 f.template_name,
                 f.deck_name,
                 f.export_status,
@@ -3230,12 +3322,12 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         [
             f'<a href="/terms/{row["term_id"]}">{escape(row["lemma"])}</a>',
             escape(row["reading"]),
-            escape(row["priority_score"]),
+            escape(format_score(row["priority_score"])),
             escape(row["template_name"]),
             escape(row["deck_name"]),
             status_chip(text(row["export_status"])),
             escape(row["source_id"]),
-            escape(truncate(text(row["front_text"], ""), size=52)),
+            escape(truncate(html_fragment_text(row["front_text"]), size=52)),
         ]
         for row in rows
     ]
@@ -3402,7 +3494,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
                 (source_id,),
             ).fetchone()
         raw_path = row["source_path"] if row is not None else None
-        source_path = Path(str(raw_path)) if raw_path else None
+        source_path = resolve_repo_local_path(raw_path)
         if source_path is None or not source_path.exists():
             self.respond_not_found("Imagem da fonte nao encontrada.")
             return

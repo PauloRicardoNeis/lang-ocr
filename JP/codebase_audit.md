@@ -77,7 +77,7 @@ Web Python (navegacao, busca, sync Anki via subprocess do CLI)
 - **Severidade:** Critica
 - **Categoria:** Seguranca
 - **Onde:** `lang_jp_web.py:1973-1991` (`respond_source_image`)
-- **Evidencia:** O path da imagem vem diretamente do banco (`source_path`), e convertido em `Path()` e lido com `read_bytes()` sem nenhuma validacao. O banco e populado pelo daemon, pelo worker e pelo CLI via `--path`. Qualquer `source_path` que aponte para um arquivo arbitrario no filesystem (ex: `C:\Users\paulorn\.ssh\id_rsa`) sera servido pelo web server.
+- **Evidencia:** O path da imagem vem diretamente do banco (`source_path`), e convertido em `Path()` e lido com `read_bytes()` sem nenhuma validacao. O banco e populado pelo daemon, pelo worker e pelo CLI via `--path`. Qualquer `source_path` que aponte para um arquivo arbitrario no filesystem (ex: `C:\Users\<user>\.ssh\id_rsa`) sera servido pelo web server.
 - **Impacto pratico:** Um source_path malicioso ou acidentalmente errado permite ler qualquer arquivo legivel pelo processo Python via `GET /sources/{id}/image`.
 - **Cenario de falha:** Um agent (AGENTS.md workflow) ou um `add-source --path "C:\Windows\System32\config\SAM"` registra um path arbitrario. O web serve o conteudo.
 - **Por que acontece:** Nao ha validacao de que o path esta dentro de um diretorio permitido (ex: `data/captures/`).
