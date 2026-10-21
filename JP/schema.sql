@@ -198,6 +198,9 @@ CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_segment_id
 CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_approval_status
     ON source_analysis_candidates(approval_status);
 
+CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_parent_candidate_id
+    ON source_analysis_candidates(parent_candidate_id);
+
 CREATE TABLE IF NOT EXISTS source_translations (
     id INTEGER PRIMARY KEY,
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,

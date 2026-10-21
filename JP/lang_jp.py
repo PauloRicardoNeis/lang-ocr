@@ -44,6 +44,8 @@ DEFAULT_TERM_TRANSLATION_TIMEOUT_SECONDS = float(
 JMDICT_DB_PATH = Path(
     os.environ.get("LANG_JP_JMDICT_DB_PATH", str(jmdict.DEFAULT_JMDICT_DB_PATH))
 )
+# Notes on the terms, segments and links that approve_source_analysis_candidates creates.
+AUTO_PROMOTION_NOTES = "approved_from_source_analysis"
 KANJI_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kanji (
     id INTEGER PRIMARY KEY,
@@ -252,6 +254,10 @@ CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_segment_id
 
 CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_approval_status
     ON source_analysis_candidates(approval_status);
+
+-- Deleting a candidate looks up its children through this column (ON DELETE SET NULL).
+CREATE INDEX IF NOT EXISTS idx_source_analysis_candidates_parent_candidate_id
+    ON source_analysis_candidates(parent_candidate_id);
 """
 
 SOURCE_TRANSLATION_SCHEMA_SQL = """
@@ -675,28 +681,34 @@ def normalize_image_dimension(value: object | None) -> int | None:
     return normalized
 
 
-def resolve_repo_local_path(raw_path: str | Path | None) -> Path | None:
+def resolve_repo_local_path(
+    raw_path: str | Path | None,
+    *,
+    root: Path | None = None,
+) -> Path | None:
+    """Resolve a stored path against the JP folder (`root`, this checkout's by default)."""
     if raw_path in (None, ""):
         return None
 
+    root = ROOT if root is None else Path(root)
     path = Path(str(raw_path))
     if path.exists():
         return path
 
     if not path.is_absolute():
-        jp_relative_candidate = ROOT / path
+        jp_relative_candidate = root / path
         if jp_relative_candidate.exists():
             return jp_relative_candidate
         if parts := list(path.parts):
-            if parts[0].lower() == ROOT.name.lower():
-                return ROOT.parent.joinpath(*parts)
+            if parts[0].lower() == root.name.lower():
+                return root.parent.joinpath(*parts)
         return jp_relative_candidate
 
     parts = list(path.parts)
     normalized_parts = [part.lower() for part in parts]
     if "jp" in normalized_parts:
         jp_index = normalized_parts.index("jp")
-        candidate = ROOT.joinpath(*parts[jp_index + 1 :])
+        candidate = root.joinpath(*parts[jp_index + 1 :])
         if candidate.exists() or path.is_absolute():
             return candidate
 
@@ -1668,7 +1680,7 @@ def approve_source_analysis_candidates(
                 reading=reading or None,
                 meaning_pt=None,
                 pos=row["pos"],
-                notes="approved_from_source_analysis",
+                notes=AUTO_PROMOTION_NOTES,
             )
         else:
             term_id = int(term_id)
@@ -1684,7 +1696,7 @@ def approve_source_analysis_candidates(
             source_id=source_id,
             segment_text=str(row["segment_raw_text"]),
             reading=row["segment_reading"],
-            notes="approved_from_source_analysis",
+            notes=AUTO_PROMOTION_NOTES,
         )
         upsert_source_term_link(
             connection,
@@ -1694,7 +1706,7 @@ def approve_source_analysis_candidates(
             surface_form=surface_form,
             count=1,
             confidence=row["confidence"],
-            notes="approved_from_source_analysis",
+            notes=AUTO_PROMOTION_NOTES,
             mode="add",
         )
         upsert_source_segment_term_link(
@@ -1705,7 +1717,7 @@ def approve_source_analysis_candidates(
             surface_form=surface_form,
             count=1,
             confidence=row["confidence"],
-            notes="approved_from_source_analysis",
+            notes=AUTO_PROMOTION_NOTES,
             mode="add",
         )
         connection.execute(
