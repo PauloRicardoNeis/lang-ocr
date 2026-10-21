@@ -1,5 +1,6 @@
 .idea/
 .venv/
+.venv-capture312/
 __pycache__/
 *.py[cod]
 *.pyo

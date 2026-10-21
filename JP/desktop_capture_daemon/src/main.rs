@@ -120,12 +120,41 @@ struct DaemonConfigPatch {
     worker_script: Option<PathBuf>,
 }
 
+fn jp_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("JP parent directory")
+        .to_path_buf()
+}
+
+fn resolve_jp_config_path(value: PathBuf) -> PathBuf {
+    if value.is_absolute() {
+        value
+    } else {
+        jp_root().join(value)
+    }
+}
+
+fn resolve_jp_command_path(value: String) -> String {
+    let path = PathBuf::from(&value);
+    if path.is_absolute() || path.components().count() <= 1 {
+        value
+    } else {
+        jp_root().join(path).to_string_lossy().into_owned()
+    }
+}
+
+fn repo_local_storage_path(path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(jp_root()) {
+        relative.to_string_lossy().replace('\\', "/")
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
-        let jp_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("JP parent directory")
-            .to_path_buf();
+        let jp_root = jp_root();
         Self {
             interval_seconds: 60,
             capture_after_source_ready: false,
@@ -189,22 +218,22 @@ impl DaemonConfig {
             self.auto_process_jobs = value;
         }
         if let Some(value) = patch.db_path {
-            self.db_path = value;
+            self.db_path = resolve_jp_config_path(value);
         }
         if let Some(value) = patch.spool_dir {
-            self.spool_dir = value;
+            self.spool_dir = resolve_jp_config_path(value);
         }
         if let Some(value) = patch.log_path {
-            self.log_path = value;
+            self.log_path = resolve_jp_config_path(value);
         }
         if let Some(value) = patch.python_executable {
-            self.python_executable = value;
+            self.python_executable = resolve_jp_command_path(value);
         }
         if let Some(value) = patch.python_args {
             self.python_args = value;
         }
         if let Some(value) = patch.worker_script {
-            self.worker_script = value;
+            self.worker_script = resolve_jp_config_path(value);
         }
         self
     }
@@ -1405,6 +1434,7 @@ fn enqueue_capture_job(
 ) -> Result<i64> {
     let connection = open_db(db_path)?;
     let now: DateTime<Local> = Local::now();
+    let temp_image_path = repo_local_storage_path(temp_path);
     connection.execute(
         "
         INSERT INTO capture_jobs (
@@ -1418,7 +1448,7 @@ fn enqueue_capture_job(
         ",
         params![
             now.to_rfc3339(),
-            temp_path.to_string_lossy().as_ref(),
+            temp_image_path,
             sha256,
             phash.to_base64(),
         ],

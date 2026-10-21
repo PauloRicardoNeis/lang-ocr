@@ -51,6 +51,7 @@ O projeto nao e apenas um OCR nem apenas um gerador de flashcards. Ele funciona 
 
 - `README.md`: visao geral do projeto.
 - `AGENTS.md`: convencoes operacionais para agentes.
+- `setup_windows.ps1`: bootstrap para recriar os ambientes Python no Windows e rodar smoke tests.
 - `open_jp_catalog.cmd`: atalho Windows para abrir a interface web local.
 - `open_jp_capture_tray.cmd`: atalho Windows para abrir o tray de captura passiva.
 - `open_jp_capture_logs.cmd`: atalho Windows para acompanhar o log de captura em tempo real.
@@ -67,6 +68,31 @@ Se outro agente ou auditor for revisar este repositorio, o ponto de entrada corr
 2. Ler `AGENTS.md` para entender as convencoes do repo.
 3. Ler `JP/README.md` para o fluxo operacional do catalogo.
 4. Inspecionar `JP/lang_jp.py`, `JP/lang_jp_web.py`, `JP/capture_worker.py` e `JP/schema.sql` como nucleo funcional.
+
+## Rebuild no Windows
+
+Se voce precisou formatar a maquina, o caminho mais seguro hoje e:
+
+1. Instalar Python 3.12 x64.
+2. Instalar Git.
+3. Instalar Rust/Cargo se for usar a captura passiva.
+4. Rodar o bootstrap do repo:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_windows.ps1 `
+  -PythonExe "C:\Path\To\Python312\python.exe" `
+  -CapturePythonExe "C:\Path\To\Python312\python.exe" `
+  -InstallCaptureDeps `
+  -BuildDaemon `
+  -RunSmokeTests
+```
+
+Notas:
+
+- O ambiente `.venv` antigo nao deve ser reaproveitado depois de trocar a instalacao base do Python.
+- O catalogo principal usa `JP\requirements-main.txt`.
+- O OCR/capture usa `JP\requirements-capture.txt` e continua mais estavel em Python 3.12.
+- O repo agora tenta resolver caminhos antigos salvos no banco quando a raiz do projeto mudou apos reinstalacao.
 
 ## Estado atual
 

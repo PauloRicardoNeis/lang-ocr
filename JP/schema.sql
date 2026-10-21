@@ -3,6 +3,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS capture_jobs (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     captured_at TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (
         status IN ('pending', 'processing', 'accepted', 'rejected', 'failed')
@@ -19,6 +20,9 @@ CREATE TABLE IF NOT EXISTS capture_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_created_at
     ON capture_jobs(status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_updated_at
+    ON capture_jobs(status, updated_at);
 
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_image_sha256
     ON capture_jobs(image_sha256);

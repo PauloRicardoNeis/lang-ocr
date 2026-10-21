@@ -10,13 +10,15 @@ import re
 import sqlite3
 import sys
 import unicodedata
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 from urllib.error import URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+
+import jmdict
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +40,9 @@ DEFAULT_TERM_TRANSLATION_TARGET = os.environ.get(
 )
 DEFAULT_TERM_TRANSLATION_TIMEOUT_SECONDS = float(
     os.environ.get("LANG_JP_TERM_TRANSLATION_TIMEOUT_SECONDS", "10")
+)
+JMDICT_DB_PATH = Path(
+    os.environ.get("LANG_JP_JMDICT_DB_PATH", str(jmdict.DEFAULT_JMDICT_DB_PATH))
 )
 KANJI_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kanji (
@@ -110,8 +115,6 @@ CREATE INDEX IF NOT EXISTS idx_kanji_flashcards_anki_note_id
 """
 
 KANJI_VIEW_SQL = """
-DROP VIEW IF EXISTS v_kanji_overview;
-
 CREATE VIEW v_kanji_overview AS
 SELECT
     k.id,
@@ -178,6 +181,7 @@ CAPTURE_JOB_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS capture_jobs (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     captured_at TEXT,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (
         status IN ('pending', 'processing', 'accepted', 'rejected', 'failed')
@@ -275,8 +279,6 @@ CREATE INDEX IF NOT EXISTS idx_source_translations_target_language
 """
 
 TERM_VIEW_SQL = """
-DROP VIEW IF EXISTS v_terms_overview;
-
 CREATE VIEW v_terms_overview AS
 SELECT
     t.id,
@@ -488,10 +490,66 @@ def table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
     }
 
 
+def schema_object_sql(
+    connection: sqlite3.Connection,
+    object_name: str,
+    *,
+    object_type: str,
+) -> str | None:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = ? AND name = ?
+        """,
+        (object_type, object_name),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["sql"]) if row["sql"] is not None else None
+
+
+def normalize_schema_sql(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = " ".join(str(value).strip().split()).lower()
+    return normalized.rstrip(" ;")
+
+
+def ensure_view_definition(
+    connection: sqlite3.Connection,
+    view_name: str,
+    create_sql: str,
+) -> bool:
+    existing_sql = schema_object_sql(connection, view_name, object_type="view")
+    if normalize_schema_sql(existing_sql) == normalize_schema_sql(create_sql):
+        return False
+    connection.execute(f"DROP VIEW IF EXISTS {view_name}")
+    connection.executescript(create_sql)
+    return True
+
+
 def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
     changed = False
 
     connection.executescript(CAPTURE_JOB_SCHEMA_SQL)
+    if table_exists(connection, "capture_jobs"):
+        capture_job_columns = table_columns(connection, "capture_jobs")
+        if "updated_at" not in capture_job_columns:
+            connection.execute("ALTER TABLE capture_jobs ADD COLUMN updated_at TEXT")
+            connection.execute(
+                """
+                UPDATE capture_jobs
+                SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+                """
+            )
+            changed = True
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_updated_at
+                ON capture_jobs(status, updated_at)
+            """
+        )
     if table_exists(connection, "flashcards"):
         flashcard_columns = table_columns(connection, "flashcards")
         if "anki_note_id" not in flashcard_columns:
@@ -585,8 +643,8 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
                 """
             )
             changed = True
-    connection.executescript(TERM_VIEW_SQL)
-    connection.executescript(KANJI_VIEW_SQL)
+    changed = ensure_view_definition(connection, "v_terms_overview", TERM_VIEW_SQL) or changed
+    changed = ensure_view_definition(connection, "v_kanji_overview", KANJI_VIEW_SQL) or changed
 
     if changed:
         connection.commit()
@@ -617,12 +675,59 @@ def normalize_image_dimension(value: object | None) -> int | None:
     return normalized
 
 
+def resolve_repo_local_path(raw_path: str | Path | None) -> Path | None:
+    if raw_path in (None, ""):
+        return None
+
+    path = Path(str(raw_path))
+    if path.exists():
+        return path
+
+    if not path.is_absolute():
+        jp_relative_candidate = ROOT / path
+        if jp_relative_candidate.exists():
+            return jp_relative_candidate
+        if parts := list(path.parts):
+            if parts[0].lower() == ROOT.name.lower():
+                return ROOT.parent.joinpath(*parts)
+        return jp_relative_candidate
+
+    parts = list(path.parts)
+    normalized_parts = [part.lower() for part in parts]
+    if "jp" in normalized_parts:
+        jp_index = normalized_parts.index("jp")
+        candidate = ROOT.joinpath(*parts[jp_index + 1 :])
+        if candidate.exists() or path.is_absolute():
+            return candidate
+
+    return path
+
+
+def normalize_repo_storage_path(raw_path: str | Path | None) -> str | None:
+    if raw_path in (None, ""):
+        return None
+
+    original = Path(str(raw_path))
+    resolved = resolve_repo_local_path(original)
+    if resolved is not None:
+        try:
+            return resolved.resolve(strict=False).relative_to(ROOT.resolve(strict=False)).as_posix()
+        except ValueError:
+            pass
+
+    if original.is_absolute():
+        return str(original)
+    return original.as_posix()
+
+
 def read_source_image_dimensions(
     source_path: str | None,
 ) -> tuple[int | None, int | None]:
     if not source_path:
         return (None, None)
-    path = Path(str(source_path))
+    path = resolve_repo_local_path(source_path)
+    if path is None:
+        return (None, None)
     if not path.exists():
         return (None, None)
     try:
@@ -721,15 +826,83 @@ def google_gtx_translate_text(
     return translated
 
 
+def lookup_jmdict_term(
+    lemma: str,
+    *,
+    reading: str | None = None,
+    pos: str | None = None,
+    db_path: Path | None = None,
+) -> jmdict.JMdictMatch | None:
+    try:
+        dictionary = jmdict.JMdict.open(db_path or JMDICT_DB_PATH)
+        if dictionary is None:
+            return None
+        with dictionary:
+            return dictionary.lookup(lemma, reading=reading, pos=pos)
+    except sqlite3.Error:
+        return None
+
+
+def split_top_level_list(value: str) -> list[str]:
+    """Split on commas/semicolons that are not inside parentheses."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for char in value:
+        if char in "([（":
+            depth += 1
+        elif char in ")]）" and depth:
+            depth -= 1
+        elif char in ",;" and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def translate_jmdict_glosses(glosses: list[str]) -> str:
+    """Translate English JMdict glosses into the term translation target.
+
+    The glosses go out as one comma-separated list because the shared context
+    picks better senses than separate items do (kind -> gentil, not tipo).
+    """
+    gloss_text = "; ".join(glosses)
+    target_language = DEFAULT_TERM_TRANSLATION_TARGET
+    if target_language.lower().startswith("en"):
+        return gloss_text
+    translated = google_gtx_translate_text(
+        ", ".join(glosses),
+        source_language="en",
+        target_language=target_language,
+    )
+    if translated is None:
+        # Google returns the input unchanged when the gloss reads the same in the
+        # target language (for example loanwords), so keep the gloss itself.
+        return gloss_text
+    return "; ".join(jmdict.unique_glosses(split_top_level_list(translated))) or translated
+
+
 def auto_translate_term_meaning_pt(
     lemma: str,
     *,
     reading: str | None = None,
+    pos: str | None = None,
 ) -> str | None:
-    del reading
+    """Fill a missing term meaning from JMdict, falling back to translating the lemma.
+
+    The first glosses of the best JMdict sense are translated EN->PT, which is far
+    more reliable than machine-translating a bare Japanese lemma. The lemma itself
+    is only sent to the translator when JMdict has no match. The part of speech
+    picks the JMdict entry for kana grammar words (ます is the auxiliary, not 鱒).
+    """
     if not DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS:
         return None
+    match = lookup_jmdict_term(lemma, reading=reading, pos=pos)
     try:
+        if match is not None:
+            return translate_jmdict_glosses(match.gloss_list())
         return google_gtx_translate_text(
             lemma,
             source_language="ja",
@@ -771,6 +944,7 @@ def create_source_record(
     ocr_text_hash: str | None = None,
     capture_job_id: int | None = None,
 ) -> int:
+    source_path = normalize_repo_storage_path(source_path)
     if source_type == "image":
         image_width, image_height = ensure_source_image_dimensions(
             connection,
@@ -893,6 +1067,7 @@ def create_capture_job(
     image_sha256: str | None,
     image_phash: str | None,
 ) -> int:
+    temp_image_path = normalize_repo_storage_path(temp_image_path) or temp_image_path
     cursor = connection.execute(
         """
         INSERT INTO capture_jobs (
@@ -939,7 +1114,8 @@ def claim_next_capture_job(
             SET
                 status = 'processing',
                 attempt_count = attempt_count + 1,
-                last_error = NULL
+                last_error = NULL,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (row["id"],),
@@ -964,12 +1140,14 @@ def update_capture_job_status(
     raw_text: str | None = None,
     ocr_text_hash: str | None = None,
 ) -> None:
+    final_image_path = normalize_repo_storage_path(final_image_path)
     connection.execute(
         """
         UPDATE capture_jobs
         SET
             status = ?,
             last_error = ?,
+            updated_at = CURRENT_TIMESTAMP,
             final_image_path = COALESCE(?, final_image_path),
             raw_text = COALESCE(?, raw_text),
             ocr_text_hash = COALESCE(?, ocr_text_hash)
@@ -977,6 +1155,59 @@ def update_capture_job_status(
         """,
         (status, last_error, final_image_path, raw_text, ocr_text_hash, job_id),
     )
+
+
+def recover_stale_capture_jobs(
+    connection: sqlite3.Connection,
+    *,
+    older_than_hours: float,
+    to_status: str = "failed",
+    dry_run: bool = False,
+    now: datetime | None = None,
+    note: str | None = None,
+) -> list[sqlite3.Row]:
+    if older_than_hours <= 0:
+        return []
+    if to_status not in {"pending", "failed"}:
+        raise ValueError(f"Unsupported capture job recovery status: {to_status}")
+
+    current_time = now
+    if current_time is None:
+        current_time = datetime.now(UTC).replace(tzinfo=None)
+    elif current_time.tzinfo is not None:
+        current_time = current_time.astimezone(UTC).replace(tzinfo=None)
+    cutoff = current_time - timedelta(hours=older_than_hours)
+    cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    stale_rows = connection.execute(
+        """
+        SELECT *
+        FROM capture_jobs
+        WHERE status = 'processing'
+          AND COALESCE(updated_at, created_at) <= ?
+        ORDER BY COALESCE(updated_at, created_at) ASC, id ASC
+        """,
+        (cutoff_text,),
+    ).fetchall()
+    if dry_run or not stale_rows:
+        return stale_rows
+
+    recovery_note = note or (
+        "Recovered stale capture job from processing "
+        f"after exceeding the {older_than_hours:g}h threshold."
+    )
+    for row in stale_rows:
+        connection.execute(
+            """
+            UPDATE capture_jobs
+            SET
+                status = ?,
+                last_error = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (to_status, recovery_note, row["id"]),
+        )
+    return stale_rows
 
 
 def claim_next_source_translation(
@@ -1533,7 +1764,11 @@ def upsert_term_record(
     if meaning_pt is None and (
         existing is None or not normalize_token(existing["meaning_pt"])
     ):
-        meaning_pt = auto_translate_term_meaning_pt(lemma, reading=reading or None)
+        meaning_pt = auto_translate_term_meaning_pt(
+            lemma,
+            reading=reading or None,
+            pos=pos,
+        )
     if existing is None:
         cursor = connection.execute(
             """
@@ -2219,6 +2454,36 @@ def rebuild_stats(args: argparse.Namespace) -> None:
     )
 
 
+def recover_stale_capture_jobs_command(args: argparse.Namespace) -> None:
+    if args.older_than_hours <= 0:
+        raise SystemExit("--older-than-hours must be greater than zero.")
+
+    recovery_note = (
+        "Manual stale capture-job recovery via CLI "
+        f"(threshold={args.older_than_hours:g}h, target={args.to_status})."
+    )
+    with db_connect(args.db) as connection:
+        stale_rows = recover_stale_capture_jobs(
+            connection,
+            older_than_hours=args.older_than_hours,
+            to_status=args.to_status,
+            dry_run=args.dry_run,
+            note=recovery_note,
+        )
+        if not args.dry_run:
+            connection.commit()
+
+    action = "Would recover" if args.dry_run else "Recovered"
+    print(
+        f"{action} {len(stale_rows)} stale capture jobs "
+        f"older than {args.older_than_hours:g}h to '{args.to_status}'."
+    )
+    if stale_rows:
+        preview_ids = ", ".join(str(int(row["id"])) for row in stale_rows[:20])
+        suffix = " ..." if len(stale_rows) > 20 else ""
+        print(f"Job ids: {preview_ids}{suffix}")
+
+
 def list_sources(args: argparse.Namespace) -> None:
     with db_connect(args.db) as connection:
         raw_rows = connection.execute(
@@ -2484,6 +2749,98 @@ def list_terms(args: argparse.Namespace) -> None:
             "distinct_sources",
             "priority_score",
         ),
+    )
+
+
+def db_connect_read_only(db_path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        f"{Path(db_path).resolve().as_uri()}?mode=ro",
+        uri=True,
+        timeout=30,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    return connection
+
+
+def term_meanings_match(stored: str | None, derived: str | None) -> bool:
+    stored_glosses = {gloss.casefold() for gloss in split_meaning_glosses(stored)}
+    derived_glosses = {gloss.casefold() for gloss in split_meaning_glosses(derived)}
+    return stored_glosses == derived_glosses
+
+
+def jmdict_meaning_report(args: argparse.Namespace) -> None:
+    dictionary = jmdict.JMdict.open(args.jmdict_db)
+    if dictionary is None:
+        raise SystemExit(
+            f"JMdict database not found at {args.jmdict_db}. "
+            "Import it first with: python jmdict.py import <path to JMdict_e.gz>"
+        )
+    missing_only_clause = (
+        "WHERE t.meaning_pt IS NULL OR TRIM(t.meaning_pt) = ''"
+        if args.missing_only
+        else ""
+    )
+    connection = db_connect_read_only(args.db)
+    try:
+        rows = connection.execute(
+            f"""
+            SELECT t.id, t.lemma, t.reading, t.meaning_pt, t.pos
+            FROM terms AS t
+            LEFT JOIN term_stats AS ts
+                ON ts.term_id = t.id
+            {missing_only_clause}
+            ORDER BY
+                {TERM_PRIORITY_ORDER_WITH_TS_SQL.strip()}
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    translate = not args.no_translate
+    report_rows: list[dict[str, object]] = []
+    scanned = 0
+    matched = 0
+    with dictionary:
+        for row in filter_blacklisted_term_rows(rows):
+            if len(report_rows) >= args.limit:
+                break
+            scanned += 1
+            match = dictionary.lookup(row["lemma"], reading=row["reading"], pos=row["pos"])
+            if match is None:
+                continue
+            matched += 1
+            gloss_text = match.gloss_text()
+            derived = "-"
+            if translate:
+                try:
+                    derived = translate_jmdict_glosses(match.gloss_list())
+                except (OSError, TimeoutError, URLError, ValueError) as error:
+                    print(
+                        f"Translation failed ({error}); listing English glosses only from here on.",
+                        file=sys.stderr,
+                    )
+                    translate = False
+                else:
+                    if term_meanings_match(row["meaning_pt"], derived):
+                        continue
+            report_rows.append(
+                {
+                    "id": row["id"],
+                    "lemma": row["lemma"],
+                    "reading": row["reading"] or "-",
+                    "stored_pt": normalize_token(row["meaning_pt"]) or "-",
+                    "jmdict_en": gloss_text,
+                    "jmdict_pt": derived,
+                }
+            )
+    print_rows(
+        report_rows,
+        ("id", "lemma", "reading", "stored_pt", "jmdict_en", "jmdict_pt"),
+    )
+    print(
+        f"\nScanned {scanned} terms, {matched} with a JMdict match, "
+        f"listed {len(report_rows)} (limit {args.limit}). Read-only: nothing was written."
     )
 
 
@@ -5224,6 +5581,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rebuild_parser.set_defaults(func=rebuild_stats)
 
+    recover_stale_jobs_parser = subparsers.add_parser(
+        "recover-stale-capture-jobs",
+        help="Reset stale capture jobs stuck in processing back into the queue.",
+    )
+    recover_stale_jobs_parser.add_argument(
+        "--older-than-hours",
+        type=float,
+        default=4.0,
+        help="Only recover jobs whose last processing update is older than this many hours.",
+    )
+    recover_stale_jobs_parser.add_argument(
+        "--to-status",
+        choices=("failed", "pending"),
+        default="failed",
+        help="Recovered jobs normally become failed so the worker retries them after pending jobs.",
+    )
+    recover_stale_jobs_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview stale jobs without changing their status.",
+    )
+    recover_stale_jobs_parser.set_defaults(func=recover_stale_capture_jobs_command)
+
     prune_blacklisted_terms_parser = subparsers.add_parser(
         "prune-blacklisted-terms",
         help="Remove placeholder and single-kana terms plus their derived links/cards.",
@@ -5320,6 +5700,29 @@ def build_parser() -> argparse.ArgumentParser:
         default="priority",
     )
     list_terms_parser.set_defaults(func=list_terms)
+
+    jmdict_report_parser = subparsers.add_parser(
+        "jmdict-meaning-report",
+        help="Read-only: list terms whose stored meaning differs from the JMdict-derived one.",
+    )
+    jmdict_report_parser.add_argument("--limit", type=int, default=50)
+    jmdict_report_parser.add_argument(
+        "--missing-only",
+        action="store_true",
+        help="Only look at terms that have no stored meaning yet.",
+    )
+    jmdict_report_parser.add_argument(
+        "--no-translate",
+        action="store_true",
+        help="Skip the EN->PT step and list matched terms with their English gloss only.",
+    )
+    jmdict_report_parser.add_argument(
+        "--jmdict-db",
+        type=Path,
+        default=JMDICT_DB_PATH,
+        help=f"Path to the imported JMdict SQLite file (default: {JMDICT_DB_PATH})",
+    )
+    jmdict_report_parser.set_defaults(func=jmdict_meaning_report)
 
     list_kanji_parser = subparsers.add_parser(
         "list-kanji",
