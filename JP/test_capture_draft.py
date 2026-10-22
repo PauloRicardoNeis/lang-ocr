@@ -608,6 +608,7 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
                 "回復アイテム",
                 reading="かいふくアイテム",
                 pos="名詞",
+                language_code="ja",
             )
         finally:
             connection.close()

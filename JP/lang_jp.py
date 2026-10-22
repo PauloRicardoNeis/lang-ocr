@@ -19,6 +19,15 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 import jmdict
+import languages
+from languages import (
+    ALL_LANGUAGES_CODE,
+    AUTO_LANGUAGE_CODE,
+    DEFAULT_LANGUAGE_CODE,
+    LanguageProfile,
+    get_language,
+    normalize_language_code,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -44,10 +53,25 @@ DEFAULT_TERM_TRANSLATION_TIMEOUT_SECONDS = float(
 JMDICT_DB_PATH = Path(
     os.environ.get("LANG_JP_JMDICT_DB_PATH", str(jmdict.DEFAULT_JMDICT_DB_PATH))
 )
+LANGUAGE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS languages (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    native_name TEXT,
+    script TEXT NOT NULL DEFAULT 'latin',
+    deck_name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 KANJI_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS kanji (
     id INTEGER PRIMARY KEY,
     literal TEXT NOT NULL UNIQUE,
+    language_code TEXT NOT NULL DEFAULT 'ja',
     meaning_pt TEXT,
     canonical_meanings TEXT,
     on_readings TEXT,
@@ -119,6 +143,7 @@ CREATE VIEW v_kanji_overview AS
 SELECT
     k.id,
     k.literal,
+    k.language_code,
     k.meaning_pt,
     k.canonical_meanings,
     k.on_readings,
@@ -144,6 +169,7 @@ CREATE TABLE IF NOT EXISTS source_segments (
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     segment_key TEXT NOT NULL,
     segment_text TEXT NOT NULL,
+    language_code TEXT,
     reading TEXT,
     notes TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -210,6 +236,7 @@ CREATE TABLE IF NOT EXISTS source_analysis_segments (
     segment_index INTEGER NOT NULL,
     raw_text TEXT NOT NULL,
     normalized_text TEXT NOT NULL,
+    language_code TEXT,
     reading TEXT,
     confidence REAL CHECK (
         confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
@@ -282,6 +309,7 @@ TERM_VIEW_SQL = """
 CREATE VIEW v_terms_overview AS
 SELECT
     t.id,
+    t.language_code,
     t.lemma,
     t.reading,
     t.meaning_pt,
@@ -295,6 +323,31 @@ SELECT
 FROM terms AS t
 LEFT JOIN term_stats AS ts
     ON ts.term_id = t.id;
+"""
+
+FLASHCARD_VIEW_SQL = """
+CREATE VIEW v_flashcards_overview AS
+SELECT
+    f.id,
+    f.template_name,
+    f.deck_name,
+    f.note_type,
+    f.front_text,
+    f.back_text,
+    f.tags,
+    f.anki_note_id,
+    f.export_status,
+    f.exported_at,
+    f.created_at,
+    t.language_code,
+    t.lemma,
+    t.reading,
+    t.meaning_pt,
+    t.pos,
+    f.source_id
+FROM flashcards AS f
+JOIN terms AS t
+    ON t.id = f.term_id;
 """
 
 TERM_PRIORITY_ORDER_SQL = """
@@ -366,6 +419,7 @@ def term_blacklist_reason(
     *,
     reading: str | None = None,
     pos: str | None = None,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
 ) -> str | None:
     del reading
     del pos
@@ -377,7 +431,10 @@ def term_blacklist_reason(
         or normalized_lemma in BLACKLISTED_SINGLE_SYMBOL_TERMS
     ):
         return "placeholder_or_punctuation"
-    if is_single_kana_character(normalized_lemma):
+    if not any(unicodedata.category(char).startswith("L") for char in normalized_lemma):
+        return "placeholder_or_punctuation"
+    base_code = languages.base_language_code(language_code) or DEFAULT_LANGUAGE_CODE
+    if base_code == DEFAULT_LANGUAGE_CODE and is_single_kana_character(normalized_lemma):
         return "single_kana_syllable"
     return None
 
@@ -387,8 +444,14 @@ def ensure_term_not_blacklisted(
     *,
     reading: str | None = None,
     pos: str | None = None,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
 ) -> None:
-    reason = term_blacklist_reason(lemma, reading=reading, pos=pos)
+    reason = term_blacklist_reason(
+        lemma,
+        reading=reading,
+        pos=pos,
+        language_code=language_code,
+    )
     if reason is None:
         return
     normalized_lemma = normalize_token(lemma) or "<empty>"
@@ -403,6 +466,9 @@ def filter_blacklisted_term_rows(rows: Iterable[sqlite3.Row]) -> list[sqlite3.Ro
             row["lemma"] if "lemma" in keys else None,
             reading=row["reading"] if "reading" in keys else None,
             pos=row["pos"] if "pos" in keys else None,
+            language_code=(
+                row["language_code"] if "language_code" in keys else DEFAULT_LANGUAGE_CODE
+            ),
         )
         if reason is None:
             visible_rows.append(row)
@@ -416,6 +482,7 @@ def blacklisted_term_entries(
         """
         SELECT
             t.id,
+            t.language_code,
             t.lemma,
             t.reading,
             t.pos,
@@ -440,6 +507,7 @@ def blacklisted_term_entries(
             row["lemma"],
             reading=row["reading"],
             pos=row["pos"],
+            language_code=row["language_code"],
         )
         if reason is not None:
             entries.append((row, reason))
@@ -451,8 +519,134 @@ def is_proper_name_meaning(value: str | None) -> bool:
     return normalized.startswith("nome") and "proprio" in normalized
 
 
-def canonical_key(lemma: str, reading: str | None) -> str:
-    return f"{normalize_token(lemma)}::{normalize_token(reading)}"
+def canonical_key(
+    lemma: str,
+    reading: str | None,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
+) -> str:
+    """Language-scoped identity of a term: ``lang::lemma::reading``."""
+    code = normalize_language_code(language_code) or DEFAULT_LANGUAGE_CODE
+    return f"{code}::{normalize_token(lemma)}::{normalize_token(reading)}"
+
+
+LEGACY_CANONICAL_KEY_PATTERN = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*::.*::")
+
+
+def resolve_language_code(
+    value: str | None,
+    *,
+    text: str | None = None,
+    candidates: Iterable[str] | None = None,
+    default: str = DEFAULT_LANGUAGE_CODE,
+) -> tuple[str, float | None]:
+    """Turn a user-facing language value into a concrete code.
+
+    ``auto`` (or empty) detects the language from ``text``; the confidence is
+    returned so callers can store it. Explicit codes return confidence ``None``.
+    """
+    normalized = normalize_language_code(value)
+    if normalized and normalized not in (AUTO_LANGUAGE_CODE, ALL_LANGUAGES_CODE):
+        if not languages.is_valid_language_code(normalized):
+            raise SystemExit(f"Invalid language code: {value!r}")
+        return normalized, None
+    if not normalize_token(text):
+        return default, None
+    guess = languages.detect_language(text, candidates=candidates, default=default)
+    return guess.code, guess.confidence
+
+
+def ensure_language_row(
+    connection: sqlite3.Connection,
+    code: str | None,
+    *,
+    deck_name: str | None = None,
+    name: str | None = None,
+    enabled: bool | None = None,
+) -> LanguageProfile:
+    """Make sure ``languages`` has a row for ``code`` and return its profile."""
+    profile = get_language(code)
+    existing = connection.execute(
+        "SELECT code FROM languages WHERE code = ?",
+        (profile.code,),
+    ).fetchone()
+    if existing is None:
+        connection.execute(
+            """
+            INSERT INTO languages (
+                code, name, native_name, script, deck_name, enabled, sort_order
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                profile.code,
+                name or profile.name,
+                profile.native_name,
+                profile.script,
+                deck_name or profile.deck_name,
+                1 if enabled is None or enabled else 0,
+                0 if profile.code == DEFAULT_LANGUAGE_CODE else 100,
+            ),
+        )
+    elif deck_name is not None or name is not None or enabled is not None:
+        connection.execute(
+            """
+            UPDATE languages
+            SET
+                name = COALESCE(?, name),
+                deck_name = COALESCE(?, deck_name),
+                enabled = COALESCE(?, enabled),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE code = ?
+            """,
+            (name, deck_name, None if enabled is None else (1 if enabled else 0), profile.code),
+        )
+    return profile
+
+
+def language_deck_name(connection: sqlite3.Connection, code: str | None) -> str:
+    row = connection.execute(
+        "SELECT deck_name FROM languages WHERE code = ?",
+        (normalize_language_code(code) or DEFAULT_LANGUAGE_CODE,),
+    ).fetchone()
+    if row is not None and row["deck_name"]:
+        return str(row["deck_name"])
+    return get_language(code).deck_name
+
+
+def list_language_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT
+            l.code,
+            l.name,
+            l.native_name,
+            l.script,
+            l.deck_name,
+            l.enabled,
+            l.sort_order,
+            (SELECT COUNT(*) FROM terms AS t WHERE t.language_code = l.code) AS term_count,
+            (SELECT COUNT(*) FROM sources AS s WHERE s.language_code = l.code) AS source_count,
+            (
+                SELECT COUNT(*)
+                FROM flashcards AS f
+                JOIN terms AS t ON t.id = f.term_id
+                WHERE t.language_code = l.code AND f.export_status = 'pending'
+            ) AS pending_flashcards
+        FROM languages AS l
+        ORDER BY l.sort_order ASC, l.name COLLATE NOCASE ASC
+        """
+    ).fetchall()
+
+
+def language_filter_clause(
+    column: str,
+    language: str | None,
+) -> tuple[str, list[object]]:
+    """Return ``(sql, params)`` restricting ``column`` to one language, or nothing for ``all``."""
+    normalized = normalize_language_code(language)
+    if not normalized or normalized in (ALL_LANGUAGES_CODE, AUTO_LANGUAGE_CODE):
+        return "", []
+    return f"{column} = ?", [normalized]
 
 
 def form_key(surface_form: str, reading: str | None) -> str:
@@ -527,6 +721,92 @@ def ensure_view_definition(
     connection.execute(f"DROP VIEW IF EXISTS {view_name}")
     connection.executescript(create_sql)
     return True
+
+
+def ensure_language_columns(connection: sqlite3.Connection) -> bool:
+    """Add language columns to pre-polyglot databases and scope legacy keys.
+
+    Everything that existed before the polyglot change was Japanese, so rows
+    get ``ja`` and canonical keys gain the ``ja::`` prefix exactly once.
+    """
+    changed = False
+    connection.executescript(LANGUAGE_SCHEMA_SQL)
+    if table_exists(connection, "terms"):
+        term_columns = table_columns(connection, "terms")
+        if "language_code" not in term_columns:
+            connection.execute(
+                """
+                ALTER TABLE terms
+                ADD COLUMN language_code TEXT NOT NULL DEFAULT 'ja'
+                """
+            )
+            changed = True
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_terms_language_code
+                ON terms(language_code, lemma)
+            """
+        )
+        legacy_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM terms
+            WHERE canonical_key NOT LIKE language_code || '::%'
+            """
+        ).fetchone()[0]
+        if legacy_count:
+            connection.execute(
+                """
+                UPDATE terms
+                SET canonical_key = language_code || '::' || canonical_key
+                WHERE canonical_key NOT LIKE language_code || '::%'
+                """
+            )
+            changed = True
+    if table_exists(connection, "sources"):
+        source_columns = table_columns(connection, "sources")
+        if "language_confidence" not in source_columns:
+            connection.execute("ALTER TABLE sources ADD COLUMN language_confidence REAL")
+            changed = True
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sources_language_code
+                ON sources(language_code, created_at)
+            """
+        )
+    for table_name in ("source_segments", "source_analysis_segments"):
+        if table_exists(connection, table_name):
+            if "language_code" not in table_columns(connection, table_name):
+                connection.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN language_code TEXT"
+                )
+                changed = True
+    if table_exists(connection, "kanji"):
+        if "language_code" not in table_columns(connection, "kanji"):
+            connection.execute(
+                """
+                ALTER TABLE kanji
+                ADD COLUMN language_code TEXT NOT NULL DEFAULT 'ja'
+                """
+            )
+            changed = True
+    # Register every language that already has data, Japanese first.
+    seen_codes = {DEFAULT_LANGUAGE_CODE}
+    for table_name in ("sources", "terms"):
+        if not table_exists(connection, table_name):
+            continue
+        for row in connection.execute(
+            f"SELECT DISTINCT language_code FROM {table_name}"
+        ).fetchall():
+            code = normalize_language_code(row["language_code"])
+            if code and code not in (AUTO_LANGUAGE_CODE, ALL_LANGUAGES_CODE):
+                seen_codes.add(code)
+    for code in sorted(seen_codes):
+        before = connection.total_changes
+        ensure_language_row(connection, code)
+        if connection.total_changes != before:
+            changed = True
+    return changed
 
 
 def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
@@ -643,8 +923,13 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
                 """
             )
             changed = True
+    changed = ensure_language_columns(connection) or changed
     changed = ensure_view_definition(connection, "v_terms_overview", TERM_VIEW_SQL) or changed
     changed = ensure_view_definition(connection, "v_kanji_overview", KANJI_VIEW_SQL) or changed
+    changed = (
+        ensure_view_definition(connection, "v_flashcards_overview", FLASHCARD_VIEW_SQL)
+        or changed
+    )
 
     if changed:
         connection.commit()
@@ -889,24 +1174,33 @@ def auto_translate_term_meaning_pt(
     *,
     reading: str | None = None,
     pos: str | None = None,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
 ) -> str | None:
-    """Fill a missing term meaning from JMdict, falling back to translating the lemma.
+    """Fill a missing term meaning for any language.
 
-    The first glosses of the best JMdict sense are translated EN->PT, which is far
-    more reliable than machine-translating a bare Japanese lemma. The lemma itself
-    is only sent to the translator when JMdict has no match. The part of speech
-    picks the JMdict entry for kana grammar words (ます is the auxiliary, not 鱒).
+    Japanese terms go through JMdict first: the first glosses of the best sense
+    are translated EN->target, which is far more reliable than machine-translating
+    a bare lemma. The part of speech picks the JMdict entry for kana grammar
+    words (ます is the auxiliary, not 鱒). Every other language, and Japanese
+    lemmas JMdict does not know, are machine-translated from their own language.
+    A term already written in the gloss language keeps the lemma as meaning.
     """
     if not DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS:
         return None
-    match = lookup_jmdict_term(lemma, reading=reading, pos=pos)
+    profile = get_language(language_code)
+    source_language = languages.base_language_code(profile.code) or DEFAULT_LANGUAGE_CODE
+    target_language = DEFAULT_TERM_TRANSLATION_TARGET
+    if source_language == languages.base_language_code(target_language):
+        return normalize_token(lemma) or None
     try:
-        if match is not None:
-            return translate_jmdict_glosses(match.gloss_list())
+        if profile.dictionary == "jmdict":
+            match = lookup_jmdict_term(lemma, reading=reading, pos=pos)
+            if match is not None:
+                return translate_jmdict_glosses(match.gloss_list())
         return google_gtx_translate_text(
             lemma,
-            source_language="ja",
-            target_language=DEFAULT_TERM_TRANSLATION_TARGET,
+            source_language=source_language,
+            target_language=target_language,
         )
     except (OSError, TimeoutError, URLError, ValueError):
         return None
@@ -928,7 +1222,8 @@ def create_source_record(
     connection: sqlite3.Connection,
     *,
     source_type: str,
-    language_code: str = "ja",
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
+    language_confidence: float | None = None,
     ingest_mode: str = "manual",
     review_status: str = "reviewed",
     title: str | None = None,
@@ -944,6 +1239,13 @@ def create_source_record(
     ocr_text_hash: str | None = None,
     capture_job_id: int | None = None,
 ) -> int:
+    language_code, detected_confidence = resolve_language_code(
+        language_code,
+        text=raw_text,
+    )
+    if language_confidence is None:
+        language_confidence = detected_confidence
+    ensure_language_row(connection, language_code)
     source_path = normalize_repo_storage_path(source_path)
     if source_type == "image":
         image_width, image_height = ensure_source_image_dimensions(
@@ -958,6 +1260,7 @@ def create_source_record(
         INSERT INTO sources (
             source_type,
             language_code,
+            language_confidence,
             ingest_mode,
             review_status,
             title,
@@ -973,11 +1276,12 @@ def create_source_record(
             ocr_text_hash,
             capture_job_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             source_type,
             language_code,
+            language_confidence,
             ingest_mode,
             review_status,
             title,
@@ -1235,6 +1539,7 @@ def claim_next_source_translation(
             SELECT
                 st.*,
                 s.raw_text,
+                s.language_code AS source_language_code,
                 s.ocr_text_hash AS current_source_text_hash
             FROM source_translations AS st
             JOIN sources AS s
@@ -1283,6 +1588,7 @@ def create_source_analysis_segment(
     reading: str | None,
     confidence: float | None,
     bbox_json: str | None,
+    language_code: str | None = None,
 ) -> int:
     cursor = connection.execute(
         """
@@ -1291,14 +1597,16 @@ def create_source_analysis_segment(
             segment_index,
             raw_text,
             normalized_text,
+            language_code,
             reading,
             confidence,
             bbox_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_id, segment_index) DO UPDATE SET
             raw_text = excluded.raw_text,
             normalized_text = excluded.normalized_text,
+            language_code = excluded.language_code,
             reading = excluded.reading,
             confidence = excluded.confidence,
             bbox_json = excluded.bbox_json,
@@ -1310,6 +1618,7 @@ def create_source_analysis_segment(
             segment_index,
             raw_text,
             normalized_text,
+            normalize_language_code(language_code) or None,
             reading,
             confidence,
             bbox_json,
@@ -1587,10 +1896,13 @@ def pending_analysis_candidates(
             sac.*,
             sas.segment_index,
             sas.raw_text AS segment_raw_text,
-            sas.reading AS segment_reading
+            sas.reading AS segment_reading,
+            COALESCE(sas.language_code, s.language_code, 'ja') AS segment_language_code
         FROM source_analysis_candidates AS sac
         JOIN source_analysis_segments AS sas
             ON sas.id = sac.source_analysis_segment_id
+        JOIN sources AS s
+            ON s.id = sas.source_id
         WHERE {' AND '.join(conditions)}
         ORDER BY sas.segment_index ASC, sac.rank ASC, sac.id ASC
         """,
@@ -1642,12 +1954,16 @@ def approve_source_analysis_candidates(
         )
         surface_form = normalize_token(row["surface_form"]) or lemma
         reading = normalize_token(row["reading"])
+        segment_language_code = (
+            normalize_language_code(row["segment_language_code"]) or DEFAULT_LANGUAGE_CODE
+        )
         if not lemma or not surface_form:
             continue
         blacklist_reason = term_blacklist_reason(
             lemma,
             reading=reading or None,
             pos=row["pos"],
+            language_code=segment_language_code,
         )
         if blacklist_reason is not None:
             connection.execute(
@@ -1669,6 +1985,7 @@ def approve_source_analysis_candidates(
                 meaning_pt=None,
                 pos=row["pos"],
                 notes="approved_from_source_analysis",
+                language_code=segment_language_code,
             )
         else:
             term_id = int(term_id)
@@ -1685,6 +2002,7 @@ def approve_source_analysis_candidates(
             segment_text=str(row["segment_raw_text"]),
             reading=row["segment_reading"],
             notes="approved_from_source_analysis",
+            language_code=segment_language_code,
         )
         upsert_source_term_link(
             connection,
@@ -1736,6 +2054,242 @@ def approve_source_analysis_candidates(
     return (promoted_terms, promoted_candidates)
 
 
+def read_existing_term_match(
+    connection: sqlite3.Connection,
+    *,
+    lemma: str,
+    reading: str | None,
+    surface_form: str,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
+) -> int | None:
+    """Find an already cataloged term for a token in the same language."""
+    language_code = normalize_language_code(language_code) or DEFAULT_LANGUAGE_CODE
+    term_row = connection.execute(
+        "SELECT id FROM terms WHERE canonical_key = ?",
+        (canonical_key(lemma, reading, language_code),),
+    ).fetchone()
+    if term_row is not None:
+        return int(term_row["id"])
+    form_row = connection.execute(
+        """
+        SELECT tf.term_id
+        FROM term_forms AS tf
+        JOIN terms AS t
+            ON t.id = tf.term_id
+        WHERE tf.form_key = ? AND t.language_code = ?
+        ORDER BY tf.term_id ASC
+        LIMIT 1
+        """,
+        (form_key(surface_form, reading), language_code),
+    ).fetchone()
+    if form_row is not None:
+        return int(form_row["term_id"])
+    return None
+
+
+def read_existing_kanji_match(connection: sqlite3.Connection, literal: str) -> int | None:
+    row = connection.execute(
+        "SELECT id FROM kanji WHERE literal = ?",
+        (literal,),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["id"])
+
+
+def build_segment_candidates(
+    connection: sqlite3.Connection,
+    *,
+    text: str,
+    language_code: str,
+    tokens: list[languages.Token],
+    confidence: float | None = None,
+    bbox_json: str | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Turn analyzer tokens into draft candidates for one segment.
+
+    Main tokens become ``term`` candidates, their sub-tokens ``subterm``
+    candidates, and for languages with characters every han character in a
+    token becomes a ``kanji`` candidate. Matches against the catalog are
+    resolved within the segment language only.
+    """
+    language_code = normalize_language_code(language_code) or DEFAULT_LANGUAGE_CODE
+    profile = get_language(language_code)
+    normalized_text = normalize_token(text)
+    segment_payload: dict[str, object] = {
+        "raw_text": text,
+        "normalized_text": normalized_text,
+        "language_code": language_code,
+        "reading": None,
+        "confidence": confidence,
+        "bbox_json": bbox_json,
+    }
+    candidates: list[dict[str, object]] = []
+    if not normalized_text:
+        return segment_payload, candidates
+    for rank, token in enumerate(tokens):
+        surface = normalize_token(token.surface)
+        if not surface:
+            continue
+        lemma = normalize_token(token.lemma) or surface
+        reading = normalize_token(token.reading) or None
+        pos = normalize_token(token.pos) or None
+        candidates.append(
+            {
+                "key": f"main:{rank}",
+                "parent_key": None,
+                "candidate_type": "term",
+                "surface_form": surface,
+                "dictionary_form": lemma,
+                "reading": reading,
+                "pos": pos,
+                "confidence": confidence,
+                "rank": rank,
+                "matched_term_id": read_existing_term_match(
+                    connection,
+                    lemma=lemma,
+                    reading=reading,
+                    surface_form=surface,
+                    language_code=language_code,
+                ),
+                "matched_kanji_id": None,
+                "language_code": language_code,
+            }
+        )
+        for sub_index, sub_token in enumerate(token.sub_tokens):
+            sub_surface = normalize_token(sub_token.surface)
+            if not sub_surface or sub_surface == surface:
+                continue
+            sub_lemma = normalize_token(sub_token.lemma) or sub_surface
+            sub_reading = normalize_token(sub_token.reading) or None
+            candidates.append(
+                {
+                    "key": f"sub:{rank}:{sub_index}",
+                    "parent_key": f"main:{rank}",
+                    "candidate_type": "subterm",
+                    "surface_form": sub_surface,
+                    "dictionary_form": sub_lemma,
+                    "reading": sub_reading,
+                    "pos": normalize_token(sub_token.pos) or None,
+                    "confidence": confidence,
+                    "rank": (rank * 100) + sub_index + 1,
+                    "matched_term_id": read_existing_term_match(
+                        connection,
+                        lemma=sub_lemma,
+                        reading=sub_reading,
+                        surface_form=sub_surface,
+                        language_code=language_code,
+                    ),
+                    "matched_kanji_id": None,
+                    "language_code": language_code,
+                }
+            )
+        if profile.has_characters:
+            for literal in sorted({char for char in f"{surface}{lemma}" if is_kanji_char(char)}):
+                candidates.append(
+                    {
+                        "key": f"kanji:{rank}:{literal}",
+                        "parent_key": f"main:{rank}",
+                        "candidate_type": "kanji",
+                        "surface_form": literal,
+                        "dictionary_form": literal,
+                        "reading": None,
+                        "pos": "kanji",
+                        "confidence": confidence,
+                        "rank": (rank * 1000) + ord(literal),
+                        "matched_term_id": None,
+                        "matched_kanji_id": read_existing_kanji_match(connection, literal),
+                        "language_code": language_code,
+                    }
+                )
+    return segment_payload, candidates
+
+
+def store_segment_candidates(
+    connection: sqlite3.Connection,
+    *,
+    segment_id: int,
+    candidates: list[dict[str, object]],
+) -> int:
+    inserted_ids: dict[str, int] = {}
+    for candidate in candidates:
+        parent_key = candidate.get("parent_key")
+        parent_id = inserted_ids.get(str(parent_key)) if parent_key is not None else None
+        candidate_id = create_source_analysis_candidate(
+            connection,
+            source_analysis_segment_id=segment_id,
+            candidate_type=str(candidate["candidate_type"]),
+            surface_form=str(candidate["surface_form"]),
+            dictionary_form=str(candidate["dictionary_form"]),
+            reading=candidate["reading"],  # type: ignore[arg-type]
+            pos=candidate["pos"],  # type: ignore[arg-type]
+            confidence=candidate["confidence"],  # type: ignore[arg-type]
+            rank=int(candidate["rank"]),  # type: ignore[arg-type]
+            parent_candidate_id=parent_id,
+            matched_term_id=candidate["matched_term_id"],  # type: ignore[arg-type]
+            matched_kanji_id=candidate["matched_kanji_id"],  # type: ignore[arg-type]
+        )
+        inserted_ids[str(candidate["key"])] = candidate_id
+    return len(inserted_ids)
+
+
+def analyze_source_text(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    text: str,
+    language: str | None = AUTO_LANGUAGE_CODE,
+    candidates: Iterable[str] | None = None,
+    confidence: float | None = None,
+) -> dict[str, object]:
+    """Split ``text`` into language runs and store draft segments and candidates.
+
+    Each line is analyzed on its own; a line that mixes scripts produces one
+    segment per language run, so mixed-language sources are sorted per language.
+    """
+    candidate_list = list(candidates) if candidates is not None else None
+    segment_index = 0
+    candidate_total = 0
+    languages_seen: set[str] = set()
+    for line in normalize_multiline_text(text).split("\n"):
+        if not line:
+            continue
+        runs = languages.analyze_text(line, language=language, candidates=candidate_list)
+        for run in runs:
+            if not normalize_token(run.text):
+                continue
+            segment_payload, run_candidates = build_segment_candidates(
+                connection,
+                text=run.text.strip(),
+                language_code=run.language_code,
+                tokens=run.tokens,
+                confidence=confidence,
+            )
+            segment_id = create_source_analysis_segment(
+                connection,
+                source_id=source_id,
+                segment_index=segment_index,
+                raw_text=str(segment_payload["raw_text"]),
+                normalized_text=str(segment_payload["normalized_text"]),
+                reading=None,
+                confidence=confidence,
+                bbox_json=None,
+                language_code=run.language_code,
+            )
+            candidate_total += store_segment_candidates(
+                connection,
+                segment_id=segment_id,
+                candidates=run_candidates,
+            )
+            languages_seen.add(run.language_code)
+            segment_index += 1
+    return {
+        "segments": segment_index,
+        "candidates": candidate_total,
+        "languages": languages_seen,
+    }
+
+
 def get_term_by_key(
     connection: sqlite3.Connection,
     key: str,
@@ -1754,12 +2308,19 @@ def upsert_term_record(
     meaning_pt: str | None,
     pos: str | None,
     notes: str | None,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
 ) -> int:
     lemma = normalize_token(lemma)
     reading = normalize_token(reading)
     meaning_pt = normalize_token(meaning_pt) or None
-    ensure_term_not_blacklisted(lemma, reading=reading or None, pos=pos)
-    key = canonical_key(lemma, reading)
+    language_code, _ = resolve_language_code(language_code, text=lemma)
+    ensure_term_not_blacklisted(
+        lemma,
+        reading=reading or None,
+        pos=pos,
+        language_code=language_code,
+    )
+    key = canonical_key(lemma, reading, language_code)
     existing = get_term_by_key(connection, key)
     if meaning_pt is None and (
         existing is None or not normalize_token(existing["meaning_pt"])
@@ -1768,21 +2329,24 @@ def upsert_term_record(
             lemma,
             reading=reading or None,
             pos=pos,
+            language_code=language_code,
         )
     if existing is None:
+        ensure_language_row(connection, language_code)
         cursor = connection.execute(
             """
             INSERT INTO terms (
                 canonical_key,
+                language_code,
                 lemma,
                 reading,
                 meaning_pt,
                 pos,
                 notes
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (key, lemma, reading or None, meaning_pt, pos, notes),
+            (key, language_code, lemma, reading or None, meaning_pt, pos, notes),
         )
         return int(cursor.lastrowid)
 
@@ -1844,12 +2408,16 @@ def ensure_source_segment(
     segment_text: str,
     reading: str | None,
     notes: str | None,
+    language_code: str | None = None,
 ) -> int:
     segment_text = normalize_token(segment_text)
     if not segment_text:
         raise SystemExit("Segment text cannot be empty.")
 
     reading = normalize_token(reading)
+    language_code = normalize_language_code(language_code) or None
+    if language_code == AUTO_LANGUAGE_CODE:
+        language_code, _ = resolve_language_code(AUTO_LANGUAGE_CODE, text=segment_text)
     key = segment_key(segment_text, reading)
     existing = connection.execute(
         """
@@ -1866,12 +2434,13 @@ def ensure_source_segment(
                 source_id,
                 segment_key,
                 segment_text,
+                language_code,
                 reading,
                 notes
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (source_id, key, segment_text, reading or None, notes),
+            (source_id, key, segment_text, language_code, reading or None, notes),
         )
         return int(cursor.lastrowid)
 
@@ -1879,12 +2448,13 @@ def ensure_source_segment(
         """
         UPDATE source_segments
         SET
+            language_code = COALESCE(?, language_code),
             reading = COALESCE(?, reading),
             notes = COALESCE(?, notes),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (reading or None, notes, existing["id"]),
+        (language_code, reading or None, notes, existing["id"]),
     )
     return int(existing["id"])
 
@@ -2139,8 +2709,14 @@ def preferred_kanji_text(surface_form: str | None, lemma: str | None) -> str:
     return normalize_token(surface_form)
 
 
-def upsert_kanji_record(connection: sqlite3.Connection, literal: str) -> int:
+def upsert_kanji_record(
+    connection: sqlite3.Connection,
+    literal: str,
+    *,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
+) -> int:
     literal = normalize_token(literal)
+    language_code = normalize_language_code(language_code) or DEFAULT_LANGUAGE_CODE
     row = connection.execute(
         "SELECT id FROM kanji WHERE literal = ?",
         (literal,),
@@ -2158,10 +2734,10 @@ def upsert_kanji_record(connection: sqlite3.Connection, literal: str) -> int:
 
     cursor = connection.execute(
         """
-        INSERT INTO kanji (literal)
-        VALUES (?)
+        INSERT INTO kanji (literal, language_code)
+        VALUES (?, ?)
         """,
-        (literal,),
+        (literal, language_code),
     )
     return int(cursor.lastrowid)
 
@@ -2280,7 +2856,8 @@ def refresh_source_kanji(connection: sqlite3.Connection, source_id: int) -> None
         SELECT
             st.surface_form,
             st.count_in_source,
-            t.lemma
+            t.lemma,
+            t.language_code
         FROM source_terms AS st
         JOIN terms AS t
             ON t.id = st.term_id
@@ -2289,17 +2866,28 @@ def refresh_source_kanji(connection: sqlite3.Connection, source_id: int) -> None
         (source_id,),
     ).fetchall()
 
+    kanji_language: dict[str, str] = {}
     for row in source_rows:
+        # Characters are only study units for languages whose profile says so
+        # (Japanese kanji, Chinese hanzi); a Latin term never produces one.
+        term_language = normalize_language_code(row["language_code"]) or DEFAULT_LANGUAGE_CODE
+        if not get_language(term_language).has_characters:
+            continue
         kanji_text = preferred_kanji_text(row["surface_form"], row["lemma"])
         for literal, count in extract_kanji_counts(kanji_text).items():
             counts_by_kanji[literal] = (
                 counts_by_kanji.get(literal, 0)
                 + (count * int(row["count_in_source"]))
             )
+            kanji_language.setdefault(literal, term_language)
 
     current_kanji_ids: set[int] = set()
     for literal, count_in_source in counts_by_kanji.items():
-        kanji_id = upsert_kanji_record(connection, literal)
+        kanji_id = upsert_kanji_record(
+            connection,
+            literal,
+            language_code=kanji_language.get(literal, DEFAULT_LANGUAGE_CODE),
+        )
         current_kanji_ids.add(kanji_id)
         connection.execute(
             """
@@ -2350,6 +2938,7 @@ def upsert_term_command(args: argparse.Namespace) -> None:
                 meaning_pt=args.meaning_pt,
                 pos=args.pos,
                 notes=args.notes,
+                language_code=args.language,
             )
     except BlacklistedTermError as exc:
         raise SystemExit(str(exc)) from exc
@@ -2361,12 +2950,16 @@ def link_term(args: argparse.Namespace) -> None:
     try:
         with db_connect(args.db) as connection:
             source = connection.execute(
-                "SELECT id FROM sources WHERE id = ?",
+                "SELECT id, language_code FROM sources WHERE id = ?",
                 (args.source_id,),
             ).fetchone()
             if source is None:
                 raise SystemExit(f"Source #{args.source_id} does not exist.")
 
+            # Terms default to the language of the source they are linked to.
+            language_code = normalize_language_code(args.language)
+            if not language_code or language_code == "source":
+                language_code = normalize_language_code(source["language_code"]) or DEFAULT_LANGUAGE_CODE
             term_id = upsert_term_record(
                 connection,
                 lemma=args.lemma,
@@ -2374,6 +2967,7 @@ def link_term(args: argparse.Namespace) -> None:
                 meaning_pt=args.meaning_pt,
                 pos=args.pos,
                 notes=args.term_notes,
+                language_code=language_code,
             )
             term_form_id = ensure_term_form(
                 connection,
@@ -2401,6 +2995,7 @@ def link_term(args: argparse.Namespace) -> None:
                     segment_text=segment_text,
                     reading=args.segment_reading,
                     notes=args.segment_notes,
+                    language_code=language_code,
                 )
                 upsert_source_segment_term_link(
                     connection,
@@ -2722,26 +3317,32 @@ def list_terms(args: argparse.Namespace) -> None:
         "recent": "last_seen_at DESC, id DESC",
         "lemma": "lemma ASC, id ASC",
     }[args.order]
+    language_sql, params = language_filter_clause("language_code", args.language)
+    where_clause = f"WHERE {language_sql}" if language_sql else ""
     query = f"""
         SELECT
             id,
+            language_code,
             lemma,
             COALESCE(reading, '-') AS reading,
             COALESCE(meaning_pt, '-') AS meaning_pt,
+            pos,
             total_occurrences,
             distinct_sources,
             priority_score
         FROM v_terms_overview
+        {where_clause}
         ORDER BY {order_clause}
         LIMIT ?
     """
     with db_connect(args.db) as connection:
-        rows = connection.execute(query, (args.limit,)).fetchall()
+        rows = connection.execute(query, [*params, args.limit]).fetchall()
     rows = filter_blacklisted_term_rows(rows)
     print_rows(
         rows,
         (
             "id",
+            "language_code",
             "lemma",
             "reading",
             "meaning_pt",
@@ -2750,6 +3351,224 @@ def list_terms(args: argparse.Namespace) -> None:
             "priority_score",
         ),
     )
+
+
+def list_languages(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        rows = list_language_rows(connection)
+    print_rows(
+        rows,
+        (
+            "code",
+            "name",
+            "script",
+            "deck_name",
+            "enabled",
+            "term_count",
+            "source_count",
+            "pending_flashcards",
+        ),
+    )
+
+
+def enable_language_command(args: argparse.Namespace) -> None:
+    code = normalize_language_code(args.code)
+    if not languages.is_valid_language_code(code):
+        raise SystemExit(f"Invalid language code: {args.code!r}")
+    with db_connect(args.db) as connection:
+        profile = ensure_language_row(
+            connection,
+            code,
+            deck_name=args.deck_name,
+            name=args.name,
+            enabled=not args.disable,
+        )
+        row = connection.execute(
+            "SELECT code, name, deck_name, enabled FROM languages WHERE code = ?",
+            (profile.code,),
+        ).fetchone()
+    state = "enabled" if row["enabled"] else "disabled"
+    print(f"Language {row['code']} ({row['name']}) {state}, deck={row['deck_name']}")
+
+
+def detect_language_command(args: argparse.Namespace) -> None:
+    text = read_text_argument(args.text, args.file)
+    candidates = (
+        languages.enabled_capture_languages(args.candidates)
+        if args.candidates
+        else None
+    )
+    guess = languages.detect_language(text, candidates=candidates)
+    print(f"language={guess.code} confidence={guess.confidence:.2f} script={guess.script or '-'}")
+    if guess.scores:
+        ranked = sorted(guess.scores.items(), key=lambda item: -item[1])
+        print("scores=" + ", ".join(f"{code}:{score:.1f}" for code, score in ranked[:6]))
+    if args.runs:
+        for run in languages.split_script_runs(text):
+            run_guess = languages.detect_language(run.text, candidates=candidates)
+            print(f"  [{run_guess.code} {run_guess.confidence:.2f}] {run.text.strip()}")
+
+
+def read_text_argument(text: str | None, file_path: Path | None) -> str:
+    if file_path is not None:
+        return file_path.read_text(encoding="utf-8")
+    if text is not None:
+        return text
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise SystemExit("Provide --text, --file, or pipe text through stdin.")
+
+
+def analyze_text_command(args: argparse.Namespace) -> None:
+    text = read_text_argument(args.text, args.file)
+    candidates = (
+        languages.enabled_capture_languages(args.candidates)
+        if args.candidates
+        else None
+    )
+    try:
+        runs = languages.analyze_text(text, language=args.language, candidates=candidates)
+    except languages.AnalyzerUnavailable as exc:
+        raise SystemExit(str(exc)) from exc
+    if args.json:
+        payload = [
+            {
+                "language": run.language_code,
+                "confidence": round(run.confidence, 3),
+                "text": run.text,
+                "tokens": [
+                    {
+                        "surface": token.surface,
+                        "lemma": token.lemma,
+                        "reading": token.reading,
+                        "pos": token.pos,
+                        "sub_tokens": [
+                            {"surface": sub.surface, "lemma": sub.lemma, "reading": sub.reading}
+                            for sub in token.sub_tokens
+                        ],
+                    }
+                    for token in run.tokens
+                ],
+            }
+            for run in runs
+        ]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    for run in runs:
+        print(f"[{run.language_code} {run.confidence:.2f}] {run.text.strip()}")
+        for token in run.tokens:
+            details = [token.lemma]
+            if token.reading:
+                details.append(token.reading)
+            if token.pos:
+                details.append(token.pos)
+            print(f"  {token.surface} -> {' | '.join(details)}")
+            for sub in token.sub_tokens:
+                print(f"      {sub.surface} -> {sub.lemma}")
+
+
+def ingest_text_command(args: argparse.Namespace) -> None:
+    text = normalize_multiline_text(read_text_argument(args.text, args.file))
+    if not text:
+        raise SystemExit("Nothing to ingest: the text is empty.")
+    candidates = (
+        languages.enabled_capture_languages(args.candidates)
+        if args.candidates
+        else None
+    )
+    with db_connect(args.db) as connection:
+        language_code, confidence = resolve_language_code(
+            args.language,
+            text=text,
+            candidates=candidates,
+        )
+        source_id = create_source_record(
+            connection,
+            source_type="text",
+            language_code=language_code,
+            language_confidence=confidence,
+            ingest_mode="manual",
+            review_status="pending",
+            title=args.title,
+            game=args.game,
+            scene=args.scene,
+            raw_text=text,
+            notes=args.notes or "ingest_text",
+        )
+        try:
+            summary = analyze_source_text(
+                connection,
+                source_id=source_id,
+                text=text,
+                language=args.language if normalize_language_code(args.language) != AUTO_LANGUAGE_CODE else AUTO_LANGUAGE_CODE,
+                candidates=candidates,
+            )
+        except languages.AnalyzerUnavailable as exc:
+            raise SystemExit(str(exc)) from exc
+        promoted_terms = 0
+        promoted_candidates = 0
+        if not args.no_promote:
+            promoted_terms, promoted_candidates = approve_source_analysis_candidates(
+                connection,
+                source_id=source_id,
+                mark_reviewed=True,
+            )
+    languages_seen = ", ".join(sorted(summary["languages"])) or language_code
+    print(
+        f"Created source #{source_id} (language={language_code}, segments={summary['segments']}, "
+        f"candidates={summary['candidates']}, languages={languages_seen})"
+    )
+    if not args.no_promote:
+        print(f"Promoted {promoted_terms} terms from {promoted_candidates} candidates")
+
+
+def set_source_language_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        source = connection.execute(
+            "SELECT id, raw_text, language_code FROM sources WHERE id = ?",
+            (args.source_id,),
+        ).fetchone()
+        if source is None:
+            raise SystemExit(f"Source #{args.source_id} does not exist.")
+        language_code, confidence = resolve_language_code(
+            args.language,
+            text=source["raw_text"],
+        )
+        ensure_language_row(connection, language_code)
+        connection.execute(
+            """
+            UPDATE sources
+            SET language_code = ?, language_confidence = ?
+            WHERE id = ?
+            """,
+            (language_code, confidence, args.source_id),
+        )
+        reanalyzed = None
+        if args.reanalyze:
+            clear_source_analysis(connection, args.source_id)
+            try:
+                reanalyzed = analyze_source_text(
+                    connection,
+                    source_id=args.source_id,
+                    text=str(source["raw_text"] or ""),
+                    language=language_code,
+                )
+            except languages.AnalyzerUnavailable as exc:
+                raise SystemExit(str(exc)) from exc
+    suffix = ""
+    if reanalyzed is not None:
+        suffix = f", reanalyzed segments={reanalyzed['segments']} candidates={reanalyzed['candidates']}"
+    print(
+        f"Source #{args.source_id}: {source['language_code']} -> {language_code}"
+        f"{'' if confidence is None else f' (confidence {confidence:.2f})'}{suffix}"
+    )
+
+
+def normalize_multiline_text(value: str | None) -> str:
+    if not value:
+        return ""
+    lines = [normalize_token(line) for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return "\n".join(line for line in lines if line)
 
 
 def db_connect_read_only(db_path: Path) -> sqlite3.Connection:
@@ -3415,6 +4234,19 @@ def row_identity_tag(row: sqlite3.Row) -> tuple[str, int]:
     raise SystemExit("Missing identity column for Anki note lookup.")
 
 
+def row_language_code(row: sqlite3.Row | None) -> str:
+    if row is None:
+        return DEFAULT_LANGUAGE_CODE
+    keys = set(row.keys())
+    if "language_code" in keys:
+        return normalize_language_code(row["language_code"]) or DEFAULT_LANGUAGE_CODE
+    return DEFAULT_LANGUAGE_CODE
+
+
+def language_tag(code: str | None) -> str:
+    return f"lang_{make_tag(normalize_language_code(code) or DEFAULT_LANGUAGE_CODE) or 'xx'}"
+
+
 def build_flashcard_payload(
     term_row: sqlite3.Row,
     source_row: sqlite3.Row | None,
@@ -3423,6 +4255,8 @@ def build_flashcard_payload(
     note_type: str,
     template_name: str,
 ) -> dict[str, str | int | None]:
+    language_code = row_language_code(term_row)
+    profile = get_language(language_code)
     preferred_surface_form = (
         source_row["surface_form"]
         if source_row and source_row["surface_form"]
@@ -3430,31 +4264,36 @@ def build_flashcard_payload(
     )
     surface_form = (
         term_row["lemma"]
-        if term_blacklist_reason(preferred_surface_form) is not None
+        if term_blacklist_reason(preferred_surface_form, language_code=language_code) is not None
         else preferred_surface_form
     )
-    front_text = build_front_text(surface_form, term_row["reading"])
+    reading = normalize_token(term_row["reading"]) if profile.has_readings else ""
+    front_text = build_front_text(surface_form, reading or None)
     back_parts = []
-    reading = normalize_token(term_row["reading"])
-    reading_romaji = romanize_kana(reading)
-    kanji_text = preferred_kanji_text(surface_form, str(term_row["lemma"]))
-    display_text = normalize_token(surface_form)
-    if extract_kanji_sequence(kanji_text) and kanji_text != display_text:
-        back_parts.append(f"Kanji: {html_text(kanji_text)}")
+    reading_romaji = romanize_kana(reading) if profile.romanizer == "kana" else ""
+    if profile.has_characters:
+        kanji_text = preferred_kanji_text(surface_form, str(term_row["lemma"]))
+        display_text = normalize_token(surface_form)
+        if extract_kanji_sequence(kanji_text) and kanji_text != display_text:
+            back_parts.append(f"Kanji: {html_text(kanji_text)}")
 
     if reading:
         back_parts.append(f"Reading: {html_text(reading)}")
     if reading_romaji:
         back_parts.append(f"Romaji: {html_text(reading_romaji)}")
+    if normalize_token(surface_form) != normalize_token(str(term_row["lemma"])):
+        back_parts.append(f"Lemma: {html_text(str(term_row['lemma']))}")
     if term_row["meaning_pt"]:
         back_parts.append(f"Meaning: {html_text(term_row['meaning_pt'])}")
 
     tags = [
-        "jp",
+        language_tag(language_code),
         "auto_generated",
         f"term_{term_row['id']}",
         f"template_{template_name}",
     ]
+    if languages.base_language_code(language_code) == DEFAULT_LANGUAGE_CODE:
+        tags.insert(0, "jp")
     pos_tag = make_tag(term_row["pos"])
     if pos_tag:
         tags.append(f"pos_{pos_tag}")
@@ -3633,6 +4472,13 @@ def flashcard_candidates(args: argparse.Namespace) -> tuple[str, list[object]]:
         filters.append("t.id = ?")
         params.append(args.term_id)
 
+    language_sql, language_params = language_filter_clause(
+        "t.language_code", getattr(args, "language", None)
+    )
+    if language_sql:
+        filters.append(language_sql)
+        params.extend(language_params)
+
     if args.existing_only:
         filters.append(
             """
@@ -3666,6 +4512,7 @@ def flashcard_candidates(args: argparse.Namespace) -> tuple[str, list[object]]:
     query = f"""
         SELECT
             t.id,
+            t.language_code,
             t.lemma,
             t.reading,
             t.meaning_pt,
@@ -3707,12 +4554,18 @@ def upsert_flashcards(
     term_rows = connection.execute(query, params).fetchall()
     term_rows = filter_blacklisted_term_rows(term_rows)
 
+    deck_cache: dict[str, str] = {}
     for term_row in term_rows:
         source_row = best_source_for_term(connection, int(term_row["id"]))
+        # Without an explicit deck every language goes to its own deck.
+        deck_name = getattr(args, "deck_name", None)
+        if not deck_name:
+            code = row_language_code(term_row)
+            deck_name = deck_cache.setdefault(code, language_deck_name(connection, code))
         payload = build_flashcard_payload(
             term_row,
             source_row,
-            deck_name=args.deck_name,
+            deck_name=deck_name,
             note_type=args.note_type,
             template_name=args.template_name,
         )
@@ -3983,8 +4836,14 @@ def list_flashcards(args: argparse.Namespace) -> None:
     filters = []
     params: list[object] = []
     if args.status != "all":
-        filters.append("export_status = ?")
+        filters.append("f.export_status = ?")
         params.append(args.status)
+    language_sql, language_params = language_filter_clause(
+        "t.language_code", getattr(args, "language", None)
+    )
+    if language_sql:
+        filters.append(language_sql)
+        params.extend(language_params)
 
     where_clause = ""
     if filters:
@@ -4032,8 +4891,14 @@ def export_anki_tsv(args: argparse.Namespace) -> None:
     filters = []
     params: list[object] = []
     if args.status != "all":
-        filters.append("export_status = ?")
+        filters.append("f.export_status = ?")
         params.append(args.status)
+    language_sql, language_params = language_filter_clause(
+        "t.language_code", getattr(args, "language", None)
+    )
+    if language_sql:
+        filters.append(language_sql)
+        params.extend(language_params)
 
     where_clause = ""
     if filters:
@@ -4772,8 +5637,14 @@ def sync_anki(args: argparse.Namespace) -> None:
     filters = []
     params: list[object] = []
     if args.status != "all":
-        filters.append("export_status = ?")
+        filters.append("f.export_status = ?")
         params.append(args.status)
+    language_sql, language_params = language_filter_clause(
+        "t.language_code", getattr(args, "language", None)
+    )
+    if language_sql:
+        filters.append(language_sql)
+        params.extend(language_params)
 
     where_clause = ""
     if filters:
@@ -5510,7 +6381,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("image", "text", "manual"),
         required=True,
     )
-    source_parser.add_argument("--language-code", default="ja")
+    source_parser.add_argument(
+        "--language-code",
+        "--language",
+        dest="language_code",
+        default=DEFAULT_LANGUAGE_CODE,
+        help="Language of the source. 'auto' detects it from --raw-text.",
+    )
     source_parser.add_argument(
         "--ingest-mode",
         choices=("manual", "auto_capture", "image_import"),
@@ -5541,6 +6418,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create or update a canonical term.",
     )
     term_parser.add_argument("--lemma", required=True)
+    term_parser.add_argument(
+        "--language",
+        default=DEFAULT_LANGUAGE_CODE,
+        help="Language code of the term (ja, es, en...). 'auto' detects it from the lemma.",
+    )
     term_parser.add_argument("--reading")
     term_parser.add_argument("--meaning-pt")
     term_parser.add_argument("--pos")
@@ -5553,6 +6435,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     link_parser.add_argument("--source-id", type=int, required=True)
     link_parser.add_argument("--lemma", required=True)
+    link_parser.add_argument(
+        "--language",
+        default="source",
+        help="Language of the term. Defaults to the language of the source; 'auto' detects it.",
+    )
     link_parser.add_argument("--surface-form")
     link_parser.add_argument("--reading")
     link_parser.add_argument("--meaning-pt")
@@ -5699,7 +6586,87 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("priority", "recent", "lemma"),
         default="priority",
     )
+    list_terms_parser.add_argument(
+        "--language",
+        default=ALL_LANGUAGES_CODE,
+        help="Only show terms of one language (default: all).",
+    )
     list_terms_parser.set_defaults(func=list_terms)
+
+    list_languages_parser = subparsers.add_parser(
+        "list-languages",
+        help="Show the languages registered in the catalog with their counts.",
+    )
+    list_languages_parser.set_defaults(func=list_languages)
+
+    enable_language_parser = subparsers.add_parser(
+        "enable-language",
+        help="Register or update a language (deck name, display name, enabled flag).",
+    )
+    enable_language_parser.add_argument("--code", required=True)
+    enable_language_parser.add_argument("--name")
+    enable_language_parser.add_argument("--deck-name")
+    enable_language_parser.add_argument("--disable", action="store_true")
+    enable_language_parser.set_defaults(func=enable_language_command)
+
+    detect_language_parser = subparsers.add_parser(
+        "detect-language",
+        help="Detect the language of a text without touching the database.",
+    )
+    detect_language_parser.add_argument("--text")
+    detect_language_parser.add_argument("--file", type=Path)
+    detect_language_parser.add_argument(
+        "--candidates",
+        help="Comma-separated codes to choose from, for example ja,en,es.",
+    )
+    detect_language_parser.add_argument(
+        "--runs",
+        action="store_true",
+        help="Also show the detected language of each script run.",
+    )
+    detect_language_parser.set_defaults(func=detect_language_command)
+
+    analyze_text_parser = subparsers.add_parser(
+        "analyze-text",
+        help="Split a text into words per language without saving anything.",
+    )
+    analyze_text_parser.add_argument("--text")
+    analyze_text_parser.add_argument("--file", type=Path)
+    analyze_text_parser.add_argument("--language", default=AUTO_LANGUAGE_CODE)
+    analyze_text_parser.add_argument("--candidates")
+    analyze_text_parser.add_argument("--json", action="store_true")
+    analyze_text_parser.set_defaults(func=analyze_text_command)
+
+    ingest_text_parser = subparsers.add_parser(
+        "ingest-text",
+        help="Create a text source, split it into words per language and catalog the terms.",
+    )
+    ingest_text_parser.add_argument("--text")
+    ingest_text_parser.add_argument("--file", type=Path)
+    ingest_text_parser.add_argument("--language", default=AUTO_LANGUAGE_CODE)
+    ingest_text_parser.add_argument(
+        "--candidates",
+        help="Restrict automatic detection to these codes, for example es,en.",
+    )
+    ingest_text_parser.add_argument("--title")
+    ingest_text_parser.add_argument("--game")
+    ingest_text_parser.add_argument("--scene")
+    ingest_text_parser.add_argument("--notes")
+    ingest_text_parser.add_argument(
+        "--no-promote",
+        action="store_true",
+        help="Keep the candidates pending for review instead of creating terms.",
+    )
+    ingest_text_parser.set_defaults(func=ingest_text_command)
+
+    set_source_language_parser = subparsers.add_parser(
+        "set-source-language",
+        help="Change the language of a source, optionally re-running the analysis.",
+    )
+    set_source_language_parser.add_argument("--source-id", type=int, required=True)
+    set_source_language_parser.add_argument("--language", default=AUTO_LANGUAGE_CODE)
+    set_source_language_parser.add_argument("--reanalyze", action="store_true")
+    set_source_language_parser.set_defaults(func=set_source_language_command)
 
     jmdict_report_parser = subparsers.add_parser(
         "jmdict-meaning-report",
@@ -5759,7 +6726,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_cards_parser.add_argument(
         "--deck-name",
-        default=DEFAULT_JP_DECK_NAME,
+        default=None,
+        help="Anki deck for every card. Default: one deck per language (Lang::Japanese, Lang::Spanish...).",
     )
     generate_cards_parser.add_argument(
         "--note-type",
@@ -5768,6 +6736,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate_cards_parser.add_argument("--min-priority", type=float, default=0.0)
     generate_cards_parser.add_argument("--limit", type=int, default=100)
     generate_cards_parser.add_argument("--term-id", type=int)
+    generate_cards_parser.add_argument(
+        "--language",
+        default=ALL_LANGUAGES_CODE,
+        help="Only generate cards for one language (default: all).",
+    )
     generate_cards_parser.add_argument(
         "--existing-only",
         action="store_true",
@@ -5826,6 +6799,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("all", "pending", "exported"),
         default="all",
     )
+    list_cards_parser.add_argument("--language", default=ALL_LANGUAGES_CODE)
     list_cards_parser.set_defaults(func=list_flashcards)
 
     export_cards_parser = subparsers.add_parser(
@@ -5838,6 +6812,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ANKI_EXPORT_PATH,
         help=f"TSV export path (default: {DEFAULT_ANKI_EXPORT_PATH})",
     )
+    export_cards_parser.add_argument("--language", default=ALL_LANGUAGES_CODE)
     export_cards_parser.add_argument(
         "--status",
         choices=("all", "pending", "exported"),
@@ -5874,6 +6849,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="pending",
     )
     sync_cards_parser.add_argument("--limit", type=int)
+    sync_cards_parser.add_argument("--language", default=ALL_LANGUAGES_CODE)
     sync_cards_parser.add_argument("--front-field", default="Front")
     sync_cards_parser.add_argument("--back-field", default="Back")
     sync_cards_parser.set_defaults(func=sync_anki)
@@ -5897,6 +6873,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="pending",
     )
     sync_words_parser.add_argument("--limit", type=int)
+    sync_words_parser.add_argument("--language", default=ALL_LANGUAGES_CODE)
     sync_words_parser.add_argument("--front-field", default="Front")
     sync_words_parser.add_argument("--back-field", default="Back")
     sync_words_parser.add_argument(
@@ -5905,7 +6882,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_words_parser.add_argument(
         "--deck-name",
-        default=DEFAULT_JP_DECK_NAME,
+        default=None,
+        help="Anki deck for every card. Default: one deck per language.",
     )
     sync_words_parser.add_argument(
         "--note-type",

@@ -25,8 +25,11 @@ from lang_jp import (
     ensure_runtime_schema,
     ensure_source_image_dimensions,
     format_source_resolution,
+    language_filter_clause,
+    list_language_rows,
     resolve_repo_local_path,
 )
+from languages import ALL_LANGUAGES_CODE, get_language, normalize_language_code
 
 
 ROOT = Path(__file__).resolve().parent
@@ -302,6 +305,48 @@ PAGE_STYLE = """
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
+  }
+
+  .lang-bar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-top: 14px;
+  }
+
+  .lang-bar .lang-label {
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted, #6b6b6b);
+    margin-right: 4px;
+  }
+
+  .lang-bar a {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 32px;
+    padding: 0 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(51, 92, 103, 0.18);
+    background: rgba(255, 253, 249, 0.85);
+    color: var(--ink);
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+
+  .lang-bar a .count {
+    font-weight: 400;
+    opacity: 0.7;
+    font-size: 0.8rem;
+  }
+
+  .lang-bar a.is-active {
+    background: var(--ink, #1f2a2e);
+    color: white;
+    border-color: transparent;
   }
 
   .chip {
@@ -1647,19 +1692,76 @@ def kanji_gloss_candidates(rows: list[sqlite3.Row], *, limit: int = 6) -> list[s
     return [gloss for gloss, _ in ordered[:limit]]
 
 
-def nav_link(path: str, label: str, active_path: str) -> str:
+def current_language(params: dict[str, list[str]] | None) -> str:
+    """Language selected through ``?lang=``; ``all`` when none or invalid."""
+    raw = first_value(params or {}, "lang", ALL_LANGUAGES_CODE)
+    normalized = normalize_language_code(raw)
+    if not normalized or normalized == ALL_LANGUAGES_CODE:
+        return ALL_LANGUAGES_CODE
+    return normalized
+
+
+def language_href(path: str, lang: str, extra: dict[str, object | None] | None = None) -> str:
+    params: dict[str, object | None] = dict(extra or {})
+    params["lang"] = lang if lang != ALL_LANGUAGES_CODE else None
+    return build_query_path(path, params)
+
+
+def language_bar_html(
+    db_path: Path,
+    *,
+    active_path: str,
+    lang: str,
+    extra_params: dict[str, object | None] | None = None,
+) -> str:
+    """Chips to switch the catalog language, keeping the current page's filters."""
+    with db_connect(db_path) as connection:
+        rows = list_language_rows(connection)
+    chips = [
+        (
+            f'<a class="{"is-active" if lang == ALL_LANGUAGES_CODE else ""}" '
+            f'href="{html.escape(language_href(active_path, ALL_LANGUAGES_CODE, extra_params), quote=True)}">Todas</a>'
+        )
+    ]
+    for row in rows:
+        code = str(row["code"])
+        if not row["enabled"] and lang != code:
+            continue
+        profile = get_language(code)
+        active = "is-active" if lang == code else ""
+        chips.append(
+            f'<a class="{active}" href="{html.escape(language_href(active_path, code, extra_params), quote=True)}" '
+            f'title="{html.escape(profile.display_label)}">'
+            f"{html.escape(profile.name)}"
+            f'<span class="count">{escape(row["term_count"], "0")}</span></a>'
+        )
+    return f'<div class="lang-bar"><span class="lang-label">Idioma</span>{"".join(chips)}</div>'
+
+
+def nav_link(path: str, label: str, active_path: str, lang: str = ALL_LANGUAGES_CODE) -> str:
     active_class = "is-active" if path == active_path else ""
+    path = language_href(path, lang)
     return f'<a class="{active_class}" href="{path}">{html.escape(label)}</a>'
 
 
-def layout(*, title: str, body: str, active_path: str, extra_scripts: str = "") -> str:
+def layout(
+    *,
+    title: str,
+    body: str,
+    active_path: str,
+    extra_scripts: str = "",
+    lang: str = ALL_LANGUAGES_CODE,
+    language_bar: str = "",
+) -> str:
+    # Character pages only make sense for languages that have characters.
+    show_kanji = lang == ALL_LANGUAGES_CODE or get_language(lang).has_characters
     nav = "".join(
         (
-            nav_link("/", "Visao geral", active_path),
-            nav_link("/terms", "Termos", active_path),
-            nav_link("/kanji", "Kanji", active_path),
-            nav_link("/sources", "Fontes", active_path),
-            nav_link("/flashcards", "Cards", active_path),
+            nav_link("/", "Visao geral", active_path, lang),
+            nav_link("/terms", "Termos", active_path, lang),
+            nav_link("/kanji", "Kanji", active_path, lang) if show_kanji else "",
+            nav_link("/sources", "Fontes", active_path, lang),
+            nav_link("/flashcards", "Cards", active_path, lang),
         )
     )
     return f"""<!doctype html>
@@ -1673,9 +1775,10 @@ def layout(*, title: str, body: str, active_path: str, extra_scripts: str = "") 
   <body>
     <div class="shell">
       <section class="hero">
-        <h1>JP Catalog</h1>
-        <p>Interface local para navegar no banco de vocabulario sem depender de comandos longos no terminal.</p>
+        <h1>Lang Catalog</h1>
+        <p>Interface local para navegar no catalogo de vocabulario em todos os idiomas sem depender de comandos longos no terminal.</p>
         <nav class="nav">{nav}</nav>
+        {language_bar}
       </section>
       {body}
     </div>
@@ -1799,21 +1902,39 @@ def sync_anki_action(*, next_path: str = "/") -> str:
 
 def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) -> str:
     params = params or {}
+    lang = current_language(params)
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    lang_and = f"AND {lang_sql}" if lang_sql else ""
+    lang_where = f"WHERE {lang_sql}" if lang_sql else ""
+    term_lang_sql, _ = language_filter_clause("t.language_code", lang)
+    term_lang_and = f"AND {term_lang_sql}" if term_lang_sql else ""
     with db_connect(db_path) as connection:
         stats = connection.execute(
-            """
+            f"""
             SELECT
-                (SELECT COUNT(*) FROM sources) AS source_count,
-                (SELECT COUNT(*) FROM terms) AS term_count,
-                (SELECT COUNT(*) FROM kanji) AS kanji_count,
-                (SELECT COUNT(*) FROM source_terms) AS link_count,
-                (SELECT COUNT(*) FROM flashcards WHERE export_status = 'pending') AS pending_flashcards
-            """
+                (SELECT COUNT(*) FROM sources WHERE 1 = 1 {lang_and}) AS source_count,
+                (SELECT COUNT(*) FROM terms WHERE 1 = 1 {lang_and}) AS term_count,
+                (SELECT COUNT(*) FROM kanji WHERE 1 = 1 {lang_and}) AS kanji_count,
+                (
+                    SELECT COUNT(*)
+                    FROM source_terms AS st
+                    JOIN terms AS t ON t.id = st.term_id
+                    WHERE 1 = 1 {term_lang_and}
+                ) AS link_count,
+                (
+                    SELECT COUNT(*)
+                    FROM flashcards AS f
+                    JOIN terms AS t ON t.id = f.term_id
+                    WHERE f.export_status = 'pending' {term_lang_and}
+                ) AS pending_flashcards
+            """,
+            [*lang_params, *lang_params, *lang_params, *lang_params, *lang_params],
         ).fetchone()
         top_terms = connection.execute(
-            """
+            f"""
             SELECT
                 id,
+                language_code,
                 lemma,
                 COALESCE(reading, '-') AS reading,
                 COALESCE(meaning_pt, '-') AS meaning_pt,
@@ -1826,13 +1947,15 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 AND NOT (
                     LOWER(TRIM(COALESCE(meaning_pt, ''))) LIKE 'nome%proprio%'
                 )
+                {lang_and}
             ORDER BY
             """ + TERM_PRIORITY_ORDER_SQL + """
             LIMIT 8
-            """
+            """,
+            lang_params,
         ).fetchall()
         top_kanji = connection.execute(
-            """
+            f"""
             SELECT
                 id,
                 literal,
@@ -1841,14 +1964,17 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 distinct_terms,
                 priority_score
             FROM v_kanji_overview
+            {lang_where}
             ORDER BY priority_score DESC, id DESC
             LIMIT 8
-            """
+            """,
+            lang_params,
         ).fetchall()
         recent_sources = connection.execute(
-            """
+            f"""
             SELECT
                 id,
+                language_code,
                 COALESCE(title, '(sem titulo)') AS title,
                 COALESCE(scene, '-') AS scene,
                 source_path,
@@ -1856,13 +1982,16 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 image_height,
                 COALESCE(captured_at, created_at) AS seen_at
             FROM sources
+            {lang_where}
             ORDER BY julianday(seen_at) DESC, id DESC
             LIMIT 8
-            """
+            """,
+            lang_params,
         ).fetchall()
         recent_source_rows = [
             [
                 f'<a href="/sources/{row["id"]}">#{row["id"]}</a>',
+                escape(row["language_code"]),
                 escape(row["title"]),
                 escape(source_resolution_label(connection, row)),
                 escape(row["scene"]),
@@ -1871,10 +2000,11 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             for row in recent_sources
         ]
         recent_cards = connection.execute(
-            """
+            f"""
             SELECT
                 f.id,
                 t.lemma,
+                t.language_code,
                 COALESCE(ts.priority_score, 0) AS priority_score,
                 f.template_name,
                 f.export_status,
@@ -1884,15 +2014,19 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 ON t.id = f.term_id
             LEFT JOIN term_stats AS ts
                 ON ts.term_id = f.term_id
+            WHERE 1 = 1 {term_lang_and}
             ORDER BY
             """ + FLASHCARD_PRIORITY_ORDER_SQL + """
             LIMIT 8
-            """
+            """,
+            lang_params,
         ).fetchall()
+        language_rows = list_language_rows(connection)
 
     term_rows = [
         [
             f'<a href="/terms/{row["id"]}">{escape(row["lemma"])}</a>',
+            escape(row["language_code"]),
             escape(row["reading"]),
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
@@ -1914,12 +2048,23 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
     card_rows = [
         [
             f'<a href="/flashcards?q={quote(str(row["lemma"]))}">{escape(row["lemma"])}</a>',
+            escape(row["language_code"]),
             escape(format_score(row["priority_score"])),
             escape(row["template_name"]),
             status_chip(text(row["export_status"])),
             escape(truncate(html_fragment_text(row["front_text"]), size=44)),
         ]
         for row in recent_cards
+    ]
+    language_table_rows = [
+        [
+            f'<a href="{html.escape(language_href("/", str(row["code"])), quote=True)}">{escape(get_language(str(row["code"])).name)}</a>',
+            escape(row["term_count"], "0"),
+            escape(row["source_count"], "0"),
+            escape(row["pending_flashcards"], "0"),
+            escape(row["deck_name"]),
+        ]
+        for row in language_rows
     ]
 
     body = f"""
@@ -1948,7 +2093,12 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
 
       <section class="panel panel-wide">
         <h2>Termos prioritarios</h2>
-        {table_html(["Termo", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], term_rows)}
+        {table_html(["Termo", "Idioma", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], term_rows)}
+      </section>
+
+      <section class="panel panel-side">
+        <h2>Idiomas</h2>
+        {table_html(["Idioma", "Termos", "Fontes", "Cards pendentes", "Deck"], language_table_rows)}
       </section>
 
       <section class="panel panel-side">
@@ -1964,7 +2114,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
 
       <section class="panel panel-wide">
         <h2>Fontes recentes</h2>
-        {table_html(["ID", "Titulo", "Resolucao", "Cena", "Quando"], recent_source_rows)}
+        {table_html(["ID", "Idioma", "Titulo", "Resolucao", "Cena", "Quando"], recent_source_rows)}
       </section>
 
       <section class="panel panel-side">
@@ -1974,15 +2124,17 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
 
       <section class="panel">
         <h2>Cards recentes</h2>
-        {table_html(["Termo", "Score", "Template", "Status", "Frente"], card_rows)}
+        {table_html(["Termo", "Idioma", "Score", "Template", "Status", "Frente"], card_rows)}
       </section>
     </div>
     """
     return layout(
-        title="JP Catalog",
+        title="Lang Catalog",
         body=body,
         active_path="/",
         extra_scripts=auto_reload_script(db_path),
+        lang=lang,
+        language_bar=language_bar_html(db_path, active_path="/", lang=lang),
     )
 
 
@@ -1991,6 +2143,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
     order_clause = {
         "priority": TERM_PRIORITY_ORDER_SQL.strip(),
         "recent": "julianday(last_seen_at) DESC, id DESC",
@@ -1999,6 +2152,10 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
 
     filters = []
     sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
     if q.strip():
         filters.append(
             "(lemma LIKE ? OR COALESCE(reading, '') LIKE ? OR COALESCE(meaning_pt, '') LIKE ?)"
@@ -2024,6 +2181,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
             f"""
             SELECT
                 id,
+                language_code,
                 lemma,
                 COALESCE(reading, '-') AS reading,
                 COALESCE(meaning_pt, '-') AS meaning_pt,
@@ -2043,6 +2201,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "q": q.strip() or None,
         "order": order if order != "priority" else None,
         "limit": limit if limit != 50 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
         path="/terms",
@@ -2063,6 +2222,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
     table_rows = [
         [
             f'<a href="/terms/{row["id"]}">{escape(row["lemma"])}</a>',
+            escape(row["language_code"]),
             escape(row["reading"]),
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
@@ -2072,16 +2232,21 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         ]
         for row in rows
     ]
+    lang_input = (
+        f'<input type="hidden" name="lang" value="{html.escape(lang)}">'
+        if lang != ALL_LANGUAGES_CODE
+        else ""
+    )
     body = f"""
     <div class="grid">
       <section class="panel">
         <h2>Termos</h2>
-        {search_form(action="/terms", label="Buscar no catalogo", placeholder="Ex.: 回復, かいふく, cura", q=q, extras=extras, reset_href=reset_href)}
+        {search_form(action="/terms", label="Buscar no catalogo", placeholder="Ex.: 回復, かいふく, cura, traicionar", q=q, extras=extras + lang_input, reset_href=reset_href)}
         <div class="results-toolbar">
           <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
           {pagination_markup}
         </div>
-        {table_html(["Termo", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
+        {table_html(["Termo", "Idioma", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
       </section>
     </div>
     """
@@ -2090,6 +2255,13 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         body=body,
         active_path="/terms",
         extra_scripts=auto_reload_script(db_path),
+        lang=lang,
+        language_bar=language_bar_html(
+            db_path,
+            active_path="/terms",
+            lang=lang,
+            extra_params={key: value for key, value in base_params.items() if key != "lang"},
+        ),
     )
 
 
@@ -2098,6 +2270,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
     order_clause = {
         "priority": "priority_score DESC, id DESC",
         "recent": "julianday(last_seen_at) DESC, id DESC",
@@ -2106,6 +2279,10 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
 
     filters = []
     sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
     if q.strip():
         filters.append(
             "(literal LIKE ? OR COALESCE(meaning_pt, '') LIKE ? OR COALESCE(canonical_meanings, '') LIKE ?)"
@@ -2198,6 +2375,8 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         title="Kanji",
         body=body,
         active_path="/kanji",
+        lang=lang,
+        language_bar=language_bar_html(db_path, active_path="/kanji", lang=lang),
         extra_scripts=auto_reload_script(db_path),
     )
 
@@ -2367,6 +2546,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             """
             SELECT
                 t.id,
+                t.language_code,
                 t.lemma,
                 t.reading,
                 t.meaning_pt,
@@ -2614,7 +2794,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
     return layout(title=f"Termo {term['lemma']}", body=body, active_path="/terms")
 
 
-SOURCES_TABLE_HEADERS = ["ID", "Tipo", "Titulo", "Resolucao", "Cena", "Termos", "Quando", "Texto"]
+SOURCES_TABLE_HEADERS = ["ID", "Idioma", "Tipo", "Titulo", "Resolucao", "Cena", "Termos", "Quando", "Texto"]
 
 
 def load_sources_rows(
@@ -2623,9 +2803,14 @@ def load_sources_rows(
     q = first_value(params, "q")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
 
     filters = []
     sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("s.language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
     if q.strip():
         filters.append(
             """
@@ -2658,6 +2843,7 @@ def load_sources_rows(
             f"""
             SELECT
                 s.id,
+                s.language_code,
                 s.source_type,
                 COALESCE(s.title, '(sem titulo)') AS title,
                 COALESCE(s.scene, '-') AS scene,
@@ -2683,6 +2869,7 @@ def load_sources_rows(
             normalized_rows.append(
                 {
                     "id": row["id"],
+                    "language_code": row["language_code"],
                     "source_type": row["source_type"],
                     "title": row["title"],
                     "resolution": source_resolution_label(connection, row),
@@ -2699,6 +2886,7 @@ def sources_table_rows(rows: list[dict[str, object]]) -> list[list[str]]:
     return [
         [
             f'<a href="/sources/{row["id"]}">#{row["id"]}</a>',
+            escape(row["language_code"]),
             escape(row["source_type"]),
             escape(row["title"]),
             escape(row["resolution"]),
@@ -2722,10 +2910,12 @@ def build_sources_payload(
     limit: int,
     pagination: PaginationState,
     rows: list[dict[str, object]],
+    lang: str = ALL_LANGUAGES_CODE,
 ) -> dict[str, object]:
     base_params = {
         "q": q.strip() or None,
         "limit": limit if limit != 50 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     revision = (
         f"{database_revision_token(db_path)}:{pagination.page}:{pagination.total_count}:"
@@ -2751,6 +2941,7 @@ def sources_live_payload(db_path: Path, params: dict[str, list[str]]) -> dict[st
         limit=limit,
         pagination=pagination,
         rows=rows,
+        lang=current_language(params),
     )
 
 
@@ -2937,20 +3128,25 @@ def sources_live_script(endpoint: str) -> str:
 
 def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
     q, limit, pagination, rows = load_sources_rows(db_path, params)
+    lang = current_language(params)
 
     extras = f'<input type="number" name="limit" value="{limit}" min="1" max="200">'
+    if lang != ALL_LANGUAGES_CODE:
+        extras += f'<input type="hidden" name="lang" value="{html.escape(lang)}">'
     payload = build_sources_payload(
         db_path=db_path,
         q=q,
         limit=limit,
         pagination=pagination,
         rows=rows,
+        lang=lang,
     )
     reset_href = "/sources" if q.strip() or limit != 50 or pagination.page > 1 else None
     live_params = {
         "q": q.strip() or None,
         "limit": limit if limit != 50 else None,
         "page": pagination.page if pagination.page > 1 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     live_query = urlencode(
         [(key, str(value)) for key, value in live_params.items() if value is not None]
@@ -2974,6 +3170,13 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
         body=body,
         active_path="/sources",
         extra_scripts=sources_live_script(live_endpoint),
+        lang=lang,
+        language_bar=language_bar_html(
+            db_path,
+            active_path="/sources",
+            lang=lang,
+            extra_params={"q": q.strip() or None, "limit": limit if limit != 50 else None},
+        ),
     )
 
 
@@ -3233,9 +3436,14 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
     status = first_value(params, "status", "all")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
 
     filters = []
     sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("t.language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
     if status != "all":
         filters.append("f.export_status = ?")
         sql_params.append(status)
@@ -3277,6 +3485,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 f.id,
                 t.id AS term_id,
                 t.lemma,
+                t.language_code,
                 COALESCE(t.reading, '-') AS reading,
                 COALESCE(ts.priority_score, 0) AS priority_score,
                 f.template_name,
@@ -3301,6 +3510,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "q": q.strip() or None,
         "status": status if status != "all" else None,
         "limit": limit if limit != 50 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
         path="/flashcards",
@@ -3316,11 +3526,13 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
           <option value="exported" {"selected" if status == "exported" else ""}>Exported</option>
         </select>
         <input type="number" name="limit" value="{limit}" min="1" max="200">
+        {f'<input type="hidden" name="lang" value="{html.escape(lang)}">' if lang != ALL_LANGUAGES_CODE else ""}
       </div>
     """
     table_rows = [
         [
             f'<a href="/terms/{row["term_id"]}">{escape(row["lemma"])}</a>',
+            escape(row["language_code"]),
             escape(row["reading"]),
             escape(format_score(row["priority_score"])),
             escape(row["template_name"]),
@@ -3342,7 +3554,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
           <p class="results-summary">{results_summary_text(pagination)}</p>
           {pagination_markup}
         </div>
-        {table_html(["Termo", "Leitura", "Score", "Template", "Deck", "Status", "Fonte", "Frente"], table_rows)}
+        {table_html(["Termo", "Idioma", "Leitura", "Score", "Template", "Deck", "Status", "Fonte", "Frente"], table_rows)}
       </section>
     </div>
     """
@@ -3351,7 +3563,236 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         body=body,
         active_path="/flashcards",
         extra_scripts=auto_reload_script(db_path),
+        lang=lang,
+        language_bar=language_bar_html(
+            db_path,
+            active_path="/flashcards",
+            lang=lang,
+            extra_params={key: value for key, value in base_params.items() if key != "lang"},
+        ),
     )
+
+
+def api_language_entry(row: sqlite3.Row) -> dict[str, object]:
+    profile = get_language(str(row["code"]))
+    return {
+        "code": row["code"],
+        "name": row["name"],
+        "native_name": row["native_name"],
+        "script": row["script"],
+        "deck_name": row["deck_name"],
+        "enabled": bool(row["enabled"]),
+        "word_delimited": profile.word_delimited,
+        "has_readings": profile.has_readings,
+        "has_characters": profile.has_characters,
+        "rtl": profile.rtl,
+        "term_count": row["term_count"],
+        "source_count": row["source_count"],
+        "pending_flashcards": row["pending_flashcards"],
+    }
+
+
+def api_languages_payload(db_path: Path) -> dict[str, object]:
+    with db_connect(db_path) as connection:
+        rows = list_language_rows(connection)
+    return {"languages": [api_language_entry(row) for row in rows]}
+
+
+def api_page_meta(pagination: PaginationState, lang: str, **extra: object) -> dict[str, object]:
+    return {
+        "lang": lang,
+        "page": pagination.page,
+        "limit": pagination.limit,
+        "total": pagination.total_count,
+        "pages": pagination.total_pages,
+        **extra,
+    }
+
+
+def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    """Terms as JSON: ``?lang=``, ``?q=``, ``?order=priority|recent|lemma``, ``?limit=``, ``?page=``."""
+    q = first_value(params, "q")
+    order = first_value(params, "order", "priority")
+    limit = parse_limit(first_value(params, "limit", "50"), maximum=500)
+    page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
+    order_clause = {
+        "priority": TERM_PRIORITY_ORDER_SQL.strip(),
+        "recent": "julianday(last_seen_at) DESC, id DESC",
+        "lemma": "lemma COLLATE NOCASE ASC, id ASC",
+    }.get(order, TERM_PRIORITY_ORDER_SQL.strip())
+    filters: list[str] = []
+    sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
+    if q.strip():
+        filters.append(
+            "(lemma LIKE ? OR COALESCE(reading, '') LIKE ? OR COALESCE(meaning_pt, '') LIKE ?)"
+        )
+        like = sql_like(q)
+        sql_params.extend([like, like, like])
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"SELECT COUNT(*) FROM v_terms_overview {where_clause}",
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
+        rows = connection.execute(
+            f"""
+            SELECT
+                id, language_code, lemma, reading, meaning_pt, pos,
+                total_occurrences, distinct_sources, distinct_forms,
+                priority_score, first_seen_at, last_seen_at
+            FROM v_terms_overview
+            {where_clause}
+            ORDER BY {order_clause}
+            LIMIT ? OFFSET ?
+            """,
+            [*sql_params, pagination.limit, pagination.offset],
+        ).fetchall()
+    return {
+        "meta": api_page_meta(pagination, lang, q=q, order=order),
+        "terms": [dict(row) for row in rows],
+    }
+
+
+def api_term_detail_payload(db_path: Path, term_id: int) -> dict[str, object] | None:
+    with db_connect(db_path) as connection:
+        term = connection.execute(
+            """
+            SELECT
+                v.id, v.language_code, v.lemma, v.reading, v.meaning_pt, v.pos, t.notes,
+                v.total_occurrences, v.distinct_sources, v.distinct_forms,
+                v.priority_score, v.first_seen_at, v.last_seen_at
+            FROM v_terms_overview AS v
+            JOIN terms AS t ON t.id = v.id
+            WHERE v.id = ?
+            """,
+            (term_id,),
+        ).fetchone()
+        if term is None:
+            return None
+        forms = connection.execute(
+            "SELECT surface_form, reading FROM term_forms WHERE term_id = ? ORDER BY surface_form",
+            (term_id,),
+        ).fetchall()
+        occurrences = connection.execute(
+            """
+            SELECT
+                st.source_id, st.surface_form, st.count_in_source, st.confidence,
+                s.title, s.game, s.scene, s.language_code AS source_language_code,
+                COALESCE(s.captured_at, s.created_at) AS seen_at
+            FROM source_terms AS st
+            JOIN sources AS s ON s.id = st.source_id
+            WHERE st.term_id = ?
+            ORDER BY st.count_in_source DESC, julianday(seen_at) DESC, st.id DESC
+            LIMIT 200
+            """,
+            (term_id,),
+        ).fetchall()
+        cards = connection.execute(
+            """
+            SELECT id, template_name, deck_name, export_status, anki_note_id
+            FROM flashcards
+            WHERE term_id = ?
+            ORDER BY id
+            """,
+            (term_id,),
+        ).fetchall()
+    payload = dict(term)
+    payload["language"] = api_language_entry_from_profile(str(term["language_code"]))
+    payload["forms"] = [dict(row) for row in forms]
+    payload["occurrences"] = [dict(row) for row in occurrences]
+    payload["flashcards"] = [dict(row) for row in cards]
+    return payload
+
+
+def api_language_entry_from_profile(code: str) -> dict[str, object]:
+    profile = get_language(code)
+    return {
+        "code": profile.code,
+        "name": profile.name,
+        "native_name": profile.native_name,
+        "script": profile.script,
+        "word_delimited": profile.word_delimited,
+        "has_readings": profile.has_readings,
+        "has_characters": profile.has_characters,
+        "rtl": profile.rtl,
+    }
+
+
+def api_sources_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    q, limit, pagination, rows = load_sources_rows(db_path, params)
+    lang = current_language(params)
+    return {
+        "meta": api_page_meta(pagination, lang, q=q),
+        "sources": [
+            {
+                "id": row["id"],
+                "language_code": row["language_code"],
+                "source_type": row["source_type"],
+                "title": row["title"],
+                "scene": row["scene"],
+                "linked_terms": row["linked_terms"],
+                "seen_at": row["seen_at"],
+                "raw_text": row["raw_text"],
+                "image_url": f"/sources/{row['id']}/image",
+            }
+            for row in rows
+        ],
+    }
+
+
+def api_flashcards_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    status = first_value(params, "status", "all")
+    limit = parse_limit(first_value(params, "limit", "50"), maximum=500)
+    page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
+    filters: list[str] = []
+    sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("t.language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
+    if status != "all":
+        filters.append("f.export_status = ?")
+        sql_params.append(status)
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM flashcards AS f
+            JOIN terms AS t ON t.id = f.term_id
+            {where_clause}
+            """,
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
+        rows = connection.execute(
+            f"""
+            SELECT
+                f.id, f.term_id, t.language_code, t.lemma, t.reading, t.meaning_pt,
+                f.template_name, f.deck_name, f.note_type, f.front_text, f.back_text,
+                f.tags, f.export_status, f.anki_note_id, f.source_id,
+                COALESCE(ts.priority_score, 0) AS priority_score
+            FROM flashcards AS f
+            JOIN terms AS t ON t.id = f.term_id
+            LEFT JOIN term_stats AS ts ON ts.term_id = f.term_id
+            {where_clause}
+            ORDER BY
+            """ + FLASHCARD_PRIORITY_ORDER_SQL + """
+            LIMIT ? OFFSET ?
+            """,
+            [*sql_params, pagination.limit, pagination.offset],
+        ).fetchall()
+    return {
+        "meta": api_page_meta(pagination, lang, status=status),
+        "flashcards": [dict(row) for row in rows],
+    }
 
 
 class CatalogRequestHandler(BaseHTTPRequestHandler):
@@ -3367,6 +3808,26 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/live/revision":
             self.respond_json(live_revision_payload(self.db_path))
+            return
+        if path == "/api/languages":
+            self.respond_json(api_languages_payload(self.db_path))
+            return
+        if path == "/api/terms":
+            self.respond_json(api_terms_payload(self.db_path, params))
+            return
+        if path.startswith("/api/terms/"):
+            term_id = self.parse_int_tail(path, "/api/terms/")
+            payload = api_term_detail_payload(self.db_path, term_id) if term_id is not None else None
+            if payload is None:
+                self.respond_json({"error": "term_not_found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self.respond_json(payload)
+            return
+        if path == "/api/sources":
+            self.respond_json(api_sources_payload(self.db_path, params))
+            return
+        if path == "/api/flashcards":
+            self.respond_json(api_flashcards_payload(self.db_path, params))
             return
         if path == "/actions/sync-anki/status":
             self.respond_sync_anki_job_status(params)

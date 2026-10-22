@@ -18,24 +18,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import languages
 from lang_jp import (
     DEFAULT_DB_PATH,
+    DEFAULT_LANGUAGE_CODE,
     ROOT,
     approve_source_analysis_candidates,
-    canonical_key,
+    build_segment_candidates,
     claim_next_source_translation,
     claim_next_capture_job,
-    create_source_analysis_candidate,
     create_source_analysis_segment,
     create_source_record,
     db_connect,
     find_source_by_image_sha256,
-    form_key,
-    is_kanji_char,
     normalize_token,
+    read_existing_kanji_match,
+    read_existing_term_match,
     recover_stale_capture_jobs,
     resolve_repo_local_path,
     stable_text_hash,
+    store_segment_candidates,
     upsert_source_translation,
     update_capture_job_status,
 )
@@ -53,6 +55,10 @@ from ocr_backends import (
 )
 
 
+DEFAULT_CAPTURE_LANGUAGES = languages.enabled_capture_languages(
+    os.environ.get("LANG_CAPTURE_LANGUAGES"),
+    default=DEFAULT_LANGUAGE_CODE,
+)
 DEFAULT_CAPTURE_DIR = ROOT / "data" / "captures"
 DEFAULT_LOG_PATH = ROOT / "data" / "capture_daemon.log"
 DEFAULT_POLL_INTERVAL = 2.0
@@ -373,6 +379,40 @@ def contains_japanese_text(value: str | None) -> bool:
     return contains_japanese_chars(value)
 
 
+def contains_target_language_text(
+    value: str | None,
+    *,
+    enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+) -> bool:
+    """True when the text looks like one of the languages enabled for capture.
+
+    With the default (``ja`` only) this is the old Japanese-only check. For
+    other sets the script of the text has to match one enabled language, and for
+    Latin-script text the detector has to pick an enabled language too.
+    """
+    if not value or not normalize_token(value):
+        return False
+    enabled = {languages.base_language_code(code) for code in enabled_languages}
+    if enabled == {DEFAULT_LANGUAGE_CODE}:
+        return contains_japanese_chars(value)
+    histogram = languages.script_histogram(value)
+    if not histogram:
+        return False
+    for code in enabled:
+        profile = languages.get_language(code)
+        if profile.script == languages.SCRIPT_JAPANESE and (
+            histogram.get(languages.SCRIPT_JAPANESE) or histogram.get(languages.SCRIPT_HAN)
+        ):
+            return True
+        if profile.script == languages.SCRIPT_LATIN and histogram.get(languages.SCRIPT_LATIN):
+            guess = languages.detect_language(value, candidates=enabled_languages)
+            if languages.base_language_code(guess.code) in enabled:
+                return True
+        elif histogram.get(profile.script):
+            return True
+    return False
+
+
 def bbox_json(value: Any) -> str | None:
     if value in (None, ""):
         return None
@@ -617,7 +657,7 @@ def filter_easyocr_blocks(blocks: list[OcrBlock]) -> tuple[list[OcrBlock], dict[
         if block.confidence is not None and block.confidence < DEFAULT_OCR_MIN_CONFIDENCE:
             stats["low_confidence"] += 1
             continue
-        if not contains_japanese_text(text):
+        if not contains_target_language_text(text):
             stats["non_japanese"] += 1
             continue
         if block.bbox is None:
@@ -712,44 +752,6 @@ def score_region(
         - top_penalty
         - edge_penalty
     )
-
-
-def read_existing_term_match(
-    connection,
-    *,
-    lemma: str,
-    reading: str | None,
-    surface_form: str,
-) -> int | None:
-    term_row = connection.execute(
-        "SELECT id FROM terms WHERE canonical_key = ?",
-        (canonical_key(lemma, reading),),
-    ).fetchone()
-    if term_row is not None:
-        return int(term_row["id"])
-    form_row = connection.execute(
-        """
-        SELECT term_id
-        FROM term_forms
-        WHERE form_key = ?
-        ORDER BY term_id ASC
-        LIMIT 1
-        """,
-        (form_key(surface_form, reading),),
-    ).fetchone()
-    if form_row is not None:
-        return int(form_row["term_id"])
-    return None
-
-
-def read_existing_kanji_match(connection, literal: str) -> int | None:
-    row = connection.execute(
-        "SELECT id FROM kanji WHERE literal = ?",
-        (literal,),
-    ).fetchone()
-    if row is None:
-        return None
-    return int(row["id"])
 
 
 class EasyOcrAdapter:
@@ -962,112 +964,120 @@ def build_capture_ocr_adapter(name: str | None = None) -> CaptureOcrAdapter:
     return MeikiOcrAdapter()
 
 
-class SudachiAnalyzer:
-    def __init__(self) -> None:
-        try:
-            from sudachipy import Dictionary, SplitMode
-        except ImportError as exc:
-            raise SystemExit(
-                "Missing Japanese NLP dependency. Install SudachiPy + sudachidict_core "
-                "before running capture_worker.py."
-            ) from exc
+class LanguageSegmentAnalyzer:
+    """Turn OCR blocks into draft segments and candidates, one language at a time.
 
-        self._split_mode = SplitMode
-        self._tokenizer = Dictionary().create()
+    Each block is split into script runs, every run is detected against the
+    languages enabled for capture, and the matching analyzer (Sudachi for
+    Japanese, the generic tokenizer for word-delimited languages, ...) produces
+    the candidates. Blocks therefore can yield more than one segment when they
+    mix languages.
+    """
+
+    def __init__(self, enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES) -> None:
+        self.enabled_languages = tuple(enabled_languages) or (DEFAULT_LANGUAGE_CODE,)
+        # Fail early when an enabled language needs a dependency that is missing.
+        for code in self.enabled_languages:
+            try:
+                languages.get_analyzer(code)
+            except languages.AnalyzerUnavailable as exc:
+                raise SystemExit(str(exc)) from exc
+        append_worker_log(
+            build_log_event(
+                "worker",
+                step="analyzer_init",
+                languages=",".join(self.enabled_languages),
+            )
+        )
+
+    def analyze_block(
+        self,
+        connection,
+        block: OcrBlock,
+    ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+        normalized_text = normalize_token(block.text)
+        if not normalized_text:
+            return []
+        runs = languages.analyze_text(
+            normalized_text,
+            language=languages.AUTO_LANGUAGE_CODE,
+            candidates=self.enabled_languages,
+        )
+        if not runs:
+            # Nothing matched an enabled language; keep the raw segment so the
+            # reviewer still sees the text, tagged with the default language.
+            payload, candidates = build_segment_candidates(
+                connection,
+                text=normalized_text,
+                language_code=self.enabled_languages[0],
+                tokens=[],
+                confidence=block.confidence,
+                bbox_json=bbox_json(block.bbox),
+            )
+            return [(payload, candidates)]
+        results: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+        for run in runs:
+            run_text = normalize_token(run.text)
+            if not run_text:
+                continue
+            payload, candidates = build_segment_candidates(
+                connection,
+                text=run_text,
+                language_code=run.language_code,
+                tokens=run.tokens,
+                confidence=block.confidence,
+                bbox_json=bbox_json(block.bbox),
+            )
+            results.append((payload, candidates))
+        return results
 
     def analyze_segment(self, connection, block: OcrBlock) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        normalized_text = normalize_token(block.text)
-        segment_payload = {
-            "raw_text": block.text,
-            "normalized_text": normalized_text,
-            "reading": None,
-            "confidence": block.confidence,
-            "bbox_json": bbox_json(block.bbox),
-        }
-        candidates: list[dict[str, Any]] = []
-        if not normalized_text:
-            return segment_payload, candidates
-
-        main_tokens = self._tokenizer.tokenize(normalized_text, self._split_mode.C)
-        for rank, token in enumerate(main_tokens):
-            surface = normalize_token(token.surface())
-            lemma = normalize_token(token.dictionary_form()) or surface
-            reading = normalize_token(token.reading_form()) or None
-            pos = normalize_token(" ".join(token.part_of_speech()[:2])) or None
-            if not surface:
-                continue
-            candidates.append(
+        """Single-segment view of :meth:`analyze_block` (first language run)."""
+        results = self.analyze_block(connection, block)
+        if not results:
+            return (
                 {
-                    "key": f"main:{rank}",
-                    "parent_key": None,
-                    "candidate_type": "term",
-                    "surface_form": surface,
-                    "dictionary_form": lemma,
-                    "reading": reading,
-                    "pos": pos,
+                    "raw_text": block.text,
+                    "normalized_text": normalize_token(block.text),
+                    "language_code": self.enabled_languages[0],
+                    "reading": None,
                     "confidence": block.confidence,
-                    "rank": rank,
-                    "matched_term_id": read_existing_term_match(
-                        connection,
-                        lemma=lemma,
-                        reading=reading,
-                        surface_form=surface,
-                    ),
-                    "matched_kanji_id": None,
-                }
+                    "bbox_json": bbox_json(block.bbox),
+                },
+                [],
             )
-            sub_tokens = token.split(self._split_mode.A)
-            for sub_index, sub_token in enumerate(sub_tokens):
-                sub_surface = normalize_token(sub_token.surface())
-                sub_lemma = normalize_token(sub_token.dictionary_form()) or sub_surface
-                sub_reading = normalize_token(sub_token.reading_form()) or None
-                sub_pos = normalize_token(" ".join(sub_token.part_of_speech()[:2])) or None
-                if not sub_surface or sub_surface == surface:
-                    continue
-                candidates.append(
-                    {
-                        "key": f"sub:{rank}:{sub_index}",
-                        "parent_key": f"main:{rank}",
-                        "candidate_type": "subterm",
-                        "surface_form": sub_surface,
-                        "dictionary_form": sub_lemma,
-                        "reading": sub_reading,
-                        "pos": sub_pos,
-                        "confidence": block.confidence,
-                        "rank": (rank * 100) + sub_index + 1,
-                        "matched_term_id": read_existing_term_match(
-                            connection,
-                            lemma=sub_lemma,
-                            reading=sub_reading,
-                            surface_form=sub_surface,
-                        ),
-                        "matched_kanji_id": None,
-                    }
-                )
-            for literal in sorted({char for char in f"{surface}{lemma}" if is_kanji_char(char)}):
-                candidates.append(
-                    {
-                        "key": f"kanji:{rank}:{literal}",
-                        "parent_key": f"main:{rank}",
-                        "candidate_type": "kanji",
-                        "surface_form": literal,
-                        "dictionary_form": literal,
-                        "reading": None,
-                        "pos": "kanji",
-                        "confidence": block.confidence,
-                        "rank": (rank * 1000) + ord(literal),
-                        "matched_term_id": None,
-                        "matched_kanji_id": read_existing_kanji_match(connection, literal),
-                    }
-                )
-        return segment_payload, candidates
+        return results[0]
+
+
+# Backwards-compatible name: the worker used to be Japanese-only.
+SudachiAnalyzer = LanguageSegmentAnalyzer
+
+
+def dominant_block_language(
+    analyzed_blocks: list[list[tuple[dict[str, Any], list[dict[str, Any]]]]],
+    *,
+    default: str = DEFAULT_LANGUAGE_CODE,
+) -> tuple[str, float | None]:
+    """Pick the language covering most letters across all analyzed segments."""
+    weights: dict[str, int] = {}
+    total = 0
+    for block_results in analyzed_blocks:
+        for payload, _ in block_results:
+            code = str(payload.get("language_code") or default)
+            letters = sum(languages.script_histogram(str(payload.get("raw_text") or "")).values())
+            weights[code] = weights.get(code, 0) + letters
+            total += letters
+    if not weights or total == 0:
+        return default, None
+    code, letters = max(weights.items(), key=lambda item: (item[1], item[0] == default, item[0]))
+    return code, round(letters / total, 3)
 
 
 def process_job_once(
     db_path: Path,
     *,
     ocr: CaptureOcrAdapter,
-    analyzer: SudachiAnalyzer,
+    analyzer: LanguageSegmentAnalyzer,
     translator: GoogleGtxSourceTranslator | None,
 ) -> bool:
     connection = db_connect(db_path)
@@ -1150,14 +1160,21 @@ def process_job_once(
             kept=len(normalized_blocks),
             text_len=len(raw_text),
         )
-        if not any(contains_japanese_text(block.text) for block in normalized_blocks):
+        enabled_languages = getattr(analyzer, "enabled_languages", DEFAULT_CAPTURE_LANGUAGES)
+        if not any(
+            contains_target_language_text(block.text, enabled_languages=enabled_languages)
+            for block in normalized_blocks
+        ):
             connection = db_connect(db_path)
             try:
                 update_capture_job_status(
                     connection,
                     job_id=job_id,
                     status="rejected",
-                    last_error="No Japanese text detected in OCR output.",
+                    last_error=(
+                        "No text in the enabled capture languages "
+                        f"({', '.join(enabled_languages)}) detected in OCR output."
+                    ),
                     raw_text=raw_text,
                     ocr_text_hash=ocr_text_hash,
                 )
@@ -1169,7 +1186,7 @@ def process_job_once(
                 "done",
                 include_memory=True,
                 status="rejected",
-                reason="no_japanese_text",
+                reason="no_target_language_text",
                 blocks=len(normalized_blocks),
                 text_len=len(raw_text),
             )
@@ -1186,10 +1203,18 @@ def process_job_once(
 
         connection = db_connect(db_path)
         try:
+            analyzed_blocks = [
+                analyzer.analyze_block(connection, block) for block in normalized_blocks
+            ]
+            source_language, source_language_confidence = dominant_block_language(
+                analyzed_blocks,
+                default=enabled_languages[0],
+            )
             source_id = create_source_record(
                 connection,
                 source_type="image",
-                language_code="ja",
+                language_code=source_language,
+                language_confidence=source_language_confidence,
                 ingest_mode="auto_capture",
                 review_status="pending",
                 source_path=str(final_path),
@@ -1208,46 +1233,33 @@ def process_job_once(
             )
             segment_count = 0
             candidate_count = 0
-            for segment_index, block in enumerate(normalized_blocks):
-                segment_payload, candidates = analyzer.analyze_segment(connection, block)
-                segment_id = create_source_analysis_segment(
-                    connection,
-                    source_id=source_id,
-                    segment_index=segment_index,
-                    raw_text=segment_payload["raw_text"],
-                    normalized_text=segment_payload["normalized_text"],
-                    reading=segment_payload["reading"],
-                    confidence=segment_payload["confidence"],
-                    bbox_json=segment_payload["bbox_json"],
-                )
-                segment_count += 1
-                inserted_ids: dict[str, int] = {}
-                for candidate in candidates:
-                    parent_id = (
-                        inserted_ids.get(candidate["parent_key"])
-                        if candidate["parent_key"] is not None
-                        else None
-                    )
-                    candidate_id = create_source_analysis_candidate(
+            segment_languages: set[str] = set()
+            for block_results in analyzed_blocks:
+                for segment_payload, candidates in block_results:
+                    segment_id = create_source_analysis_segment(
                         connection,
-                        source_analysis_segment_id=segment_id,
-                        candidate_type=candidate["candidate_type"],
-                        surface_form=candidate["surface_form"],
-                        dictionary_form=candidate["dictionary_form"],
-                        reading=candidate["reading"],
-                        pos=candidate["pos"],
-                        confidence=candidate["confidence"],
-                        rank=candidate["rank"],
-                        parent_candidate_id=parent_id,
-                        matched_term_id=candidate["matched_term_id"],
-                        matched_kanji_id=candidate["matched_kanji_id"],
+                        source_id=source_id,
+                        segment_index=segment_count,
+                        raw_text=segment_payload["raw_text"],
+                        normalized_text=segment_payload["normalized_text"],
+                        reading=segment_payload["reading"],
+                        confidence=segment_payload["confidence"],
+                        bbox_json=segment_payload["bbox_json"],
+                        language_code=segment_payload["language_code"],
                     )
-                    inserted_ids[candidate["key"]] = candidate_id
-                    candidate_count += 1
+                    segment_count += 1
+                    segment_languages.add(str(segment_payload["language_code"]))
+                    candidate_count += store_segment_candidates(
+                        connection,
+                        segment_id=segment_id,
+                        candidates=candidates,
+                    )
             probe.mark(
                 "analyze",
                 segments=segment_count,
                 candidates=candidate_count,
+                language=source_language,
+                languages=",".join(sorted(segment_languages)) or source_language,
             )
             promoted_terms = 0
             promoted_candidates = 0
@@ -1394,7 +1406,11 @@ def process_pending_translation_once(
         )
     )
     try:
-        translated_text = translator.translate_lines(lines, source_language="ja")
+        source_language = (
+            languages.base_language_code(job.get("source_language_code"))
+            or DEFAULT_LANGUAGE_CODE
+        )
+        translated_text = translator.translate_lines(lines, source_language=source_language)
         connection = db_connect(db_path)
         try:
             upsert_source_translation(
@@ -1493,7 +1509,7 @@ def diagnose_image(
             delete_if_exists(cleanup_path)
     normalized_blocks = [block for block in blocks if normalize_token(block.text)]
     raw_text = "\n".join(block.text for block in normalized_blocks)
-    japanese_detected = any(contains_japanese_text(block.text) for block in normalized_blocks)
+    japanese_detected = any(contains_target_language_text(block.text) for block in normalized_blocks)
     probe.mark(
         "after_ocr_predict",
         note=(
@@ -1504,13 +1520,13 @@ def diagnose_image(
 
     if with_analysis:
         probe.mark("before_analyzer_init")
-        analyzer = SudachiAnalyzer()
+        analyzer = LanguageSegmentAnalyzer()
         probe.mark("after_analyzer_init")
         candidate_total = 0
         with db_connect(DEFAULT_DB_PATH) as connection:
             for block in normalized_blocks:
-                _, candidates = analyzer.analyze_segment(connection, block)
-                candidate_total += len(candidates)
+                for _, candidates in analyzer.analyze_block(connection, block):
+                    candidate_total += len(candidates)
         probe.mark(
             "after_analysis",
             note=f"segments={len(normalized_blocks)} candidates={candidate_total}",
@@ -1576,7 +1592,7 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose_parser.add_argument(
         "--with-analysis",
         action="store_true",
-        help="Also initialize Sudachi and run analysis on OCR blocks.",
+        help="Also initialize the language analyzers and run analysis on OCR blocks.",
     )
     diagnose_parser.add_argument(
         "--output-json",
@@ -1608,7 +1624,7 @@ def main() -> None:
         )
 
     ocr = build_capture_ocr_adapter()
-    analyzer = SudachiAnalyzer()
+    analyzer = LanguageSegmentAnalyzer()
     translator = (
         GoogleGtxSourceTranslator(target_language=DEFAULT_SOURCE_TRANSLATION_TARGET)
         if DEFAULT_ENABLE_SOURCE_TRANSLATION

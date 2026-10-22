@@ -1,10 +1,11 @@
 # JP catalog
 
-Minimal local foundation for cataloging Japanese vocabulary from game screenshots.
+Local foundation for cataloging vocabulary from game screenshots and text, in any language. The folder keeps its historical `JP` name; the catalog itself is polyglot (see "Multiple languages" below and `../polyglot-plan.md`).
 
 ## Files
 - `schema.sql`: SQLite schema.
 - `lang_jp.py`: CLI for sources, terms, and recurrence.
+- `languages.py`: language registry, offline language detection, mixed-text splitting and per-language analyzers (Sudachi for Japanese, a generic tokenizer for word-delimited languages, jieba/pythainlp when installed).
 - `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs.
 - `requirements-capture.txt`: Python worker dependencies for the dedicated 3.12 environment.
 - `requirements-main.txt`: small helper dependencies for the main catalog environment.
@@ -49,6 +50,46 @@ python .\lang_jp.py sync-anki-kanji
 python .\lang_jp.py export-anki-tsv --include-header
 python .\lang_jp.py rebuild-stats
 ```
+
+## Multiple languages
+Every source, segment, term, character and flashcard carries a `language_code`. Terms are keyed per language (`es::no::` and `en::no::` are different terms), each language gets its own Anki deck (`Lang::Japanese`, `Lang::Spanish`, ...), and the web UI and JSON API filter by language.
+
+```powershell
+# What languages are in the catalog
+python .\lang_jp.py list-languages
+
+# Detect and split text without saving anything
+python .\lang_jp.py detect-language --text "¡No puede ser! ¿Nos ha traicionado?" --runs
+python .\lang_jp.py analyze-text --text "안녕하세요 Press START" --candidates ko,en
+
+# Create a text source, split it into words per language and catalog the terms
+python .\lang_jp.py ingest-text --language auto --candidates es,en --title "Spanish RPG" --text "¡No puede ser! ¿Nos ha traicionado?"
+
+# Everything else accepts --language (auto, a code, or all for listings)
+python .\lang_jp.py add-source --source-type text --language-code auto --raw-text "Eu não sei o que fazer"
+python .\lang_jp.py link-term --source-id 12 --lemma traicionar --meaning-pt "trair" --language es
+python .\lang_jp.py list-terms --language es
+python .\lang_jp.py generate-flashcards --language es
+python .\lang_jp.py sync-anki --language es
+python .\lang_jp.py set-source-language --source-id 12 --language pt --reanalyze
+python .\lang_jp.py enable-language --code de --deck-name "Lang::Deutsch"
+```
+
+Detection is offline: script ranges decide CJK, Hangul, Cyrillic, Arabic, Hebrew, Greek, Thai and Devanagari; stop words and diacritics tell Latin-script languages apart. Mixed lines are split into script runs, so a Korean line with an English button label produces one Korean and one English segment. Pass `--candidates` to restrict detection to the languages you actually study.
+
+Japanese keeps JMdict meanings, Sudachi analysis, kanji and romaji. Other languages get lemmas from `simplemma` when it is installed (`pip install simplemma`), otherwise the lower-cased surface, and meanings from machine translation of the lemma. Chinese uses `jieba` when installed and falls back to character runs.
+
+Passive capture reads `LANG_CAPTURE_LANGUAGES` (default `ja`). To capture a Spanish game: `LANG_CAPTURE_LANGUAGES=es,en`, `LANG_JP_OCR_BACKEND=easyocr`, `LANG_JP_EASYOCR_LANGS=es,en`. Blocks in other languages are dropped, every segment is tagged, and the source language is the one covering most of the text. `meikiocr` is Japanese-only; EasyOCR can pair `ja` only with `en`.
+
+The web UI has a language bar on every page (`?lang=es`, `lang=all`), and other front ends can read:
+
+- `GET /api/languages`
+- `GET /api/terms?lang=es&q=&order=priority|recent|lemma&limit=&page=`
+- `GET /api/terms/{id}`
+- `GET /api/sources?lang=es&q=&limit=&page=`
+- `GET /api/flashcards?lang=es&status=pending&limit=&page=`
+
+Databases created before this change are upgraded in place on the next command: existing rows become `ja` and canonical keys gain the `ja::` prefix once.
 
 For a shorter Windows entry point, run `..\open_jp_catalog.cmd` from the repository root.
 For the passive-capture tray, run `..\open_jp_capture_tray.cmd` from the repository root. The launcher reuses an existing compiled daemon when available and otherwise builds `desktop_capture_daemon.exe` once before starting it.
