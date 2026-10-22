@@ -1063,6 +1063,71 @@ class SudachiAnalyzer:
         return segment_payload, candidates
 
 
+def blocks_with_text(blocks: list[OcrBlock]) -> tuple[list[OcrBlock], str]:
+    """Drop empty OCR blocks and join the rest into the source raw_text."""
+    normalized_blocks = [block for block in blocks if normalize_token(block.text)]
+    return normalized_blocks, "\n".join(block.text for block in normalized_blocks)
+
+
+def store_source_analysis(
+    connection,
+    *,
+    source_id: int,
+    blocks: list[OcrBlock],
+    analyzer: SudachiAnalyzer,
+) -> tuple[int, int]:
+    segment_count = 0
+    candidate_count = 0
+    for segment_index, block in enumerate(blocks):
+        segment_payload, candidates = analyzer.analyze_segment(connection, block)
+        segment_id = create_source_analysis_segment(
+            connection,
+            source_id=source_id,
+            segment_index=segment_index,
+            raw_text=segment_payload["raw_text"],
+            normalized_text=segment_payload["normalized_text"],
+            reading=segment_payload["reading"],
+            confidence=segment_payload["confidence"],
+            bbox_json=segment_payload["bbox_json"],
+        )
+        segment_count += 1
+        inserted_ids: dict[str, int] = {}
+        for candidate in candidates:
+            parent_id = (
+                inserted_ids.get(candidate["parent_key"])
+                if candidate["parent_key"] is not None
+                else None
+            )
+            candidate_id = create_source_analysis_candidate(
+                connection,
+                source_analysis_segment_id=segment_id,
+                candidate_type=candidate["candidate_type"],
+                surface_form=candidate["surface_form"],
+                dictionary_form=candidate["dictionary_form"],
+                reading=candidate["reading"],
+                pos=candidate["pos"],
+                confidence=candidate["confidence"],
+                rank=candidate["rank"],
+                parent_candidate_id=parent_id,
+                matched_term_id=candidate["matched_term_id"],
+                matched_kanji_id=candidate["matched_kanji_id"],
+            )
+            inserted_ids[candidate["key"]] = candidate_id
+            candidate_count += 1
+    return segment_count, candidate_count
+
+
+def auto_promote_source_terms(connection, source_id: int) -> tuple[int, int]:
+    """Promote a new source's candidates without marking it reviewed (LANG_JP_AUTO_PROMOTE_SOURCE_TERMS)."""
+    if not DEFAULT_AUTO_PROMOTE_SOURCE_TERMS:
+        return 0, 0
+    return approve_source_analysis_candidates(
+        connection,
+        source_id=source_id,
+        mark_reviewed=False,
+    )
+
+
 def process_job_once(
     db_path: Path,
     *,
@@ -1140,8 +1205,7 @@ def process_job_once(
             temp_image_path,
             progress_label=job_log_prefix(job_id, "ocr"),
         )
-        normalized_blocks = [block for block in blocks if normalize_token(block.text)]
-        raw_text = "\n".join(block.text for block in normalized_blocks)
+        normalized_blocks, raw_text = blocks_with_text(blocks)
         ocr_text_hash = stable_text_hash(raw_text)
         probe.mark(
             "ocr_result",
@@ -1206,57 +1270,21 @@ def process_job_once(
                 text_len=len(raw_text),
                 blocks=len(normalized_blocks),
             )
-            segment_count = 0
-            candidate_count = 0
-            for segment_index, block in enumerate(normalized_blocks):
-                segment_payload, candidates = analyzer.analyze_segment(connection, block)
-                segment_id = create_source_analysis_segment(
-                    connection,
-                    source_id=source_id,
-                    segment_index=segment_index,
-                    raw_text=segment_payload["raw_text"],
-                    normalized_text=segment_payload["normalized_text"],
-                    reading=segment_payload["reading"],
-                    confidence=segment_payload["confidence"],
-                    bbox_json=segment_payload["bbox_json"],
-                )
-                segment_count += 1
-                inserted_ids: dict[str, int] = {}
-                for candidate in candidates:
-                    parent_id = (
-                        inserted_ids.get(candidate["parent_key"])
-                        if candidate["parent_key"] is not None
-                        else None
-                    )
-                    candidate_id = create_source_analysis_candidate(
-                        connection,
-                        source_analysis_segment_id=segment_id,
-                        candidate_type=candidate["candidate_type"],
-                        surface_form=candidate["surface_form"],
-                        dictionary_form=candidate["dictionary_form"],
-                        reading=candidate["reading"],
-                        pos=candidate["pos"],
-                        confidence=candidate["confidence"],
-                        rank=candidate["rank"],
-                        parent_candidate_id=parent_id,
-                        matched_term_id=candidate["matched_term_id"],
-                        matched_kanji_id=candidate["matched_kanji_id"],
-                    )
-                    inserted_ids[candidate["key"]] = candidate_id
-                    candidate_count += 1
+            segment_count, candidate_count = store_source_analysis(
+                connection,
+                source_id=source_id,
+                blocks=normalized_blocks,
+                analyzer=analyzer,
+            )
             probe.mark(
                 "analyze",
                 segments=segment_count,
                 candidates=candidate_count,
             )
-            promoted_terms = 0
-            promoted_candidates = 0
-            if DEFAULT_AUTO_PROMOTE_SOURCE_TERMS:
-                promoted_terms, promoted_candidates = approve_source_analysis_candidates(
-                    connection,
-                    source_id=source_id,
-                    mark_reviewed=False,
-                )
+            promoted_terms, promoted_candidates = auto_promote_source_terms(
+                connection,
+                source_id,
+            )
             probe.mark(
                 "promote",
                 terms=promoted_terms,
@@ -1491,8 +1519,7 @@ def diagnose_image(
     finally:
         if cleanup_path is not None:
             delete_if_exists(cleanup_path)
-    normalized_blocks = [block for block in blocks if normalize_token(block.text)]
-    raw_text = "\n".join(block.text for block in normalized_blocks)
+    normalized_blocks, raw_text = blocks_with_text(blocks)
     japanese_detected = any(contains_japanese_text(block.text) for block in normalized_blocks)
     probe.mark(
         "after_ocr_predict",
