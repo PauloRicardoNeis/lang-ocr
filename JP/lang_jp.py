@@ -3991,44 +3991,90 @@ def ingest_text_command(args: argparse.Namespace) -> None:
         print(f"Promoted {promoted_terms} terms from {promoted_candidates} candidates")
 
 
+def change_source_language(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    language: str | None,
+    reanalyze: bool = False,
+    promote: bool = False,
+) -> dict[str, object]:
+    """Set a source's language (``auto`` detects it) and optionally redo its analysis.
+
+    Re-analysis drops the draft segments and candidates and rebuilds them in
+    the new language (detection restricted to it, mixed scripts still split).
+    With ``promote`` the new candidates become terms right away, as the capture
+    worker does. Shared by the CLI and the web UI (plan item D4).
+    """
+    source = connection.execute(
+        "SELECT id, raw_text, language_code FROM sources WHERE id = ?",
+        (source_id,),
+    ).fetchone()
+    if source is None:
+        raise SystemExit(f"Source #{source_id} does not exist.")
+    previous_language = str(source["language_code"])
+    language_code, confidence = resolve_language_code(
+        language,
+        text=source["raw_text"],
+    )
+    ensure_language_row(connection, language_code)
+    connection.execute(
+        """
+        UPDATE sources
+        SET language_code = ?, language_confidence = ?
+        WHERE id = ?
+        """,
+        (language_code, confidence, source_id),
+    )
+    reanalyzed: dict[str, object] | None = None
+    promoted_terms = 0
+    promoted_candidates = 0
+    if reanalyze:
+        clear_source_analysis(connection, source_id)
+        try:
+            reanalyzed = analyze_source_text(
+                connection,
+                source_id=source_id,
+                text=str(source["raw_text"] or ""),
+                language=language_code,
+            )
+        except languages.AnalyzerUnavailable as exc:
+            raise SystemExit(str(exc)) from exc
+        if promote:
+            promoted_terms, promoted_candidates = approve_source_analysis_candidates(
+                connection,
+                source_id=source_id,
+                mark_reviewed=False,
+            )
+    return {
+        "source_id": source_id,
+        "previous_language": previous_language,
+        "language_code": language_code,
+        "confidence": confidence,
+        "reanalyzed": reanalyzed,
+        "promoted_terms": promoted_terms,
+        "promoted_candidates": promoted_candidates,
+    }
+
+
 def set_source_language_command(args: argparse.Namespace) -> None:
     with db_connect(args.db) as connection:
-        source = connection.execute(
-            "SELECT id, raw_text, language_code FROM sources WHERE id = ?",
-            (args.source_id,),
-        ).fetchone()
-        if source is None:
-            raise SystemExit(f"Source #{args.source_id} does not exist.")
-        language_code, confidence = resolve_language_code(
-            args.language,
-            text=source["raw_text"],
+        result = change_source_language(
+            connection,
+            source_id=args.source_id,
+            language=args.language,
+            reanalyze=args.reanalyze,
+            promote=getattr(args, "promote", False),
         )
-        ensure_language_row(connection, language_code)
-        connection.execute(
-            """
-            UPDATE sources
-            SET language_code = ?, language_confidence = ?
-            WHERE id = ?
-            """,
-            (language_code, confidence, args.source_id),
-        )
-        reanalyzed = None
-        if args.reanalyze:
-            clear_source_analysis(connection, args.source_id)
-            try:
-                reanalyzed = analyze_source_text(
-                    connection,
-                    source_id=args.source_id,
-                    text=str(source["raw_text"] or ""),
-                    language=language_code,
-                )
-            except languages.AnalyzerUnavailable as exc:
-                raise SystemExit(str(exc)) from exc
+    reanalyzed = result["reanalyzed"]
+    confidence = result["confidence"]
     suffix = ""
     if reanalyzed is not None:
         suffix = f", reanalyzed segments={reanalyzed['segments']} candidates={reanalyzed['candidates']}"
+        if getattr(args, "promote", False):
+            suffix += f", promoted terms={result['promoted_terms']}"
     print(
-        f"Source #{args.source_id}: {source['language_code']} -> {language_code}"
+        f"Source #{args.source_id}: {result['previous_language']} -> {result['language_code']}"
         f"{'' if confidence is None else f' (confidence {confidence:.2f})'}{suffix}"
     )
 
@@ -7215,6 +7261,11 @@ def build_parser() -> argparse.ArgumentParser:
     set_source_language_parser.add_argument("--source-id", type=int, required=True)
     set_source_language_parser.add_argument("--language", default=AUTO_LANGUAGE_CODE)
     set_source_language_parser.add_argument("--reanalyze", action="store_true")
+    set_source_language_parser.add_argument(
+        "--promote",
+        action="store_true",
+        help="After --reanalyze, turn the new candidates into terms right away.",
+    )
     set_source_language_parser.set_defaults(func=set_source_language_command)
 
     jmdict_report_parser = subparsers.add_parser(

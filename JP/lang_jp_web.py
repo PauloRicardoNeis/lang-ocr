@@ -21,6 +21,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from uuid import uuid4
 
+import lang_jp
+import languages
 from lang_jp import (
     ensure_runtime_schema,
     ensure_source_image_dimensions,
@@ -29,7 +31,13 @@ from lang_jp import (
     list_language_rows,
     resolve_repo_local_path,
 )
-from languages import ALL_LANGUAGES_CODE, get_language, normalize_language_code
+from languages import (
+    ALL_LANGUAGES_CODE,
+    AUTO_LANGUAGE_CODE,
+    get_language,
+    normalize_language_code,
+)
+from ocr_backends import plan_ocr_engines
 
 
 ROOT = Path(__file__).resolve().parent
@@ -347,6 +355,38 @@ PAGE_STYLE = """
     background: var(--ink, #1f2a2e);
     color: white;
     border-color: transparent;
+  }
+
+  .lang-bar a.lang-settings {
+    margin-left: auto;
+    border-style: dashed;
+    font-weight: 500;
+  }
+
+  .stats-compact { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 12px; }
+  .stats-compact .stat { padding: 10px 12px; }
+  .stats-compact .stat .value { font-size: 1.3rem; }
+  .lang-card h2 { display: flex; align-items: center; gap: 8px; }
+  .lang-card h2 a { text-decoration: none; color: inherit; }
+
+  .capture-language-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 14px;
+    margin: 12px 0 14px;
+  }
+
+  .capture-language { display: flex; align-items: center; gap: 8px; }
+  .capture-language input { width: 16px; height: 16px; }
+  .source-language-form { margin-top: 14px; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .source-language-form label { display: inline-flex; align-items: center; gap: 6px; }
+  input[type="text"] {
+    min-height: 38px;
+    border-radius: var(--radius-md, 10px);
+    border: 1px solid rgba(51, 92, 103, 0.24);
+    padding: 0 12px;
+    font: inherit;
+    background: rgba(255, 253, 249, 0.9);
   }
 
   .chip {
@@ -1723,9 +1763,13 @@ def language_bar_html(
             f'href="{html.escape(language_href(active_path, ALL_LANGUAGES_CODE, extra_params), quote=True)}">Todas</a>'
         )
     ]
+    # Every built-in language is registered (and captured) by default; the bar
+    # only lists the ones that already have data, plus the active one, so it
+    # stays readable. The capture page lists them all.
     for row in rows:
         code = str(row["code"])
-        if not row["enabled"] and lang != code:
+        has_data = (row["term_count"] or 0) > 0 or (row["source_count"] or 0) > 0
+        if lang != code and (not row["enabled"] or not has_data):
             continue
         profile = get_language(code)
         active = "is-active" if lang == code else ""
@@ -1735,6 +1779,7 @@ def language_bar_html(
             f"{html.escape(profile.name)}"
             f'<span class="count">{escape(row["term_count"], "0")}</span></a>'
         )
+    chips.append('<a class="lang-settings" href="/capture" title="Idiomas capturados e perfis">Captura</a>')
     return f'<div class="lang-bar"><span class="lang-label">Idioma</span>{"".join(chips)}</div>'
 
 
@@ -1762,6 +1807,7 @@ def layout(
             nav_link("/kanji", "Kanji", active_path, lang) if show_kanji else "",
             nav_link("/sources", "Fontes", active_path, lang),
             nav_link("/flashcards", "Cards", active_path, lang),
+            nav_link("/capture", "Captura", active_path),
         )
     )
     return f"""<!doctype html>
@@ -1900,6 +1946,88 @@ def sync_anki_action(*, next_path: str = "/") -> str:
     """
 
 
+LANGUAGE_CARD_TOP_TERMS = 6
+
+
+def language_cards(
+    connection: sqlite3.Connection,
+    language_rows: list[sqlite3.Row],
+    *,
+    lang: str = ALL_LANGUAGES_CODE,
+) -> str:
+    """One card per language with data: counts plus its top terms (plan item D5).
+
+    With ``lang=all`` every language that has terms or sources gets a card, side
+    by side; with one language selected only that card shows. Languages that are
+    registered but still empty are listed in one line so the page stays short.
+    """
+    cards: list[str] = []
+    empty: list[str] = []
+    for row in language_rows:
+        code = str(row["code"])
+        term_count = int(row["term_count"] or 0)
+        source_count = int(row["source_count"] or 0)
+        if lang != ALL_LANGUAGES_CODE and code != lang:
+            continue
+        if term_count == 0 and source_count == 0 and lang == ALL_LANGUAGES_CODE:
+            label = get_language(code).name
+            capture = "" if row["capture_enabled"] else " (captura off)"
+            empty.append(f"{html.escape(label)}{capture}")
+            continue
+        profile = get_language(code)
+        top_terms = connection.execute(
+            """
+            SELECT id, lemma, COALESCE(reading, '') AS reading, COALESCE(meaning_pt, '-') AS meaning_pt,
+                   total_occurrences, priority_score
+            FROM v_terms_overview
+            WHERE language_code = ?
+              AND NOT (LOWER(TRIM(COALESCE(meaning_pt, ''))) LIKE 'nome%proprio%')
+            ORDER BY
+            """ + TERM_PRIORITY_ORDER_SQL + """
+            LIMIT ?
+            """,
+            (code, LANGUAGE_CARD_TOP_TERMS),
+        ).fetchall()
+        term_rows = [
+            [
+                f'<a href="/terms/{term["id"]}">{escape(term["lemma"])}</a>'
+                + (f' <span class="muted">{escape(term["reading"])}</span>' if profile.has_readings and term["reading"] else ""),
+                escape(truncate(str(term["meaning_pt"]), size=40)),
+                escape(term["total_occurrences"]),
+                escape(format_score(term["priority_score"])),
+            ]
+            for term in top_terms
+        ]
+        capture_state = "captura ligada" if row["capture_enabled"] else "captura desligada"
+        cards.append(
+            f"""
+      <section class="panel panel-side lang-card" data-language="{html.escape(code)}">
+        <h2><a href="{html.escape(language_href("/", code), quote=True)}">{html.escape(profile.name)}</a> <span class="chip">{html.escape(code)}</span></h2>
+        <div class="stats stats-compact">
+          <div class="stat"><span class="label">Termos</span><span class="value">{escape(term_count, "0")}</span></div>
+          <div class="stat"><span class="label">Fontes</span><span class="value">{escape(source_count, "0")}</span></div>
+          <div class="stat"><span class="label">Cards pendentes</span><span class="value">{escape(row["pending_flashcards"], "0")}</span></div>
+        </div>
+        {table_html(["Termo", "Significado", "Ocorr.", "Score"], term_rows)}
+        <p class="footer-note">Deck {html.escape(str(row["deck_name"]))} | {capture_state} |
+          <a href="{html.escape(language_href("/terms", code), quote=True)}">termos</a> |
+          <a href="{html.escape(language_href("/sources", code), quote=True)}">fontes</a></p>
+      </section>
+            """
+        )
+    if empty and lang == ALL_LANGUAGES_CODE:
+        cards.append(
+            f"""
+      <section class="panel">
+        <h2>Idiomas sem dados ainda</h2>
+        <p>{", ".join(empty)}.</p>
+        <p class="footer-note">Estes idiomas ja estao registrados; assim que a captura ou o <code>ingest-text</code> encontrar texto neles, o card aparece aqui. <a href="/capture">Ajustar a captura</a>.</p>
+      </section>
+            """
+        )
+    return "".join(cards)
+
+
 def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) -> str:
     params = params or {}
     lang = current_language(params)
@@ -2022,6 +2150,7 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             lang_params,
         ).fetchall()
         language_rows = list_language_rows(connection)
+        language_cards_html = language_cards(connection, language_rows, lang=lang)
 
     term_rows = [
         [
@@ -2099,7 +2228,10 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
       <section class="panel panel-side">
         <h2>Idiomas</h2>
         {table_html(["Idioma", "Termos", "Fontes", "Cards pendentes", "Deck"], language_table_rows)}
+        <p class="footer-note"><a href="/capture">Escolher quais idiomas a captura guarda</a></p>
       </section>
+
+      {language_cards_html}
 
       <section class="panel panel-side">
         <h2>Acesso rapido</h2>
@@ -3180,7 +3312,44 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
     )
 
 
-def source_detail_page(db_path: Path, source_id: int) -> str | None:
+def source_language_form(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    current_language: str,
+) -> str:
+    """Change a source's language and re-run its analysis from the page (plan item D4)."""
+    options = [
+        f'<option value="{AUTO_LANGUAGE_CODE}">auto (detectar pelo texto)</option>'
+    ]
+    seen = set()
+    for row in list_language_rows(connection):
+        code = str(row["code"])
+        seen.add(code)
+        selected = " selected" if code == current_language else ""
+        options.append(
+            f'<option value="{html.escape(code)}"{selected}>{html.escape(get_language(code).name)} ({html.escape(code)})</option>'
+        )
+    if current_language not in seen:
+        options.append(f'<option value="{html.escape(current_language)}" selected>{html.escape(current_language)}</option>')
+    return f"""
+        <form class="inline-action source-language-form" action="/actions/sources/{source_id}/language" method="post">
+          <label>Idioma da fonte
+            <select name="language">{"".join(options)}</select>
+          </label>
+          <label><input type="checkbox" name="reanalyze" value="1" checked> Reanalisar segmentos e candidatos</label>
+          <label><input type="checkbox" name="promote" value="1"> Criar termos ja</label>
+          <button type="submit">Salvar idioma</button>
+        </form>
+    """
+
+
+def source_detail_page(
+    db_path: Path,
+    source_id: int,
+    params: dict[str, list[str]] | None = None,
+) -> str | None:
+    params = params or {}
     with db_connect(db_path) as connection:
         source = connection.execute(
             """
@@ -3188,6 +3357,7 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
                 id,
                 source_type,
                 language_code,
+                language_confidence,
                 title,
                 game,
                 scene,
@@ -3231,6 +3401,35 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
         if source is None:
             return None
         resolution_label = source_resolution_label(connection, source)
+        language_form = source_language_form(
+            connection,
+            source_id=source_id,
+            current_language=str(source["language_code"]),
+        )
+        analysis_rows = connection.execute(
+            """
+            SELECT
+                sas.segment_index,
+                COALESCE(sas.language_code, '-') AS language_code,
+                sas.raw_text,
+                (
+                    SELECT COUNT(*)
+                    FROM source_analysis_candidates AS sac
+                    WHERE sac.source_analysis_segment_id = sas.id
+                ) AS candidate_count,
+                (
+                    SELECT COUNT(*)
+                    FROM source_analysis_candidates AS sac
+                    WHERE sac.source_analysis_segment_id = sas.id
+                      AND sac.approval_status = 'approved'
+                ) AS approved_count
+            FROM source_analysis_segments AS sas
+            WHERE sas.source_id = ?
+            ORDER BY sas.segment_index ASC
+            LIMIT ?
+            """,
+            (source_id, DETAIL_TABLE_LIMIT),
+        ).fetchall()
 
         term_rows = connection.execute(
             """
@@ -3364,18 +3563,37 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
         ]
         for row in kanji_rows
     ]
+    analysis_table_rows = [
+        [
+            escape(row["segment_index"]),
+            escape(row["language_code"]),
+            escape(truncate(str(row["raw_text"]), size=80)),
+            escape(row["candidate_count"]),
+            escape(row["approved_count"]),
+        ]
+        for row in analysis_rows
+    ]
+    language_profile = get_language(str(source["language_code"]))
+    confidence_label = (
+        f" (confianca {float(source['language_confidence']):.2f})"
+        if source["language_confidence"] is not None
+        else ""
+    )
     body = f"""
     <div class="grid">
       <section class="panel panel-wide">
+        {notice_banner(params)}
         <h2>{escape(source["title"] or "(sem titulo)")}</h2>
         <ul class="meta-list">
           <li><strong>Tipo</strong>{escape(source["source_type"])}</li>
-          <li><strong>Idioma</strong>{escape(source["language_code"])}</li>
+          <li><strong>Idioma</strong>{escape(language_profile.name)} ({escape(source["language_code"])}){html.escape(confidence_label)}</li>
+          <li><strong>Jogo / perfil</strong>{escape(source["game"] or "-")}</li>
           <li><strong>Resolucao original</strong>{escape(resolution_label)}</li>
           <li><strong>Cena</strong>{escape(source["scene"] or "-")}</li>
           <li><strong>Capturado em</strong>{escape(format_datetime_display(source["captured_at"] or source["created_at"]))}</li>
           <li><strong>Arquivo</strong><span class="mono">{escape(source["source_path"] or "-")}</span></li>
         </ul>
+        {language_form}
       </section>
 
       <section class="panel panel-side">
@@ -3405,6 +3623,12 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
       <section class="panel panel-side">
         <h3>Notas</h3>
         <pre>{html.escape(text(source["notes"], "(sem notas)"))}</pre>
+      </section>
+
+      <section class="panel panel-wide">
+        <h3>Segmentos analisados (rascunho por idioma)</h3>
+        {table_html(["#", "Idioma", "Texto", "Candidatos", "Aprovados"], analysis_table_rows)}
+        {truncation_note(len(analysis_rows), len(analysis_rows)) if len(analysis_rows) >= DETAIL_TABLE_LIMIT else ""}
       </section>
 
       <section class="panel panel-wide">
@@ -3573,6 +3797,187 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
     )
 
 
+def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    """Capture settings: which languages the worker keeps, the OCR plan, window profiles."""
+    with db_connect(db_path) as connection:
+        language_rows = list_language_rows(connection)
+        capture_codes = lang_jp.capture_language_codes(connection)
+        profiles = lang_jp.list_capture_profiles(connection)
+        recent_jobs = connection.execute(
+            """
+            SELECT
+                cj.id, cj.status, cj.captured_at, cj.window_title, cj.process_name,
+                cj.capture_profile_id,
+                (SELECT name FROM capture_profiles AS cp WHERE cp.id = cj.capture_profile_id) AS profile_name,
+                (SELECT s.id FROM sources AS s WHERE s.capture_job_id = cj.id LIMIT 1) AS source_id,
+                (SELECT s.language_code FROM sources AS s WHERE s.capture_job_id = cj.id LIMIT 1) AS source_language
+            FROM capture_jobs AS cj
+            ORDER BY cj.id DESC
+            LIMIT 12
+            """
+        ).fetchall()
+    override = os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV, "").strip()
+    plan = plan_ocr_engines(capture_codes)
+
+    checkboxes = []
+    for row in language_rows:
+        code = str(row["code"])
+        profile = get_language(code)
+        checked = " checked" if code in capture_codes else ""
+        disabled_note = "" if row["enabled"] else ' <span class="muted">(idioma desativado)</span>'
+        checkboxes.append(
+            f'<label class="capture-language"><input type="checkbox" name="codes" value="{html.escape(code)}"{checked}> '
+            f"{html.escape(profile.name)} <span class=\"muted\">{html.escape(code)}</span>{disabled_note}</label>"
+        )
+    override_note = (
+        f'<div class="notice-banner">A variavel {html.escape(lang_jp.CAPTURE_LANGUAGES_ENV)}={html.escape(override)} '
+        "esta definida no ambiente do worker e sobrepoe estas opcoes enquanto existir.</div>"
+        if override
+        else ""
+    )
+    engines_html = "".join(f"<li><span class=\"mono\">{html.escape(name)}</span></li>" for name in plan.engine_names) or "<li>-</li>"
+    unsupported_html = (
+        f'<p class="muted">Sem motor de OCR para: {html.escape(", ".join(plan.unsupported))}. '
+        "O texto nesses idiomas so entra por <code>ingest-text</code>.</p>"
+        if plan.unsupported
+        else ""
+    )
+
+    profile_rows = []
+    for row in profiles:
+        state = "ativo" if row["enabled"] else "inativo"
+        toggle_label = "Desativar" if row["enabled"] else "Ativar"
+        actions = f"""
+            <form class="inline-action" action="/actions/capture-profiles/toggle" method="post">
+              <input type="hidden" name="id" value="{row['id']}">
+              <input type="hidden" name="enabled" value="{0 if row['enabled'] else 1}">
+              <button type="submit">{toggle_label}</button>
+            </form>
+            <form class="inline-action" action="/actions/capture-profiles/delete" method="post" onsubmit="return confirm('Remover o perfil {html.escape(str(row['name']), quote=True)}?');">
+              <input type="hidden" name="id" value="{row['id']}">
+              <button type="submit">Remover</button>
+            </form>
+        """
+        profile_rows.append(
+            [
+                escape(row["name"]),
+                escape(row["window_title_pattern"] or "-"),
+                escape(row["process_name_pattern"] or "-"),
+                escape(row["language_codes"]),
+                escape(row["priority"]),
+                status_chip(state),
+                actions,
+            ]
+        )
+    job_rows = [
+        [
+            escape(row["id"]),
+            status_chip(text(row["status"])),
+            escape(truncate(text(row["window_title"], "-"), size=60)),
+            escape(row["process_name"] or "-"),
+            escape(row["profile_name"] or "-"),
+            (
+                f'<a href="/sources/{row["source_id"]}">#{row["source_id"]} ({escape(row["source_language"])})</a>'
+                if row["source_id"] is not None
+                else "-"
+            ),
+            datetime_cell(row["captured_at"]),
+        ]
+        for row in recent_jobs
+    ]
+    language_options = "".join(
+        f'<option value="{html.escape(str(row["code"]))}">{html.escape(get_language(str(row["code"])).name)} ({html.escape(str(row["code"]))})</option>'
+        for row in language_rows
+    )
+    body = f"""
+    <div class="grid">
+      <section class="panel panel-wide">
+        {notice_banner(params)}
+        <h2>Idiomas capturados</h2>
+        <p>O worker guarda o texto de tela nestes idiomas e descarta o resto. A escolha fica no banco (<code>languages.capture_enabled</code>) e vale para o tray, a CLI e esta pagina. Por padrao todos os idiomas entram.</p>
+        {override_note}
+        <form class="capture-languages-form" action="/actions/capture-languages" method="post">
+          <div class="capture-language-grid">{"".join(checkboxes)}</div>
+          <div class="action-row">
+            <button type="submit">Salvar idiomas</button>
+            <button type="submit" name="preset" value="all">Todos</button>
+            <button type="submit" name="preset" value="ja">Somente japones</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-side">
+        <h2>Motores de OCR</h2>
+        <p>Escolhidos automaticamente pelo conjunto acima: meikiocr para japones, um leitor EasyOCR por grupo de idiomas compativeis.</p>
+        <ul class="meta-list">{engines_html}</ul>
+        {unsupported_html}
+        <p class="footer-note">Captura atual: {html.escape(", ".join(capture_codes))}</p>
+      </section>
+
+      <section class="panel panel-wide">
+        <h2>Perfis de captura por janela</h2>
+        <p>Um perfil prende uma janela (titulo ou processo) a um conjunto fixo de idiomas: com um idioma a deteccao e pulada, com varios ela fica restrita a eles.</p>
+        {table_html(["Nome", "Titulo da janela", "Processo", "Idiomas", "Prioridade", "Estado", "Acoes"], profile_rows)}
+        <form class="search capture-profile-form" action="/actions/capture-profiles/save" method="post">
+          <label>Novo perfil (ou mesmo nome para substituir)</label>
+          <div class="inputs">
+            <input type="text" name="name" placeholder="Nome, ex.: Dragon Quest ES" required>
+            <input type="text" name="window_pattern" placeholder="Titulo da janela, ex.: *dragon quest*">
+            <input type="text" name="process_pattern" placeholder="Processo, ex.: dq11.exe">
+            <input type="text" name="languages" placeholder="Idiomas, ex.: es,en" required list="capture-language-codes">
+            <datalist id="capture-language-codes">{language_options}</datalist>
+            <input type="number" name="priority" value="100" min="0" max="9999" title="Prioridade (menor vence)">
+            <div class="search-actions"><button type="submit">Salvar perfil</button></div>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-wide">
+        <h2>Capturas recentes</h2>
+        <p>Titulo e processo da janela em primeiro plano em cada captura: use-os para criar perfis.</p>
+        {table_html(["Job", "Status", "Janela", "Processo", "Perfil", "Fonte", "Quando"], job_rows)}
+      </section>
+    </div>
+    """
+    return layout(
+        title="Captura",
+        body=body,
+        active_path="/capture",
+        language_bar=language_bar_html(db_path, active_path="/capture", lang=ALL_LANGUAGES_CODE),
+    )
+
+
+def api_capture_payload(db_path: Path) -> dict[str, object]:
+    with db_connect(db_path) as connection:
+        capture_codes = lang_jp.capture_language_codes(connection)
+        profiles = lang_jp.list_capture_profiles(connection)
+    plan = plan_ocr_engines(capture_codes)
+    return {
+        "capture_languages": list(capture_codes),
+        "override_env": os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV) or None,
+        "ocr_plan": {
+            "backend": plan.backend,
+            "engines": list(plan.engine_names),
+            "meikiocr": plan.use_meikiocr,
+            "easyocr_groups": [list(group) for group in plan.easyocr_groups],
+            "unsupported": list(plan.unsupported),
+        },
+        "profiles": [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "window_title_pattern": row["window_title_pattern"],
+                "process_name_pattern": row["process_name_pattern"],
+                "language_codes": lang_jp.parse_language_code_list(row["language_codes"]),
+                "enabled": bool(row["enabled"]),
+                "priority": row["priority"],
+                "notes": row["notes"],
+            }
+            for row in profiles
+        ],
+    }
+
+
 def api_language_entry(row: sqlite3.Row) -> dict[str, object]:
     profile = get_language(str(row["code"]))
     return {
@@ -3582,6 +3987,7 @@ def api_language_entry(row: sqlite3.Row) -> dict[str, object]:
         "script": row["script"],
         "deck_name": row["deck_name"],
         "enabled": bool(row["enabled"]),
+        "capture_enabled": bool(row["capture_enabled"]),
         "word_delimited": profile.word_delimited,
         "has_readings": profile.has_readings,
         "has_characters": profile.has_characters,
@@ -3812,6 +4218,12 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/languages":
             self.respond_json(api_languages_payload(self.db_path))
             return
+        if path == "/api/capture":
+            self.respond_json(api_capture_payload(self.db_path))
+            return
+        if path == "/capture":
+            self.respond_html(capture_page(self.db_path, params))
+            return
         if path == "/api/terms":
             self.respond_json(api_terms_payload(self.db_path, params))
             return
@@ -3878,7 +4290,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             if source_id is None:
                 self.respond_not_found("Fonte invalida.")
                 return
-            page = source_detail_page(self.db_path, source_id)
+            page = source_detail_page(self.db_path, source_id, params)
             if page is None:
                 self.respond_not_found("Fonte nao encontrada.")
                 return
@@ -3900,8 +4312,130 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/actions/sync-kanji-anki":
             self.run_sync_anki_action()
             return
+        if path == "/actions/capture-languages":
+            self.run_capture_languages_action()
+            return
+        if path == "/actions/capture-profiles/save":
+            self.run_capture_profile_action("save")
+            return
+        if path == "/actions/capture-profiles/toggle":
+            self.run_capture_profile_action("toggle")
+            return
+        if path == "/actions/capture-profiles/delete":
+            self.run_capture_profile_action("delete")
+            return
+        if path.startswith("/actions/sources/") and path.endswith("/language"):
+            source_id = self.parse_int_tail(path[: -len("/language")], "/actions/sources/")
+            if source_id is None:
+                self.respond_not_found("Fonte invalida.")
+                return
+            self.run_source_language_action(source_id)
+            return
 
         self.respond_not_found("Acao nao encontrada.")
+
+    def run_capture_languages_action(self) -> None:
+        form_data = self.read_form_data()
+        preset = first_value(form_data, "preset", "").strip()
+        try:
+            with db_connect(self.db_path) as connection:
+                if preset == "all":
+                    for code in languages.BUILTIN_LANGUAGES:
+                        lang_jp.ensure_language_row(connection, code, capture_enabled=True)
+                    connection.execute(
+                        "UPDATE languages SET capture_enabled = 1, updated_at = CURRENT_TIMESTAMP"
+                    )
+                elif preset:
+                    lang_jp.set_capture_languages(connection, preset.split(","))
+                else:
+                    lang_jp.set_capture_languages(connection, form_data.get("codes", []))
+                codes = lang_jp.capture_language_codes(connection, override="")
+                connection.commit()
+        except SystemExit as exc:
+            self.redirect(self.append_notice("/capture", message=str(exc), level="error"))
+            return
+        message = f"Captura: {', '.join(codes)}."
+        if self.prefers_json_response():
+            self.respond_json({"capture_languages": list(codes), "message": message})
+            return
+        self.redirect(self.append_notice("/capture", message=message, level="info"))
+
+    def run_capture_profile_action(self, action: str) -> None:
+        form_data = self.read_form_data()
+        try:
+            with db_connect(self.db_path) as connection:
+                if action == "save":
+                    priority_raw = first_value(form_data, "priority", "100").strip() or "100"
+                    try:
+                        priority = int(priority_raw)
+                    except ValueError:
+                        priority = 100
+                    profile_id = lang_jp.upsert_capture_profile(
+                        connection,
+                        name=first_value(form_data, "name"),
+                        language_codes=first_value(form_data, "languages"),
+                        window_title_pattern=first_value(form_data, "window_pattern") or None,
+                        process_name_pattern=first_value(form_data, "process_pattern") or None,
+                        enabled=first_value(form_data, "enabled", "1") != "0",
+                        priority=priority,
+                        notes=first_value(form_data, "notes") or None,
+                    )
+                    message = f"Perfil #{profile_id} salvo."
+                else:
+                    try:
+                        profile_id = int(first_value(form_data, "id", ""))
+                    except ValueError:
+                        raise SystemExit("Perfil invalido.")
+                    if action == "toggle":
+                        enabled = first_value(form_data, "enabled", "1") != "0"
+                        if not lang_jp.set_capture_profile_enabled(connection, profile_id, enabled):
+                            raise SystemExit("Perfil nao encontrado.")
+                        message = f"Perfil #{profile_id} {'ativado' if enabled else 'desativado'}."
+                    else:
+                        if not lang_jp.delete_capture_profile(connection, profile_id=profile_id):
+                            raise SystemExit("Perfil nao encontrado.")
+                        message = f"Perfil #{profile_id} removido."
+                connection.commit()
+        except SystemExit as exc:
+            self.redirect(self.append_notice("/capture", message=str(exc), level="error"))
+            return
+        if self.prefers_json_response():
+            self.respond_json({"message": message})
+            return
+        self.redirect(self.append_notice("/capture", message=message, level="info"))
+
+    def run_source_language_action(self, source_id: int) -> None:
+        form_data = self.read_form_data()
+        language = first_value(form_data, "language", AUTO_LANGUAGE_CODE) or AUTO_LANGUAGE_CODE
+        reanalyze = first_value(form_data, "reanalyze", "") == "1"
+        promote = first_value(form_data, "promote", "") == "1"
+        next_path = f"/sources/{source_id}"
+        try:
+            with db_connect(self.db_path) as connection:
+                result = lang_jp.change_source_language(
+                    connection,
+                    source_id=source_id,
+                    language=language,
+                    reanalyze=reanalyze,
+                    promote=promote,
+                )
+                connection.commit()
+        except SystemExit as exc:
+            self.redirect(self.append_notice(next_path, message=str(exc), level="error"))
+            return
+        message = f"Idioma da fonte: {result['previous_language']} -> {result['language_code']}."
+        reanalyzed = result["reanalyzed"]
+        if isinstance(reanalyzed, dict):
+            message += (
+                f" Reanalisada: {reanalyzed['segments']} segmentos, {reanalyzed['candidates']} candidatos"
+                f" ({', '.join(sorted(reanalyzed['languages'])) or result['language_code']})."
+            )
+        if promote:
+            message += f" Termos criados: {result['promoted_terms']}."
+        if self.prefers_json_response():
+            self.respond_json({"message": message, **{k: v for k, v in result.items() if k != "reanalyzed"}})
+            return
+        self.redirect(self.append_notice(next_path, message=message, level="info"))
 
     def log_message(self, format: str, *args: object) -> None:
         return
