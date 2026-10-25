@@ -6,7 +6,8 @@ Local foundation for cataloging vocabulary from game screenshots and text, in an
 - `schema.sql`: SQLite schema.
 - `lang_jp.py`: CLI for sources, terms, and recurrence.
 - `languages.py`: language registry, offline language detection, mixed-text splitting and per-language analyzers (Sudachi for Japanese, a generic tokenizer for word-delimited languages, jieba/pythainlp when installed).
-- `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs.
+- `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs. Picks the OCR engines from the capture language set, merges their output and sorts every block per language.
+- `ocr_backends.py`: OCR engines (meikiocr, EasyOCR, manga-ocr), engine routing by language set, language-aware line filters and cross-engine block merging.
 - `requirements-capture.txt`: Python worker dependencies for the dedicated 3.12 environment.
 - `requirements-main.txt`: small helper dependencies for the main catalog environment.
 - `desktop_capture_daemon/`: Rust tray daemon for passive full-screen capture and job enqueueing.
@@ -77,17 +78,46 @@ python .\lang_jp.py enable-language --code de --deck-name "Lang::Deutsch"
 
 Detection is offline: script ranges decide CJK, Hangul, Cyrillic, Arabic, Hebrew, Greek, Thai and Devanagari; stop words and diacritics tell Latin-script languages apart. Mixed lines are split into script runs, so a Korean line with an English button label produces one Korean and one English segment. Pass `--candidates` to restrict detection to the languages you actually study.
 
-Japanese keeps JMdict meanings, Sudachi analysis, kanji and romaji. Other languages get lemmas from `simplemma` when it is installed (`pip install simplemma`), otherwise the lower-cased surface, and meanings from machine translation of the lemma. Chinese uses `jieba` when installed and falls back to character runs.
+Japanese keeps JMdict meanings, Sudachi analysis, kanji and romaji. Other languages get lemmas from `simplemma` (installed by both requirement files; lower-cased surface as fallback), meanings from machine translation of the lemma into `LANG_JP_TERM_TRANSLATION_TARGET` (default `pt`), and, when the profile has readings, a Latin reading through the romanizer hook: pinyin for Chinese (`pypinyin`, optional), Revised Romanization for Korean and a transliteration table for Russian and Ukrainian (both built in). Chinese uses `jieba` when installed and falls back to character runs.
 
-Passive capture reads `LANG_CAPTURE_LANGUAGES` (default `ja`). To capture a Spanish game: `LANG_CAPTURE_LANGUAGES=es,en`, `LANG_JP_OCR_BACKEND=easyocr`, `LANG_JP_EASYOCR_LANGS=es,en`. Blocks in other languages are dropped, every segment is tagged, and the source language is the one covering most of the text. `meikiocr` is Japanese-only; EasyOCR can pair `ja` only with `en`.
+### Passive capture in every language
+
+The passive capture catalogs every language that appears on screen; nothing is dropped only because of its language. Which languages are kept lives in the database (`languages.enabled` plus `languages.capture_enabled`), defaults to every built-in profile, and is edited from three places that all write the same flags:
+
+- the tray menu `Capture languages` (checkbox per language, `Capture every language`, `Capture Japanese only`);
+- the web page `/capture` (also lists the OCR plan, the capture profiles and the recent captures with their window titles);
+- the CLI: `set-capture-languages --codes ja,en,es,ko`, `set-capture-languages --all`, `enable-language --code de --capture` / `--no-capture`.
+
+The worker reads the set per job, so changes apply to the next capture without a restart. `LANG_CAPTURE_LANGUAGES` is no longer required; when set in the worker environment it overrides the database for that run.
+
+OCR engines follow the set automatically (`LANG_JP_OCR_BACKEND=auto`, the default): `meikiocr` alone when only `ja` is enabled, otherwise `meikiocr` for the Japanese pass plus one EasyOCR reader per compatible language group (all Latin-script languages share one reader; `ko`, `zh`, `th`, Cyrillic, Arabic and Devanagari each get their own, paired with English when English is enabled). Readers are cached for the life of the worker, EasyOCR detection runs once per capture and later readers only re-read boxes nobody read confidently, and the blocks of every engine are merged by bounding-box overlap and text similarity. Greek and Hebrew have no EasyOCR model, so their text only enters through `ingest-text`. `LANG_JP_OCR_BACKEND=meikiocr` or `easyocr` still force the old single-engine flows.
+
+Capture profiles pin a window to a fixed language set: the daemon records the foreground window title and process name with every job (`capture_jobs.window_title`, `capture_jobs.process_name`, off with `record_foreground_window = false`), and a matching profile fixes the languages for that capture, skipping detection when it has a single language. Sources from the capture get the window title as title and the profile name as game.
+
+```powershell
+python .\lang_jp.py list-languages                       # includes capture_enabled and the effective capture set
+python .\lang_jp.py set-capture-languages --codes ja,en,es,ko
+python .\lang_jp.py add-capture-profile --name "Dragon Quest ES" --languages es,en --window-pattern "*dragon quest*"
+python .\lang_jp.py add-capture-profile --name "Korean VN" --languages ko --process-pattern "vn.exe"
+python .\lang_jp.py list-capture-profiles
+python .\lang_jp.py match-capture-profile --window-title "DRAGON QUEST XI - Steam"
+python .\lang_jp.py remove-capture-profile --name "Korean VN"
+python .\lang_jp.py list-sources --language all
+python .\lang_jp.py set-source-language --source-id 12 --language es --reanalyze --promote
+python .\lang_jp.py sync-anki --language all                # one Anki deck per language, lang_xx tags
+python .\lang_jp.py export-anki-tsv --language all
+```
 
 The web UI has a language bar on every page (`?lang=es`, `lang=all`), and other front ends can read:
 
-- `GET /api/languages`
+- `GET /api/languages` (with `capture_enabled` per language)
+- `GET /api/capture` (effective capture set, OCR plan, capture profiles)
 - `GET /api/terms?lang=es&q=&order=priority|recent|lemma&limit=&page=`
 - `GET /api/terms/{id}`
 - `GET /api/sources?lang=es&q=&limit=&page=`
 - `GET /api/flashcards?lang=es&status=pending&limit=&page=`
+
+`lang=all` (or no `lang`) works on every page and every endpoint. The dashboard shows one card per language with counts and top terms; a source page lets you change the source language and re-run its analysis.
 
 Databases created before this change are upgraded in place on the next command: existing rows become `ja` and canonical keys gain the `ja::` prefix once.
 
@@ -99,19 +129,20 @@ The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-op
 1. Prepare a dedicated Python 3.12 environment for the capture worker and install `requirements-capture.txt`.
 2. Start the Rust tray daemon with `..\open_lang.cmd` from the repository root, or run `cargo run` inside `desktop_capture_daemon` if you want to launch it manually from a shell.
 3. The daemon captures the primary monitor either on a fixed interval or in an `after source ready` cadence, dedupes recent frames, writes spool PNGs, and enqueues `capture_jobs`.
-4. The Python worker consumes those jobs, runs `EasyOCR` with horizontal-box filtering + Japanese draft analysis, and creates pending `sources`.
+4. The Python worker consumes those jobs, runs the OCR engines for the capture language set (meikiocr for Japanese, EasyOCR readers for the other languages), splits the text per language and creates pending `sources` whose segments and candidates carry their language.
 5. Review drafts with:
    - `python .\lang_jp.py review-sources`
    - `python .\lang_jp.py review-source --source-id N`
    - `python .\lang_jp.py approve-analysis --source-id N`
    - `python .\lang_jp.py ignore-source --source-id N`
 
-The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example`.
+The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example` (including `record_foreground_window`).
 
 The tray menu now exposes both capture cadences:
 - `Cadence: Fixed interval`: uses the selected capture interval as before.
 - `Cadence: After source ready`: waits until the current capture job finishes turning into a source before taking the next screenshot. This mode works best with `auto_start_worker = false` and `auto_process_jobs = true`.
 - `manual_capture_hotkey` in `desktop_capture_daemon\capture_daemon.toml`: binds a global shortcut to the same `Capture now` action in the tray. Example: `Ctrl+Shift+F8`.
+- `Capture languages`: a checkbox per registered language plus `Capture every language` and `Capture Japanese only`. The choice is stored in the database and shared with the web UI and the CLI.
 
 At the moment, the automatic worker is optimized for normal horizontal text in screenshots. It is not tuned for manga-style vertical text.
 

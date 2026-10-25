@@ -2,7 +2,7 @@
 
 Status legend: `[x]` done in this pass, `[ ]` open, `[~]` partially done.
 
-State as of 2026-10-21: Phases A, B, C1-C2, D1-D3, E1 and E2 are implemented and covered by `JP/test_languages.py` (27 tests) plus the existing suite. Open items are the ones still unchecked below.
+State as of 2026-10-25: Phases A, B, C1-C4, D1-D5, E1, E2 and E5 are implemented and covered by `JP/test_languages.py`, `JP/test_ocr_backends.py`, `JP/test_capture_pipeline.py` and the integration test `JP/test_capture_integration.py` (real OCR on synthetic screenshots, skipped outside the OCR environment). Open items are the ones still unchecked below; the choices made along the way are in section 6.
 
 ## 1. Goal
 
@@ -38,7 +38,7 @@ Make the catalog work for all languages at the same time, in one database and on
   - `ko`: whitespace tokens (particle stripping is a later step).
 - R12. Meaning lookup per language: JMdict for `ja`; machine translation of the lemma from its own language otherwise. The gloss language stays configurable (`LANG_JP_TERM_TRANSLATION_TARGET`).
 - R13. The term blacklist is language-aware: single kana only applies to `ja`; punctuation and digit-only tokens apply everywhere.
-- R14. The capture worker keeps OCR blocks whose detected language is enabled for capture (`LANG_CAPTURE_LANGUAGES`, default `ja`), tags each segment, and derives the source language from the majority of its blocks. Translation of sources uses the source language as the source side.
+- R14. The capture worker keeps OCR blocks whose detected language is enabled for capture. The capture set is stored in the database (`languages.enabled` and `languages.capture_enabled`, default: every built-in language) and edited from the tray, the web UI and the CLI; `LANG_CAPTURE_LANGUAGES` is only an override. Every segment is tagged, the source language is the majority of its blocks, and source translation uses the source language as the source side.
 - R15. Text ingestion without OCR (`ingest-text`) runs the same pipeline: detect, split, analyze, create candidates, auto-promote terms.
 
 ### 2.3 Surfaces
@@ -52,7 +52,7 @@ Make the catalog work for all languages at the same time, in one database and on
 
 - R20. No new mandatory dependencies for the catalog environment: detection and the generic analyzer are standard library. Sudachi, simplemma and jieba are optional and loaded lazily.
 - R21. Tests cover detection, mixed-text splitting, generic analysis, key migration and multi-language ingestion end to end.
-- R22. The passive-capture OCR layer stays as is. Multi-language OCR needs EasyOCR with `LANG_JP_EASYOCR_LANGS` (ja can only be paired with en in EasyOCR); meikiocr is Japanese-only.
+- R22. OCR engines follow the capture set: meikiocr for the Japanese pass (it is Japanese-only), one EasyOCR reader per compatible language group for the rest (EasyOCR pairs `ja`, `ko`, `zh`, `th` and the non-Latin script groups only with English), detection shared across readers, blocks merged by overlap and text similarity. `LANG_JP_OCR_BACKEND=meikiocr|easyocr` forces one engine.
 
 ## 3. Architecture after this change
 
@@ -98,16 +98,16 @@ Language-specific behaviour lives in `languages.py` (profiles, analyzers). Every
 
 - [x] C1. Worker keeps blocks in enabled capture languages instead of Japanese-only, tags segments, derives the source language.
 - [x] C2. Source translation uses the source language as the source side.
-- [ ] C3. Capture profiles per window/game with a fixed language (skips detection for known apps).
-- [ ] C4. OCR backend selection per language set (EasyOCR language packs, PaddleOCR for zh, Tesseract for Latin scripts).
+- [x] C3. Capture profiles per window/game with a fixed language (skips detection for known apps). The daemon records the foreground window title and process name in `capture_jobs`; `capture_profiles` maps title/process patterns to a language set, managed from the CLI and `/capture`.
+- [x] C4. OCR backend selection per language set: meikiocr + EasyOCR reader groups chosen from the capture set, cached readers, shared detection, cross-engine merge (`ocr_backends.plan_ocr_engines`, `capture_worker.MultiEngineOcrAdapter`). PaddleOCR/Tesseract were not needed.
 
 ### Phase D: surfaces
 
 - [x] D1. Web: language switcher, `?lang=` on dashboard, terms, sources, flashcards; language columns.
 - [x] D2. Web: JSON API endpoints for languages, terms, sources, flashcards.
 - [x] D3. Kanji pages hidden for languages without characters.
-- [ ] D4. Web: edit a source's language and re-run analysis from the source page.
-- [ ] D5. Web: per-language dashboard cards (counts and top terms side by side).
+- [x] D4. Web: edit a source's language and re-run analysis from the source page (`POST /actions/sources/{id}/language`, shared `change_source_language`).
+- [x] D5. Web: per-language dashboard cards (counts and top terms side by side), `lang=all` on every page and API endpoint, `/capture` settings page, `/api/capture`.
 
 ### Phase E: quality and docs
 
@@ -115,13 +115,33 @@ Language-specific behaviour lives in `languages.py` (profiles, analyzers). Every
 - [x] E2. Docs: README and JP/README updated; AGENTS.md image-only rule becomes language-agnostic.
 - [ ] E3. Rename `lang_jp.py` / `lang_jp.sqlite3` to language-neutral names behind compatibility shims.
 - [ ] E4. Frequency lists per language for a coverage map (top 5000 words).
-- [ ] E5. Readings for non-Japanese languages (pinyin for zh, romanization for ko/ru/ar) through the profile's romanizer hook.
+- [x] E5. Readings for non-Japanese languages through the profile's romanizer hook: pinyin for `zh` (`pypinyin`, optional), Revised Romanization for `ko`, transliteration tables for `ru`/`uk`. Arabic has no romanizer yet.
 - [ ] E6. Inflection-aware matching for Latin languages (spaCy models as an optional plugin behind the analyzer interface).
 
 ## 5. Operating notes
 
-- Default behaviour is unchanged for Japanese: `LANG_CAPTURE_LANGUAGES` defaults to `ja`, decks stay `Lang::Japanese`.
-- To capture a Spanish game: set `LANG_CAPTURE_LANGUAGES=es,en`, `LANG_JP_OCR_BACKEND=easyocr`, `LANG_JP_EASYOCR_LANGS=es,en`, then run the worker as usual.
+- Japanese behaviour is unchanged: JMdict, Sudachi, kanji, romaji, `Lang::Japanese` deck, meikiocr for the Japanese pass.
+- Every built-in language is captured by default. To narrow it: tray `Capture languages`, web `/capture`, or `python JP/lang_jp.py set-capture-languages --codes ja,en,es,ko`. The worker picks the change up on the next job.
+- To pin a game to a language: `python JP/lang_jp.py add-capture-profile --name "Dragon Quest ES" --languages es,en --window-pattern "*dragon quest*"` (or from `/capture`).
 - To add text manually in any language: `python JP/lang_jp.py ingest-text --language auto --text "..."`.
-- To browse one language: open `/terms?lang=es` or use the switcher; `lang=all` shows everything.
-- Other front ends read `/api/terms?lang=es&order=priority`.
+- To browse one language: open `/terms?lang=es` or use the switcher; `lang=all` shows everything, the dashboard shows one card per language.
+- Other front ends read `/api/terms?lang=es&order=priority` and `/api/capture`.
+- `LANG_CAPTURE_LANGUAGES`, `LANG_JP_OCR_BACKEND` and `LANG_JP_EASYOCR_LANGS` remain as overrides for one-off runs only.
+
+## 6. Decisions
+
+Choices made while finishing the capture pipeline (2026-10-24/25), where the plan left room:
+
+- **Database is the source of truth for the capture set.** `languages.capture_enabled` (new column, default 1) next to `languages.enabled`; the tray, `/capture` and the CLI all write it, the worker reads it per job. The environment variable stays as an override because it is handy for one-off runs, but nothing requires it. An empty set falls back to `ja` so the worker never runs with nothing.
+- **Upgrading registers every built-in language with capture on.** The first command after the upgrade registers the 24 built-in profiles. The language bar only lists languages that have data (plus the active one) so 24 chips do not clutter every page; the dashboard lists the empty ones in a single line.
+- **meikiocr stays the Japanese engine and is never used for other languages.** It only runs when `ja` is in the capture set; with `ja` alone the flow is the pre-polyglot one (same filters, same furigana rule). EasyOCR never gets a `ja` reader in `auto` mode.
+- **One EasyOCR reader per compatible group, shared detection, confidence-gated recognition.** EasyOCR's rule only lets `ja`, `ko`, `zh`, `th` and the non-Latin script groups pair with English, so each becomes a reader (paired with `en` when enabled) while all Latin languages share one. The CRAFT detector is the same model for every reader, so detection runs once per capture and later readers only recognize boxes nobody read with confidence >= 0.7 (`LANG_JP_OCR_CONFIDENT_READ`). Without this, 22 languages meant 8 full passes per capture.
+- **Cross-engine merge: earlier engine wins.** Blocks whose boxes overlap >= 50% of the smaller box are the same text; 20-50% overlap also needs text similarity >= 0.6. meikiocr goes first so Japanese lines are never replaced by a Latin reader's garbage.
+- **Japanese-only filters apply only to the Japanese pass.** `is_plausible_text_line` is language-aware (two letters of an enabled script, >= 30% of the line); the furigana filter runs only when `ja` is enabled; region scoring counts letters of any script. The stat formerly called `non_japanese` is `off_language`.
+- **Capture profiles match substrings or wildcards, case-insensitively, title and process both when given, lowest priority first.** One language in a profile forces every block to that language (no detection); several restrict detection. The window title becomes the source title and the profile name the source `game`, because that is what the user searches for later.
+- **The daemon adds the window columns itself** when the Python side has not upgraded the schema yet, so a capture never fails on a fresh database.
+- **Blocks in a language outside the capture set** stay visible as a segment tagged with the language they look like (unrestricted detection) but produce no candidates, so the reviewer sees why nothing was cataloged.
+- **Readings.** Korean and Cyrillic romanization are standard library (Revised Romanization with the vowel-carry rule, BGN-style tables for `ru`/`uk`); pinyin comes from `pypinyin` when installed, otherwise the term simply has no reading. `ru`/`uk` profiles gained `has_readings`. Japanese readings stay kana from Sudachi.
+- **Lemmas.** `simplemma` is installed in both venvs. Acronyms keep their case; a token simplemma leaves unchanged is retried lower-cased so sentence-initial words merge with their lower-case form; real inflections (`Häuser` -> `Haus`) win as is.
+- **Source translation skips same-language sources** (an English source with target `en` keeps its text) instead of calling the translator.
+- **Not done, on purpose:** Greek and Hebrew have no EasyOCR model, so they are registered but only reachable through `ingest-text` (the capture page says so); Arabic has no romanizer; term meanings are still one translation request per new term, which makes a Latin-heavy first capture slow.

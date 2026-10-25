@@ -20,10 +20,11 @@ O projeto nao e apenas um OCR nem apenas um gerador de flashcards. Ele funciona 
 ## Componentes principais
 
 - `JP/lang_jp.py`: CLI principal para inicializar banco, registrar fontes, ligar termos, revisar analises, recalcular estatisticas e gerar/sincronizar flashcards.
-- `JP/languages.py`: registro de idiomas, deteccao offline de idioma, divisao de texto misto e analisadores por idioma (Sudachi para japones, tokenizador generico para idiomas com espacos, jieba para chines quando instalado).
-- `JP/lang_jp_web.py`: interface web local para navegar por termos, kanji, fontes e cards, com filtro de idioma em todas as paginas e uma API JSON (`/api/languages`, `/api/terms`, `/api/sources`, `/api/flashcards`).
-- `JP/capture_worker.py`: worker Python que consome jobs de captura, roda OCR local e gera rascunhos de analise para revisao.
-- `JP/desktop_capture_daemon/`: daemon em Rust para captura passiva de tela, deduplicacao basica e enqueue de jobs.
+- `JP/languages.py`: registro de idiomas, deteccao offline de idioma, divisao de texto misto, analisadores por idioma (Sudachi para japones, tokenizador generico com `simplemma` para idiomas com espacos, jieba para chines quando instalado) e romanizadores (pinyin, hangul, cirilico) para leituras.
+- `JP/lang_jp_web.py`: interface web local para navegar por termos, kanji, fontes e cards, com filtro de idioma em todas as paginas (`lang=all` mostra tudo), cards por idioma no painel, pagina `/capture` para escolher os idiomas capturados e os perfis por janela, e uma API JSON (`/api/languages`, `/api/capture`, `/api/terms`, `/api/sources`, `/api/flashcards`).
+- `JP/capture_worker.py`: worker Python que consome jobs de captura, escolhe os motores de OCR pelo conjunto de idiomas capturados (meikiocr para japones, leitores EasyOCR para os demais), separa o texto por idioma e gera rascunhos de analise para revisao.
+- `JP/ocr_backends.py`: motores de OCR, roteamento por idioma, filtros de linha por idioma e fusao dos blocos de varios motores.
+- `JP/desktop_capture_daemon/`: daemon em Rust para captura passiva de tela, deduplicacao basica e enqueue de jobs; registra a janela em primeiro plano de cada captura e expoe no tray o menu de idiomas capturados.
 - `JP/schema.sql`: schema SQLite que sustenta fontes, termos, segmentos, analise OCR, estatisticas e flashcards.
 - `JP/data/lang_jp.sqlite3`: banco local do catalogo.
 
@@ -97,4 +98,4 @@ Notas:
 
 ## Estado atual
 
-O repositorio parece estar centrado quase totalmente no catalogo japones em `JP/`. Nao ha, neste momento, evidencias de outros modulos equivalentes para outros idiomas dentro da raiz.
+O catalogo e poliglota de ponta a ponta: a captura passiva guarda, por padrao, todo idioma que aparece na tela (o conjunto fica no banco e pode ser ajustado pelo tray, pela interface web ou pela CLI), cada termo sabe seu idioma, e os cards vao para um deck do Anki por idioma. O japones continua com JMdict, Sudachi, kanji e romaji; os outros idiomas ganham lema (`simplemma`), significado por traducao automatica e leitura quando o perfil tem (pinyin, romanizacao do hangul, transliteracao do cirilico). O modulo `JP/` mantem o nome historico.
