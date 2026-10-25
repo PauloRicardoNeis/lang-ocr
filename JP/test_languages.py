@@ -174,7 +174,7 @@ class CatalogLanguageTest(unittest.TestCase):
                 language_code="es",
             )
             rows = connection.execute(
-                "SELECT code FROM languages ORDER BY code"
+                "SELECT code FROM languages WHERE code IN ('en', 'es', 'ja') ORDER BY code"
             ).fetchall()
         finally:
             connection.close()
@@ -407,7 +407,11 @@ class LegacyMigrationTest(unittest.TestCase):
             self.assertEqual(term["canonical_key"], "ja::回復::かいふく")
             self.assertEqual(term["language_code"], "ja")
             self.assertIsNotNone(found)
-            self.assertEqual([row["code"] for row in registered], ["ja"])
+            registered_codes = [row["code"] for row in registered]
+            # Every built-in profile is registered and captures by default; the
+            # legacy Japanese data keeps its row.
+            self.assertIn("ja", registered_codes)
+            self.assertEqual(set(registered_codes), set(languages.BUILTIN_LANGUAGES))
             self.assertIn("language_code", kanji_columns)
             self.assertIn("language_code", view_columns)
 

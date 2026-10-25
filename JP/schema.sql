@@ -15,7 +15,10 @@ CREATE TABLE IF NOT EXISTS capture_jobs (
     image_sha256 TEXT,
     image_phash TEXT,
     raw_text TEXT,
-    ocr_text_hash TEXT
+    ocr_text_hash TEXT,
+    window_title TEXT,
+    process_name TEXT,
+    capture_profile_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_created_at
@@ -34,7 +37,23 @@ CREATE TABLE IF NOT EXISTS languages (
     script TEXT NOT NULL DEFAULT 'latin',
     deck_name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    capture_enabled INTEGER NOT NULL DEFAULT 1,
     sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- A window title or process name pinned to a fixed language set: captures from
+-- that window skip language detection (one language) or restrict it (several).
+CREATE TABLE IF NOT EXISTS capture_profiles (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    window_title_pattern TEXT,
+    process_name_pattern TEXT,
+    language_codes TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 100,
+    notes TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

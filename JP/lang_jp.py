@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import hashlib
 import html
 import json
@@ -61,7 +62,23 @@ CREATE TABLE IF NOT EXISTS languages (
     script TEXT NOT NULL DEFAULT 'latin',
     deck_name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    capture_enabled INTEGER NOT NULL DEFAULT 1,
     sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+CAPTURE_PROFILE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS capture_profiles (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    window_title_pattern TEXT,
+    process_name_pattern TEXT,
+    language_codes TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 100,
+    notes TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -219,7 +236,10 @@ CREATE TABLE IF NOT EXISTS capture_jobs (
     image_sha256 TEXT,
     image_phash TEXT,
     raw_text TEXT,
-    ocr_text_hash TEXT
+    ocr_text_hash TEXT,
+    window_title TEXT,
+    process_name TEXT,
+    capture_profile_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_created_at
@@ -562,8 +582,13 @@ def ensure_language_row(
     deck_name: str | None = None,
     name: str | None = None,
     enabled: bool | None = None,
+    capture_enabled: bool | None = None,
 ) -> LanguageProfile:
-    """Make sure ``languages`` has a row for ``code`` and return its profile."""
+    """Make sure ``languages`` has a row for ``code`` and return its profile.
+
+    New rows are enabled for capture by default, so a fresh install captures
+    every registered language until the user turns some off.
+    """
     profile = get_language(code)
     existing = connection.execute(
         "SELECT code FROM languages WHERE code = ?",
@@ -573,9 +598,9 @@ def ensure_language_row(
         connection.execute(
             """
             INSERT INTO languages (
-                code, name, native_name, script, deck_name, enabled, sort_order
+                code, name, native_name, script, deck_name, enabled, capture_enabled, sort_order
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 profile.code,
@@ -584,10 +609,16 @@ def ensure_language_row(
                 profile.script,
                 deck_name or profile.deck_name,
                 1 if enabled is None or enabled else 0,
+                1 if capture_enabled is None or capture_enabled else 0,
                 0 if profile.code == DEFAULT_LANGUAGE_CODE else 100,
             ),
         )
-    elif deck_name is not None or name is not None or enabled is not None:
+    elif (
+        deck_name is not None
+        or name is not None
+        or enabled is not None
+        or capture_enabled is not None
+    ):
         connection.execute(
             """
             UPDATE languages
@@ -595,12 +626,288 @@ def ensure_language_row(
                 name = COALESCE(?, name),
                 deck_name = COALESCE(?, deck_name),
                 enabled = COALESCE(?, enabled),
+                capture_enabled = COALESCE(?, capture_enabled),
                 updated_at = CURRENT_TIMESTAMP
             WHERE code = ?
             """,
-            (name, deck_name, None if enabled is None else (1 if enabled else 0), profile.code),
+            (
+                name,
+                deck_name,
+                None if enabled is None else (1 if enabled else 0),
+                None if capture_enabled is None else (1 if capture_enabled else 0),
+                profile.code,
+            ),
         )
     return profile
+
+
+CAPTURE_LANGUAGES_ENV = "LANG_CAPTURE_LANGUAGES"
+
+
+def capture_language_codes(
+    connection: sqlite3.Connection,
+    *,
+    override: str | None = None,
+) -> tuple[str, ...]:
+    """Languages the passive capture keeps, in registry order.
+
+    The database is the source of truth (``languages.enabled`` and
+    ``languages.capture_enabled``). ``LANG_CAPTURE_LANGUAGES`` is only an
+    override for one-off runs; when it is unset the environment plays no part.
+    An empty set falls back to Japanese so the worker never runs with nothing.
+    """
+    raw = override if override is not None else os.environ.get(CAPTURE_LANGUAGES_ENV)
+    if raw is not None and raw.strip():
+        return languages.enabled_capture_languages(raw)
+    if not table_exists(connection, "languages"):
+        return (DEFAULT_LANGUAGE_CODE,)
+    rows = connection.execute(
+        """
+        SELECT code
+        FROM languages
+        WHERE enabled = 1 AND capture_enabled = 1
+        ORDER BY sort_order ASC, code ASC
+        """
+    ).fetchall()
+    codes: list[str] = []
+    for row in rows:
+        code = normalize_language_code(row["code"])
+        if code and code not in codes:
+            codes.append(code)
+    return tuple(codes) or (DEFAULT_LANGUAGE_CODE,)
+
+
+def set_language_capture_enabled(
+    connection: sqlite3.Connection,
+    code: str,
+    enabled: bool,
+) -> LanguageProfile:
+    normalized = normalize_language_code(code)
+    if not languages.is_valid_language_code(normalized):
+        raise SystemExit(f"Invalid language code: {code!r}")
+    return ensure_language_row(connection, normalized, capture_enabled=enabled)
+
+
+def set_capture_languages(
+    connection: sqlite3.Connection,
+    codes: Iterable[str],
+) -> tuple[str, ...]:
+    """Replace the capture set: the given codes capture, every other language does not."""
+    wanted: list[str] = []
+    for code in codes:
+        normalized = normalize_language_code(code)
+        if not normalized or normalized in (AUTO_LANGUAGE_CODE, ALL_LANGUAGES_CODE):
+            continue
+        if not languages.is_valid_language_code(normalized):
+            raise SystemExit(f"Invalid language code: {code!r}")
+        if normalized not in wanted:
+            wanted.append(normalized)
+    connection.execute("UPDATE languages SET capture_enabled = 0, updated_at = CURRENT_TIMESTAMP")
+    for code in wanted:
+        ensure_language_row(connection, code, capture_enabled=True)
+    return tuple(wanted)
+
+
+# ---------------------------------------------------------------------------
+# Capture profiles: a window title or process name pinned to a language set
+# ---------------------------------------------------------------------------
+
+
+def parse_language_code_list(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        if not value.strip():
+            return ()
+        return tuple(
+            code
+            for code in languages.enabled_capture_languages(value, default="")
+            if code
+        )
+    codes: list[str] = []
+    for item in value:
+        normalized = normalize_language_code(item)
+        if normalized and normalized not in codes and normalized not in (
+            AUTO_LANGUAGE_CODE,
+            ALL_LANGUAGES_CODE,
+        ):
+            codes.append(normalized)
+    return tuple(codes)
+
+
+def list_capture_profiles(
+    connection: sqlite3.Connection,
+    *,
+    enabled_only: bool = False,
+) -> list[sqlite3.Row]:
+    where_clause = "WHERE enabled = 1" if enabled_only else ""
+    return connection.execute(
+        f"""
+        SELECT
+            id, name, window_title_pattern, process_name_pattern, language_codes,
+            enabled, priority, notes, created_at, updated_at
+        FROM capture_profiles
+        {where_clause}
+        ORDER BY priority ASC, name COLLATE NOCASE ASC, id ASC
+        """
+    ).fetchall()
+
+
+def upsert_capture_profile(
+    connection: sqlite3.Connection,
+    *,
+    name: str,
+    language_codes: str | Iterable[str],
+    window_title_pattern: str | None = None,
+    process_name_pattern: str | None = None,
+    enabled: bool = True,
+    priority: int = 100,
+    notes: str | None = None,
+) -> int:
+    """Create or replace the profile called ``name`` and return its id."""
+    name = normalize_token(name)
+    if not name:
+        raise SystemExit("A capture profile needs a name.")
+    codes = parse_language_code_list(language_codes)
+    if not codes:
+        raise SystemExit("A capture profile needs at least one language code.")
+    for code in codes:
+        if not languages.is_valid_language_code(code):
+            raise SystemExit(f"Invalid language code: {code!r}")
+    window_title_pattern = normalize_token(window_title_pattern) or None
+    process_name_pattern = normalize_token(process_name_pattern) or None
+    if window_title_pattern is None and process_name_pattern is None:
+        raise SystemExit("A capture profile needs a window title pattern or a process name pattern.")
+    for code in codes:
+        ensure_language_row(connection, code)
+    existing = connection.execute(
+        "SELECT id FROM capture_profiles WHERE name = ?",
+        (name,),
+    ).fetchone()
+    joined = ",".join(codes)
+    if existing is None:
+        cursor = connection.execute(
+            """
+            INSERT INTO capture_profiles (
+                name, window_title_pattern, process_name_pattern, language_codes,
+                enabled, priority, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                window_title_pattern,
+                process_name_pattern,
+                joined,
+                1 if enabled else 0,
+                int(priority),
+                normalize_token(notes) or None,
+            ),
+        )
+        return int(cursor.lastrowid)
+    connection.execute(
+        """
+        UPDATE capture_profiles
+        SET
+            window_title_pattern = ?,
+            process_name_pattern = ?,
+            language_codes = ?,
+            enabled = ?,
+            priority = ?,
+            notes = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            window_title_pattern,
+            process_name_pattern,
+            joined,
+            1 if enabled else 0,
+            int(priority),
+            normalize_token(notes) or None,
+            existing["id"],
+        ),
+    )
+    return int(existing["id"])
+
+
+def set_capture_profile_enabled(
+    connection: sqlite3.Connection,
+    profile_id: int,
+    enabled: bool,
+) -> bool:
+    cursor = connection.execute(
+        """
+        UPDATE capture_profiles
+        SET enabled = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (1 if enabled else 0, profile_id),
+    )
+    return cursor.rowcount > 0
+
+
+def delete_capture_profile(
+    connection: sqlite3.Connection,
+    *,
+    profile_id: int | None = None,
+    name: str | None = None,
+) -> bool:
+    if profile_id is not None:
+        cursor = connection.execute("DELETE FROM capture_profiles WHERE id = ?", (profile_id,))
+    elif normalize_token(name):
+        cursor = connection.execute(
+            "DELETE FROM capture_profiles WHERE name = ?",
+            (normalize_token(name),),
+        )
+    else:
+        raise SystemExit("Pass a profile id or name to remove.")
+    return cursor.rowcount > 0
+
+
+def capture_pattern_matches(pattern: str | None, value: str | None) -> bool:
+    """Case-insensitive match: ``*``/``?`` wildcards, otherwise a substring test."""
+    pattern = normalize_token(pattern)
+    if not pattern:
+        return True
+    value = normalize_token(value)
+    if not value:
+        return False
+    haystack = value.casefold()
+    needle = pattern.casefold()
+    if any(char in needle for char in "*?["):
+        return fnmatch.fnmatchcase(haystack, needle) or fnmatch.fnmatchcase(haystack, f"*{needle}*")
+    return needle in haystack
+
+
+def match_capture_profile(
+    connection: sqlite3.Connection,
+    *,
+    window_title: str | None,
+    process_name: str | None,
+) -> sqlite3.Row | None:
+    """First enabled profile whose patterns match the foreground window, by priority."""
+    if not normalize_token(window_title) and not normalize_token(process_name):
+        return None
+    if not table_exists(connection, "capture_profiles"):
+        return None
+    for row in list_capture_profiles(connection, enabled_only=True):
+        title_pattern = normalize_token(row["window_title_pattern"]) or None
+        process_pattern = normalize_token(row["process_name_pattern"]) or None
+        if title_pattern is None and process_pattern is None:
+            continue
+        if title_pattern is not None and not capture_pattern_matches(title_pattern, window_title):
+            continue
+        if process_pattern is not None and not capture_pattern_matches(process_pattern, process_name):
+            continue
+        return row
+    return None
+
+
+def capture_profile_languages(row: sqlite3.Row | None) -> tuple[str, ...]:
+    if row is None:
+        return ()
+    return parse_language_code_list(row["language_codes"])
 
 
 def language_deck_name(connection: sqlite3.Connection, code: str | None) -> str:
@@ -623,6 +930,7 @@ def list_language_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
             l.script,
             l.deck_name,
             l.enabled,
+            l.capture_enabled,
             l.sort_order,
             (SELECT COUNT(*) FROM terms AS t WHERE t.language_code = l.code) AS term_count,
             (SELECT COUNT(*) FROM sources AS s WHERE s.language_code = l.code) AS source_count,
@@ -731,6 +1039,14 @@ def ensure_language_columns(connection: sqlite3.Connection) -> bool:
     """
     changed = False
     connection.executescript(LANGUAGE_SCHEMA_SQL)
+    if "capture_enabled" not in table_columns(connection, "languages"):
+        connection.execute(
+            """
+            ALTER TABLE languages
+            ADD COLUMN capture_enabled INTEGER NOT NULL DEFAULT 1
+            """
+        )
+        changed = True
     if table_exists(connection, "terms"):
         term_columns = table_columns(connection, "terms")
         if "language_code" not in term_columns:
@@ -790,8 +1106,11 @@ def ensure_language_columns(connection: sqlite3.Connection) -> bool:
                 """
             )
             changed = True
-    # Register every language that already has data, Japanese first.
-    seen_codes = {DEFAULT_LANGUAGE_CODE}
+    # Register every built-in profile plus every language that already has data,
+    # Japanese first. New rows capture by default: a fresh catalog (and an
+    # upgraded one) catalogs every language that shows up on screen until the
+    # user narrows the capture set from the tray, the web UI or the CLI.
+    seen_codes = {DEFAULT_LANGUAGE_CODE, *languages.BUILTIN_LANGUAGES}
     for table_name in ("sources", "terms"):
         if not table_exists(connection, table_name):
             continue
@@ -824,12 +1143,23 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
                 """
             )
             changed = True
+        for column_name, column_type in (
+            ("window_title", "TEXT"),
+            ("process_name", "TEXT"),
+            ("capture_profile_id", "INTEGER"),
+        ):
+            if column_name not in capture_job_columns:
+                connection.execute(
+                    f"ALTER TABLE capture_jobs ADD COLUMN {column_name} {column_type}"
+                )
+                changed = True
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_updated_at
                 ON capture_jobs(status, updated_at)
             """
         )
+    connection.executescript(CAPTURE_PROFILE_SCHEMA_SQL)
     if table_exists(connection, "flashcards"):
         flashcard_columns = table_columns(connection, "flashcards")
         if "anki_note_id" not in flashcard_columns:
@@ -1370,6 +1700,8 @@ def create_capture_job(
     temp_image_path: str,
     image_sha256: str | None,
     image_phash: str | None,
+    window_title: str | None = None,
+    process_name: str | None = None,
 ) -> int:
     temp_image_path = normalize_repo_storage_path(temp_image_path) or temp_image_path
     cursor = connection.execute(
@@ -1378,11 +1710,20 @@ def create_capture_job(
             captured_at,
             temp_image_path,
             image_sha256,
-            image_phash
+            image_phash,
+            window_title,
+            process_name
         )
-        VALUES (?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (captured_at, temp_image_path, image_sha256, image_phash),
+        (
+            captured_at,
+            temp_image_path,
+            image_sha256,
+            image_phash,
+            normalize_token(window_title) or None,
+            normalize_token(process_name) or None,
+        ),
     )
     return int(cursor.lastrowid)
 
@@ -1443,6 +1784,7 @@ def update_capture_job_status(
     final_image_path: str | None = None,
     raw_text: str | None = None,
     ocr_text_hash: str | None = None,
+    capture_profile_id: int | None = None,
 ) -> None:
     final_image_path = normalize_repo_storage_path(final_image_path)
     connection.execute(
@@ -1454,10 +1796,19 @@ def update_capture_job_status(
             updated_at = CURRENT_TIMESTAMP,
             final_image_path = COALESCE(?, final_image_path),
             raw_text = COALESCE(?, raw_text),
-            ocr_text_hash = COALESCE(?, ocr_text_hash)
+            ocr_text_hash = COALESCE(?, ocr_text_hash),
+            capture_profile_id = COALESCE(?, capture_profile_id)
         WHERE id = ?
         """,
-        (status, last_error, final_image_path, raw_text, ocr_text_hash, job_id),
+        (
+            status,
+            last_error,
+            final_image_path,
+            raw_text,
+            ocr_text_hash,
+            capture_profile_id,
+            job_id,
+        ),
     )
 
 
@@ -3080,11 +3431,16 @@ def recover_stale_capture_jobs_command(args: argparse.Namespace) -> None:
 
 
 def list_sources(args: argparse.Namespace) -> None:
+    language_sql, params = language_filter_clause(
+        "language_code", getattr(args, "language", None)
+    )
+    where_clause = f"WHERE {language_sql}" if language_sql else ""
     with db_connect(args.db) as connection:
         raw_rows = connection.execute(
-            """
+            f"""
             SELECT
                 id,
+                language_code,
                 source_type,
                 review_status,
                 COALESCE(title, '(untitled)') AS title,
@@ -3094,10 +3450,11 @@ def list_sources(args: argparse.Namespace) -> None:
                 image_height,
                 COALESCE(captured_at, created_at) AS seen_at
             FROM sources
+            {where_clause}
             ORDER BY seen_at DESC, id DESC
             LIMIT ?
             """,
-            (args.limit,),
+            [*params, args.limit],
         ).fetchall()
         rows = []
         for row in raw_rows:
@@ -3111,6 +3468,7 @@ def list_sources(args: argparse.Namespace) -> None:
             rows.append(
                 {
                     "id": row["id"],
+                    "language_code": row["language_code"],
                     "source_type": row["source_type"],
                     "review_status": row["review_status"],
                     "title": row["title"],
@@ -3121,7 +3479,16 @@ def list_sources(args: argparse.Namespace) -> None:
             )
     print_rows(
         rows,
-        ("id", "source_type", "review_status", "title", "resolution", "scene", "seen_at"),
+        (
+            "id",
+            "language_code",
+            "source_type",
+            "review_status",
+            "title",
+            "resolution",
+            "scene",
+            "seen_at",
+        ),
     )
 
 
@@ -3356,6 +3723,7 @@ def list_terms(args: argparse.Namespace) -> None:
 def list_languages(args: argparse.Namespace) -> None:
     with db_connect(args.db) as connection:
         rows = list_language_rows(connection)
+        capture_codes = capture_language_codes(connection)
     print_rows(
         rows,
         (
@@ -3364,17 +3732,26 @@ def list_languages(args: argparse.Namespace) -> None:
             "script",
             "deck_name",
             "enabled",
+            "capture_enabled",
             "term_count",
             "source_count",
             "pending_flashcards",
         ),
     )
+    override = os.environ.get(CAPTURE_LANGUAGES_ENV)
+    suffix = f" (override from {CAPTURE_LANGUAGES_ENV})" if override and override.strip() else ""
+    print(f"capture languages: {', '.join(capture_codes)}{suffix}")
 
 
 def enable_language_command(args: argparse.Namespace) -> None:
     code = normalize_language_code(args.code)
     if not languages.is_valid_language_code(code):
         raise SystemExit(f"Invalid language code: {args.code!r}")
+    capture_enabled: bool | None = None
+    if getattr(args, "capture", False):
+        capture_enabled = True
+    elif getattr(args, "no_capture", False):
+        capture_enabled = False
     with db_connect(args.db) as connection:
         profile = ensure_language_row(
             connection,
@@ -3382,13 +3759,105 @@ def enable_language_command(args: argparse.Namespace) -> None:
             deck_name=args.deck_name,
             name=args.name,
             enabled=not args.disable,
+            capture_enabled=capture_enabled,
         )
         row = connection.execute(
-            "SELECT code, name, deck_name, enabled FROM languages WHERE code = ?",
+            "SELECT code, name, deck_name, enabled, capture_enabled FROM languages WHERE code = ?",
             (profile.code,),
         ).fetchone()
     state = "enabled" if row["enabled"] else "disabled"
-    print(f"Language {row['code']} ({row['name']}) {state}, deck={row['deck_name']}")
+    capture_state = "capture on" if row["capture_enabled"] else "capture off"
+    print(f"Language {row['code']} ({row['name']}) {state}, {capture_state}, deck={row['deck_name']}")
+
+
+def set_capture_languages_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        if args.all:
+            codes = tuple(languages.BUILTIN_LANGUAGES)
+            for code in codes:
+                ensure_language_row(connection, code, capture_enabled=True)
+            connection.execute(
+                "UPDATE languages SET capture_enabled = 1, updated_at = CURRENT_TIMESTAMP"
+            )
+        else:
+            codes = set_capture_languages(connection, parse_language_code_list(args.codes))
+        effective = capture_language_codes(connection, override="")
+    print(f"capture languages: {', '.join(effective) if effective else '(none)'}")
+    if not codes and not args.all:
+        print("No codes given; nothing is enabled for capture (the worker falls back to ja).")
+
+
+def list_capture_profiles_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        rows = list_capture_profiles(connection)
+    print_rows(
+        [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "window_title_pattern": row["window_title_pattern"] or "-",
+                "process_name_pattern": row["process_name_pattern"] or "-",
+                "language_codes": row["language_codes"],
+                "enabled": row["enabled"],
+                "priority": row["priority"],
+            }
+            for row in rows
+        ],
+        (
+            "id",
+            "name",
+            "window_title_pattern",
+            "process_name_pattern",
+            "language_codes",
+            "enabled",
+            "priority",
+        ),
+    )
+
+
+def add_capture_profile_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        profile_id = upsert_capture_profile(
+            connection,
+            name=args.name,
+            language_codes=args.languages,
+            window_title_pattern=args.window_pattern,
+            process_name_pattern=args.process_pattern,
+            enabled=not args.disable,
+            priority=args.priority,
+            notes=args.notes,
+        )
+        row = connection.execute(
+            "SELECT * FROM capture_profiles WHERE id = ?",
+            (profile_id,),
+        ).fetchone()
+    print(
+        f"Capture profile #{row['id']} {row['name']}: languages={row['language_codes']} "
+        f"window={row['window_title_pattern'] or '-'} process={row['process_name_pattern'] or '-'} "
+        f"enabled={row['enabled']}"
+    )
+
+
+def remove_capture_profile_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        removed = delete_capture_profile(connection, profile_id=args.id, name=args.name)
+    if removed:
+        print("Capture profile removed.")
+    else:
+        raise SystemExit("No capture profile matched.")
+
+
+def match_capture_profile_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        row = match_capture_profile(
+            connection,
+            window_title=args.window_title,
+            process_name=args.process_name,
+        )
+    if row is None:
+        print("No capture profile matches; the worker would use the capture language set.")
+        return
+    print(f"Capture profile #{row['id']} {row['name']} -> {row['language_codes']}")
 
 
 def detect_language_command(args: argparse.Namespace) -> None:
@@ -6527,6 +6996,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show recent sources.",
     )
     list_sources_parser.add_argument("--limit", type=int, default=20)
+    list_sources_parser.add_argument(
+        "--language",
+        default=ALL_LANGUAGES_CODE,
+        help="Only show sources of one language (default: all).",
+    )
     list_sources_parser.set_defaults(func=list_sources)
 
     review_sources_parser = subparsers.add_parser(
@@ -6607,7 +7081,82 @@ def build_parser() -> argparse.ArgumentParser:
     enable_language_parser.add_argument("--name")
     enable_language_parser.add_argument("--deck-name")
     enable_language_parser.add_argument("--disable", action="store_true")
+    capture_flag_group = enable_language_parser.add_mutually_exclusive_group()
+    capture_flag_group.add_argument(
+        "--capture",
+        action="store_true",
+        help="Keep this language when the passive capture sorts OCR text.",
+    )
+    capture_flag_group.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Drop this language from the passive capture (the catalog keeps its data).",
+    )
     enable_language_parser.set_defaults(func=enable_language_command)
+
+    set_capture_languages_parser = subparsers.add_parser(
+        "set-capture-languages",
+        help="Replace the set of languages the passive capture keeps (stored in the database).",
+    )
+    capture_set_group = set_capture_languages_parser.add_mutually_exclusive_group(required=True)
+    capture_set_group.add_argument(
+        "--codes",
+        help="Comma-separated codes to capture, for example ja,en,es,ko.",
+    )
+    capture_set_group.add_argument(
+        "--all",
+        action="store_true",
+        help="Capture every built-in language (the default for a fresh install).",
+    )
+    set_capture_languages_parser.set_defaults(func=set_capture_languages_command)
+
+    list_capture_profiles_parser = subparsers.add_parser(
+        "list-capture-profiles",
+        help="Show window/process patterns pinned to a fixed language set.",
+    )
+    list_capture_profiles_parser.set_defaults(func=list_capture_profiles_command)
+
+    add_capture_profile_parser = subparsers.add_parser(
+        "add-capture-profile",
+        help="Create or replace a capture profile that pins a window to a language set.",
+    )
+    add_capture_profile_parser.add_argument("--name", required=True)
+    add_capture_profile_parser.add_argument(
+        "--languages",
+        required=True,
+        help="Comma-separated codes, for example es or es,en. One code skips detection.",
+    )
+    add_capture_profile_parser.add_argument(
+        "--window-pattern",
+        help="Case-insensitive substring or wildcard (*, ?) matched against the window title.",
+    )
+    add_capture_profile_parser.add_argument(
+        "--process-pattern",
+        help="Case-insensitive substring or wildcard matched against the process name (game.exe).",
+    )
+    add_capture_profile_parser.add_argument("--priority", type=int, default=100)
+    add_capture_profile_parser.add_argument("--notes")
+    add_capture_profile_parser.add_argument("--disable", action="store_true")
+    add_capture_profile_parser.set_defaults(func=add_capture_profile_command)
+
+    remove_capture_profile_parser = subparsers.add_parser(
+        "remove-capture-profile",
+        help="Delete a capture profile by id or name.",
+    )
+    remove_capture_profile_group = remove_capture_profile_parser.add_mutually_exclusive_group(
+        required=True
+    )
+    remove_capture_profile_group.add_argument("--id", type=int)
+    remove_capture_profile_group.add_argument("--name")
+    remove_capture_profile_parser.set_defaults(func=remove_capture_profile_command)
+
+    match_capture_profile_parser = subparsers.add_parser(
+        "match-capture-profile",
+        help="Show which capture profile a window title/process name would select.",
+    )
+    match_capture_profile_parser.add_argument("--window-title")
+    match_capture_profile_parser.add_argument("--process-name")
+    match_capture_profile_parser.set_defaults(func=match_capture_profile_command)
 
     detect_language_parser = subparsers.add_parser(
         "detect-language",

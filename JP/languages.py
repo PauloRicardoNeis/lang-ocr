@@ -658,15 +658,22 @@ class GenericAnalyzer:
         self._simplemma = _simplemma_module()
 
     def lemmatize(self, surface: str) -> str:
-        if self._simplemma is not None:
-            try:
-                lemma = self._simplemma.lemmatize(surface, lang=self._base)
-                if lemma:
-                    return lemma
-            except (ValueError, KeyError, TypeError):
-                pass
+        # Acronyms and UI labels (HP, START) keep their case so they stay recognizable.
         if len(surface) > 1 and surface.isupper():
             return surface
+        if self._simplemma is not None:
+            try:
+                # A real inflection ("Häuser" -> "Haus") wins as is; a token simplemma
+                # leaves untouched is retried lower-cased so sentence-initial words
+                # ("Press") merge with their lower-case form ("press").
+                lemma = self._simplemma.lemmatize(surface, lang=self._base)
+                if lemma and lemma != surface:
+                    return lemma
+                lowered = self._simplemma.lemmatize(surface.lower(), lang=self._base)
+                if lowered:
+                    return lowered
+            except (ValueError, KeyError, TypeError):
+                pass
         return surface.lower()
 
     def analyze(self, text: str) -> list[Token]:
