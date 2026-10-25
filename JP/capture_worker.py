@@ -20,17 +20,21 @@ from typing import Any
 
 import languages
 from lang_jp import (
+    CAPTURE_LANGUAGES_ENV,
     DEFAULT_DB_PATH,
     DEFAULT_LANGUAGE_CODE,
     ROOT,
     approve_source_analysis_candidates,
     build_segment_candidates,
+    capture_language_codes,
+    capture_profile_languages,
     claim_next_source_translation,
     claim_next_capture_job,
     create_source_analysis_segment,
     create_source_record,
     db_connect,
     find_source_by_image_sha256,
+    match_capture_profile,
     normalize_token,
     read_existing_kanji_match,
     read_existing_term_match,
@@ -43,20 +47,28 @@ from lang_jp import (
 )
 from ocr_backends import (
     EasyOcrBackend,
-    MeikiOcrBackend,
     OcrBlock,
+    OcrEnginePlan,
     contains_japanese_chars,
     filter_ocr_line_boxes,
+    get_easyocr_backend,
+    get_meikiocr_backend,
     group_ocr_blocks_into_regions,
     is_horizontal_bbox,
+    merge_engine_blocks,
     ocr_line_boxes_to_blocks,
+    plan_ocr_engines,
     resolve_capture_ocr_backend,
+    scale_ocr_blocks,
     sort_ocr_blocks_reading_order,
 )
 
 
+# The database decides which languages are captured (languages.capture_enabled);
+# LANG_CAPTURE_LANGUAGES is only an override for one-off runs. This module-level
+# default is what callers without a database connection (tests, diagnostics) get.
 DEFAULT_CAPTURE_LANGUAGES = languages.enabled_capture_languages(
-    os.environ.get("LANG_CAPTURE_LANGUAGES"),
+    os.environ.get(CAPTURE_LANGUAGES_ENV),
     default=DEFAULT_LANGUAGE_CODE,
 )
 DEFAULT_CAPTURE_DIR = ROOT / "data" / "captures"
@@ -87,6 +99,7 @@ DEFAULT_SOURCE_TRANSLATION_TARGET = os.environ.get(
 JOB_PROGRESS_BAR_WIDTH = 12
 JOB_PROGRESS_PERCENT_BY_STEP_STATUS: dict[tuple[str, str | None], int] = {
     ("start", None): 0,
+    ("languages", None): 4,
     ("ocr_input", None): 10,
     ("ocr", "start"): 18,
     ("ocr", "running"): 24,
@@ -379,6 +392,35 @@ def contains_japanese_text(value: str | None) -> bool:
     return contains_japanese_chars(value)
 
 
+def resolve_capture_languages(connection) -> tuple[str, ...]:
+    """Languages the worker keeps right now: env override, else the database flags."""
+    return capture_language_codes(connection)
+
+
+def resolve_job_languages(
+    connection,
+    *,
+    window_title: str | None,
+    process_name: str | None,
+) -> tuple[tuple[str, ...], Any, bool]:
+    """``(languages, profile_row, forced)`` for one capture.
+
+    A matching capture profile pins the languages: one code skips detection
+    entirely (``forced``), several restrict it. Otherwise the capture set from
+    the database applies and every block is detected against it.
+    """
+    profile = match_capture_profile(
+        connection,
+        window_title=window_title,
+        process_name=process_name,
+    )
+    if profile is not None:
+        codes = capture_profile_languages(profile)
+        if codes:
+            return codes, profile, len(codes) == 1
+    return resolve_capture_languages(connection), None, False
+
+
 def contains_target_language_text(
     value: str | None,
     *,
@@ -638,12 +680,15 @@ def run_with_progress_logs(
         )
 
 
-def filter_easyocr_blocks(blocks: list[OcrBlock]) -> tuple[list[OcrBlock], dict[str, int]]:
+def filter_easyocr_blocks(
+    blocks: list[OcrBlock],
+    enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+) -> tuple[list[OcrBlock], dict[str, int]]:
     stats = {
         "detected": len(blocks),
         "kept": 0,
         "empty": 0,
-        "non_japanese": 0,
+        "off_language": 0,
         "vertical": 0,
         "low_confidence": 0,
         "missing_bbox": 0,
@@ -657,8 +702,8 @@ def filter_easyocr_blocks(blocks: list[OcrBlock]) -> tuple[list[OcrBlock], dict[
         if block.confidence is not None and block.confidence < DEFAULT_OCR_MIN_CONFIDENCE:
             stats["low_confidence"] += 1
             continue
-        if not contains_target_language_text(text):
-            stats["non_japanese"] += 1
+        if not contains_target_language_text(text, enabled_languages=enabled_languages):
+            stats["off_language"] += 1
             continue
         if block.bbox is None:
             stats["missing_bbox"] += 1
@@ -711,8 +756,13 @@ def crop_image_region(
     )
 
 
-def count_japanese_characters(value: str) -> int:
-    return sum(1 for char in value if contains_japanese_chars(char))
+def count_text_letters(value: str) -> int:
+    """Letters of any script (kana, kanji, Latin, Hangul...): what makes a region worth reading."""
+    return sum(languages.script_histogram(value).values())
+
+
+# Backwards-compatible name from the Japanese-only worker.
+count_japanese_characters = count_text_letters
 
 
 def score_region(
@@ -727,7 +777,7 @@ def score_region(
     image_height: int,
     blocks_in_region: int,
 ) -> float:
-    japanese_chars = count_japanese_characters(text)
+    japanese_chars = count_text_letters(text)
     line_count = len([line for line in text.splitlines() if line.strip()])
     region_width = max(1, right - left)
     region_height = max(1, bottom - top)
@@ -755,9 +805,20 @@ def score_region(
 
 
 class EasyOcrAdapter:
+    """Legacy single-engine EasyOCR flow (``LANG_JP_OCR_BACKEND=easyocr``).
+
+    Reads the downscaled capture, groups boxes into regions, re-reads the best
+    regions and keeps the top ones. Languages come from ``LANG_JP_EASYOCR_LANGS``.
+    """
+
     downscales_input = True
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+    ) -> None:
+        self.enabled_languages = tuple(enabled_languages) or (DEFAULT_LANGUAGE_CODE,)
         self._engine = EasyOcrBackend()
         append_worker_log(
             build_log_event(
@@ -767,6 +828,7 @@ class EasyOcrAdapter:
                 gpu=getattr(self._engine, "gpu_enabled", None),
                 gpu_mode=getattr(self._engine, "gpu_mode", None),
                 languages=",".join(getattr(self._engine, "languages", ())),
+                capture_languages=",".join(self.enabled_languages),
                 min_conf=DEFAULT_OCR_MIN_CONFIDENCE,
                 min_ratio=DEFAULT_OCR_HORIZONTAL_MIN_RATIO,
                 max_angle=DEFAULT_OCR_HORIZONTAL_MAX_ANGLE,
@@ -794,7 +856,7 @@ class EasyOcrAdapter:
         label = progress_label or build_log_event("step=ocr", image=image_path)
         try:
             detected_blocks = run_with_progress_logs(label, do_read, echo_stdout=echo_stdout)
-            kept_blocks, stats = filter_easyocr_blocks(detected_blocks)
+            kept_blocks, stats = filter_easyocr_blocks(detected_blocks, self.enabled_languages)
             grouped_regions = group_ocr_blocks_into_regions(kept_blocks)
             append_worker_log(
                 build_log_event(
@@ -803,7 +865,7 @@ class EasyOcrAdapter:
                     boxes=stats["detected"],
                     kept=stats["kept"],
                     regions=len(grouped_regions),
-                    drop_non_jp=stats["non_japanese"],
+                    drop_off_lang=stats["off_language"],
                     drop_vertical=stats["vertical"],
                     drop_low_conf=stats["low_confidence"],
                     drop_no_bbox=stats["missing_bbox"],
@@ -832,7 +894,9 @@ class EasyOcrAdapter:
                         bottom=region.bottom,
                     )
                     rerun_blocks = self._engine.read_blocks(crop)
-                    rerun_kept_blocks, rerun_stats = filter_easyocr_blocks(rerun_blocks)
+                    rerun_kept_blocks, rerun_stats = filter_easyocr_blocks(
+                        rerun_blocks, self.enabled_languages
+                    )
                     region_text = "\n".join(block.text for block in rerun_kept_blocks if block.text)
                     region_confidence: float | None = None
                     if rerun_kept_blocks:
@@ -906,11 +970,18 @@ class EasyOcrAdapter:
 
 
 class MeikiOcrAdapter:
+    """The Japanese pass: meikiocr on the full-resolution capture with the Japanese filters.
+
+    meikiocr is Japanese-only, so this adapter is exactly the pre-polyglot flow
+    and is reused unchanged inside :class:`MultiEngineOcrAdapter`.
+    """
+
     # One pass on the full-resolution capture; meikiocr resizes internally for detection.
     downscales_input = False
+    engine_name = "meikiocr"
 
     def __init__(self) -> None:
-        self._engine = MeikiOcrBackend()
+        self._engine = get_meikiocr_backend()
         append_worker_log(
             build_log_event(
                 "worker",
@@ -935,7 +1006,7 @@ class MeikiOcrAdapter:
 
         label = progress_label or build_log_event("step=ocr", image=image_path)
         line_boxes = run_with_progress_logs(label, do_read, echo_stdout=echo_stdout)
-        kept_boxes, stats = filter_ocr_line_boxes(line_boxes)
+        kept_boxes, stats = filter_ocr_line_boxes(line_boxes, language_codes=("ja",))
         blocks = [
             OcrBlock(text=normalize_token(block.text), confidence=block.confidence, bbox=block.bbox)
             for block in ocr_line_boxes_to_blocks(kept_boxes)
@@ -944,10 +1015,11 @@ class MeikiOcrAdapter:
             build_log_event(
                 label,
                 status="filter",
+                engine="meikiocr",
                 boxes=stats["detected"],
                 kept=stats["kept"],
                 rows=len(blocks),
-                drop_non_jp=stats["non_japanese"],
+                drop_off_lang=stats["off_language"],
                 drop_contained=stats["contained"],
                 drop_furigana=stats["furigana"],
             )
@@ -955,13 +1027,187 @@ class MeikiOcrAdapter:
         return blocks
 
 
-CaptureOcrAdapter = EasyOcrAdapter | MeikiOcrAdapter
+def downscale_for_easyocr(image, *, max_side: int = DEFAULT_OCR_MAX_SIDE):
+    """``(image, factor)``: the image EasyOCR reads and how to map its boxes back."""
+    from PIL import Image
+
+    width, height = image.size
+    longest = max(width, height)
+    if max_side <= 0 or longest <= max_side:
+        return image, 1.0
+    scale = max_side / float(longest)
+    resampling = getattr(Image, "Resampling", Image)
+    resized = image.resize(
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        resampling.LANCZOS,
+    )
+    return resized, 1.0 / scale
 
 
-def build_capture_ocr_adapter(name: str | None = None) -> CaptureOcrAdapter:
-    if resolve_capture_ocr_backend(name) == "easyocr":
-        return EasyOcrAdapter()
-    return MeikiOcrAdapter()
+class EasyOcrGroupAdapter:
+    """One EasyOCR reader for one compatible language group, single full-image pass.
+
+    Used for the non-Japanese languages next to meikiocr. Boxes come back in the
+    capture's full-resolution coordinates so they can be merged with meikiocr's.
+    """
+
+    downscales_input = False
+
+    def __init__(
+        self,
+        group: tuple[str, ...],
+        *,
+        enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+    ) -> None:
+        self.group = tuple(group)
+        self.enabled_languages = tuple(enabled_languages) or (DEFAULT_LANGUAGE_CODE,)
+        self.engine_name = "easyocr:" + "+".join(self.group)
+        self._engine = get_easyocr_backend(self.group)
+        append_worker_log(
+            build_log_event(
+                "worker",
+                step="ocr_init",
+                engine=self.engine_name,
+                gpu=getattr(self._engine, "gpu_enabled", None),
+                capture_languages=",".join(self.enabled_languages),
+                min_conf=DEFAULT_OCR_MIN_CONFIDENCE,
+                max_side=DEFAULT_OCR_MAX_SIDE,
+            )
+        )
+
+    def extract_blocks(
+        self,
+        image_path: Path,
+        *,
+        prepared: bool = False,
+        progress_label: str | None = None,
+        echo_stdout: bool = False,
+    ) -> list[OcrBlock]:
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise SystemExit("Pillow is required to prepare OCR input images.") from exc
+
+        label = progress_label or build_log_event("step=ocr", image=image_path)
+
+        def do_read() -> tuple[list[OcrBlock], float]:
+            with Image.open(image_path) as image_file:
+                rgb = image_file.convert("RGB")
+            target, factor = downscale_for_easyocr(rgb)
+            return self._engine.read_blocks(target), factor
+
+        detected_blocks, factor = run_with_progress_logs(
+            f"{label} engine={self.engine_name}", do_read, echo_stdout=echo_stdout
+        )
+        kept_blocks, stats = filter_easyocr_blocks(detected_blocks, self.enabled_languages)
+        blocks = scale_ocr_blocks(kept_blocks, factor)
+        append_worker_log(
+            build_log_event(
+                label,
+                status="filter",
+                engine=self.engine_name,
+                boxes=stats["detected"],
+                kept=stats["kept"],
+                drop_off_lang=stats["off_language"],
+                drop_vertical=stats["vertical"],
+                drop_low_conf=stats["low_confidence"],
+                drop_no_bbox=stats["missing_bbox"],
+                drop_empty=stats["empty"],
+            )
+        )
+        return blocks
+
+
+class MultiEngineOcrAdapter:
+    """meikiocr for Japanese plus one EasyOCR reader per language group, merged.
+
+    Every engine reads the whole capture; blocks are merged by bounding-box
+    overlap and text similarity, earlier engines (meikiocr first) winning ties.
+    """
+
+    downscales_input = False
+
+    def __init__(
+        self,
+        plan: OcrEnginePlan,
+        *,
+        enabled_languages: tuple[str, ...] | None = None,
+    ) -> None:
+        self.plan = plan
+        self.enabled_languages = tuple(enabled_languages or plan.language_codes)
+        self.engines: list[MeikiOcrAdapter | EasyOcrGroupAdapter] = []
+        if plan.use_meikiocr:
+            self.engines.append(MeikiOcrAdapter())
+        for group in plan.easyocr_groups:
+            self.engines.append(
+                EasyOcrGroupAdapter(group, enabled_languages=self.enabled_languages)
+            )
+        self.engine_name = "+".join(engine.engine_name for engine in self.engines) or "none"
+        append_worker_log(
+            build_log_event(
+                "worker",
+                step="ocr_plan",
+                backend=plan.backend,
+                languages=",".join(plan.language_codes),
+                engines=",".join(plan.engine_names) or "none",
+                no_engine_for=",".join(plan.unsupported) or None,
+            )
+        )
+
+    def extract_blocks(
+        self,
+        image_path: Path,
+        *,
+        prepared: bool = False,
+        progress_label: str | None = None,
+        echo_stdout: bool = False,
+    ) -> list[OcrBlock]:
+        label = progress_label or build_log_event("step=ocr", image=image_path)
+        groups: list[list[OcrBlock]] = []
+        for engine in self.engines:
+            groups.append(
+                engine.extract_blocks(
+                    image_path,
+                    prepared=prepared,
+                    progress_label=progress_label,
+                    echo_stdout=echo_stdout,
+                )
+            )
+        merged = merge_engine_blocks(groups)
+        append_worker_log(
+            build_log_event(
+                label,
+                status="merge",
+                engines=",".join(engine.engine_name for engine in self.engines),
+                per_engine=",".join(str(len(group)) for group in groups),
+                merged=len(merged),
+            )
+        )
+        return merged
+
+
+CaptureOcrAdapter = EasyOcrAdapter | MeikiOcrAdapter | EasyOcrGroupAdapter | MultiEngineOcrAdapter
+
+
+def build_capture_ocr_adapter(
+    name: str | None = None,
+    *,
+    enabled_languages: tuple[str, ...] | None = None,
+) -> CaptureOcrAdapter:
+    """OCR engines for the enabled languages (plan item C4).
+
+    ``auto`` (default): meikiocr alone for a Japanese-only set, otherwise
+    meikiocr plus one EasyOCR reader per compatible language group, merged.
+    ``meikiocr`` / ``easyocr`` force the old single-engine flows.
+    """
+    codes = tuple(enabled_languages or DEFAULT_CAPTURE_LANGUAGES)
+    backend = resolve_capture_ocr_backend(name)
+    if backend == "easyocr":
+        return EasyOcrAdapter(enabled_languages=codes)
+    plan = plan_ocr_engines(codes, backend=backend)
+    if plan.use_meikiocr and not plan.easyocr_groups:
+        return MeikiOcrAdapter()
+    return MultiEngineOcrAdapter(plan, enabled_languages=codes)
 
 
 class LanguageSegmentAnalyzer:
@@ -974,8 +1220,15 @@ class LanguageSegmentAnalyzer:
     mix languages.
     """
 
-    def __init__(self, enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES) -> None:
+    def __init__(
+        self,
+        enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+        *,
+        forced_language: str | None = None,
+    ) -> None:
         self.enabled_languages = tuple(enabled_languages) or (DEFAULT_LANGUAGE_CODE,)
+        # A capture profile with a single language pins every block to it (no detection).
+        self.forced_language = languages.normalize_language_code(forced_language) or None
         # Fail early when an enabled language needs a dependency that is missing.
         for code in self.enabled_languages:
             try:
@@ -987,6 +1240,7 @@ class LanguageSegmentAnalyzer:
                 "worker",
                 step="analyzer_init",
                 languages=",".join(self.enabled_languages),
+                forced=self.forced_language,
             )
         )
 
@@ -1000,7 +1254,7 @@ class LanguageSegmentAnalyzer:
             return []
         runs = languages.analyze_text(
             normalized_text,
-            language=languages.AUTO_LANGUAGE_CODE,
+            language=self.forced_language or languages.AUTO_LANGUAGE_CODE,
             candidates=self.enabled_languages,
         )
         if not runs:
@@ -1053,6 +1307,53 @@ class LanguageSegmentAnalyzer:
 SudachiAnalyzer = LanguageSegmentAnalyzer
 
 
+class CapturePipeline:
+    """OCR adapters and analyzers per language set, built once and reused.
+
+    The capture set can change between jobs (tray menu, web UI, CLI, capture
+    profiles), so each job asks for the adapter matching its languages. Readers
+    are cached inside ``ocr_backends`` as well, so switching sets never reloads
+    a model that is already in memory.
+    """
+
+    def __init__(self, *, backend: str | None = None) -> None:
+        self.backend = backend
+        self._adapters: dict[tuple[str, ...], CaptureOcrAdapter] = {}
+        self._analyzers: dict[tuple[tuple[str, ...], str | None], LanguageSegmentAnalyzer] = {}
+
+    def ocr_for(self, codes: tuple[str, ...]) -> CaptureOcrAdapter:
+        key = tuple(codes) or (DEFAULT_LANGUAGE_CODE,)
+        adapter = self._adapters.get(key)
+        if adapter is None:
+            adapter = build_capture_ocr_adapter(self.backend, enabled_languages=key)
+            self._adapters[key] = adapter
+        return adapter
+
+    def analyzer_for(
+        self,
+        codes: tuple[str, ...],
+        *,
+        forced_language: str | None = None,
+    ) -> LanguageSegmentAnalyzer:
+        key = (tuple(codes) or (DEFAULT_LANGUAGE_CODE,), forced_language)
+        analyzer = self._analyzers.get(key)
+        if analyzer is None:
+            analyzer = LanguageSegmentAnalyzer(key[0], forced_language=forced_language)
+            self._analyzers[key] = analyzer
+        return analyzer
+
+    def warm_up(self, db_path: Path) -> tuple[str, ...]:
+        """Load the engines for the current capture set so the first job is not slow."""
+        connection = db_connect(db_path)
+        try:
+            codes = resolve_capture_languages(connection)
+        finally:
+            connection.close()
+        self.ocr_for(codes)
+        self.analyzer_for(codes)
+        return codes
+
+
 def dominant_block_language(
     analyzed_blocks: list[list[tuple[dict[str, Any], list[dict[str, Any]]]]],
     *,
@@ -1073,20 +1374,65 @@ def dominant_block_language(
     return code, round(letters / total, 3)
 
 
+def job_field(job, name: str) -> str | None:
+    """Column that may be missing on databases created before the column existed."""
+    try:
+        keys = job.keys()
+    except AttributeError:
+        return None
+    if name not in keys:
+        return None
+    value = job[name]
+    return str(value) if value not in (None, "") else None
+
+
 def process_job_once(
     db_path: Path,
     *,
-    ocr: CaptureOcrAdapter,
-    analyzer: LanguageSegmentAnalyzer,
+    ocr: CaptureOcrAdapter | None = None,
+    analyzer: LanguageSegmentAnalyzer | None = None,
     translator: GoogleGtxSourceTranslator | None,
+    pipeline: CapturePipeline | None = None,
 ) -> bool:
+    """Process one capture job.
+
+    With a ``pipeline`` the languages come from the job's capture profile or the
+    database capture set and the matching OCR adapter and analyzer are picked per
+    job. Explicit ``ocr``/``analyzer`` arguments pin them instead (tests, forced
+    single-engine runs).
+    """
     connection = db_connect(db_path)
     try:
         job = claim_next_capture_job(connection)
+        window_title = job_field(job, "window_title") if job is not None else None
+        process_name = job_field(job, "process_name") if job is not None else None
+        enabled_languages: tuple[str, ...]
+        capture_profile = None
+        forced_language: str | None = None
+        if job is not None:
+            if analyzer is not None and ocr is not None:
+                enabled_languages = getattr(analyzer, "enabled_languages", DEFAULT_CAPTURE_LANGUAGES)
+                capture_profile = match_capture_profile(
+                    connection, window_title=window_title, process_name=process_name
+                )
+            else:
+                enabled_languages, capture_profile, forced = resolve_job_languages(
+                    connection, window_title=window_title, process_name=process_name
+                )
+                forced_language = enabled_languages[0] if forced else None
     finally:
         connection.close()
     if job is None:
         return False
+
+    if ocr is None or analyzer is None:
+        active_pipeline = pipeline or CapturePipeline()
+        if ocr is None:
+            ocr = active_pipeline.ocr_for(enabled_languages)
+        if analyzer is None:
+            analyzer = active_pipeline.analyzer_for(
+                enabled_languages, forced_language=forced_language
+            )
 
     job_id = int(job["id"])
     probe = WorkerJobProbe(job_id)
@@ -1095,11 +1441,21 @@ def process_job_once(
         temp_image_path = Path(str(job["temp_image_path"]))
     image_sha256 = job["image_sha256"]
     captured_at = job["captured_at"]
+    capture_profile_id = int(capture_profile["id"]) if capture_profile is not None else None
+    capture_profile_name = str(capture_profile["name"]) if capture_profile is not None else None
     append_job_log_banner(
         job_id=job_id,
         temp_image_path=temp_image_path,
         image_sha256=image_sha256,
         captured_at=captured_at,
+    )
+    probe.mark(
+        "languages",
+        languages=",".join(enabled_languages),
+        profile=capture_profile_name,
+        forced=forced_language,
+        window=window_title,
+        process=process_name,
     )
     if not temp_image_path.exists():
         connection = db_connect(db_path)
@@ -1160,7 +1516,6 @@ def process_job_once(
             kept=len(normalized_blocks),
             text_len=len(raw_text),
         )
-        enabled_languages = getattr(analyzer, "enabled_languages", DEFAULT_CAPTURE_LANGUAGES)
         if not any(
             contains_target_language_text(block.text, enabled_languages=enabled_languages)
             for block in normalized_blocks
@@ -1217,6 +1572,8 @@ def process_job_once(
                 language_confidence=source_language_confidence,
                 ingest_mode="auto_capture",
                 review_status="pending",
+                title=window_title,
+                game=capture_profile_name,
                 source_path=str(final_path),
                 raw_text=raw_text,
                 notes="capture_worker_auto_ingest",
@@ -1260,6 +1617,7 @@ def process_job_once(
                 candidates=candidate_count,
                 language=source_language,
                 languages=",".join(sorted(segment_languages)) or source_language,
+                profile=capture_profile_name,
             )
             promoted_terms = 0
             promoted_candidates = 0
@@ -1281,6 +1639,7 @@ def process_job_once(
                 final_image_path=str(final_path),
                 raw_text=raw_text,
                 ocr_text_hash=ocr_text_hash,
+                capture_profile_id=capture_profile_id,
             )
             connection.commit()
         finally:
@@ -1410,7 +1769,11 @@ def process_pending_translation_once(
             languages.base_language_code(job.get("source_language_code"))
             or DEFAULT_LANGUAGE_CODE
         )
-        translated_text = translator.translate_lines(lines, source_language=source_language)
+        if source_language == languages.base_language_code(translator.target_language):
+            # Already in the target language: nothing to translate, keep the text.
+            translated_text = "\n".join(lines)
+        else:
+            translated_text = translator.translate_lines(lines, source_language=source_language)
         connection = db_connect(db_path)
         try:
             upsert_source_translation(
@@ -1470,6 +1833,7 @@ def diagnose_image(
     *,
     with_analysis: bool,
     output_json: Path | None,
+    db_path: Path = DEFAULT_DB_PATH,
 ) -> None:
     probe = DiagnosticProbe(image_path)
     probe.mark("start", note=f"image={image_path}")
@@ -1486,8 +1850,17 @@ def diagnose_image(
         image.load()
         probe.mark("image_decoded", note=f"size={image.width}x{image.height} mode={image.mode}")
 
+    enabled_languages = DEFAULT_CAPTURE_LANGUAGES
+    if db_path.exists():
+        connection = db_connect(db_path)
+        try:
+            enabled_languages = resolve_capture_languages(connection)
+        finally:
+            connection.close()
+    probe.mark("languages", note=f"languages={','.join(enabled_languages)}")
+
     probe.mark("before_ocr_init")
-    ocr = build_capture_ocr_adapter()
+    ocr = build_capture_ocr_adapter(enabled_languages=enabled_languages)
     probe.mark("after_ocr_init")
 
     probe.mark("before_ocr_predict")
@@ -1509,21 +1882,26 @@ def diagnose_image(
             delete_if_exists(cleanup_path)
     normalized_blocks = [block for block in blocks if normalize_token(block.text)]
     raw_text = "\n".join(block.text for block in normalized_blocks)
-    japanese_detected = any(contains_target_language_text(block.text) for block in normalized_blocks)
+    target_detected = any(
+        contains_target_language_text(block.text, enabled_languages=enabled_languages)
+        for block in normalized_blocks
+    )
     probe.mark(
         "after_ocr_predict",
         note=(
             f"blocks={len(blocks)} normalized_blocks={len(normalized_blocks)} "
-            f"japanese_detected={japanese_detected} raw_text_len={len(raw_text)}"
+            f"target_language_detected={target_detected} raw_text_len={len(raw_text)}"
         ),
     )
+    for block in normalized_blocks:
+        print(f"  [{block.confidence if block.confidence is None else round(block.confidence, 2)}] {block.text}")
 
     if with_analysis:
         probe.mark("before_analyzer_init")
-        analyzer = LanguageSegmentAnalyzer()
+        analyzer = LanguageSegmentAnalyzer(enabled_languages)
         probe.mark("after_analyzer_init")
         candidate_total = 0
-        with db_connect(DEFAULT_DB_PATH) as connection:
+        with db_connect(db_path) as connection:
             for block in normalized_blocks:
                 for _, candidates in analyzer.analyze_block(connection, block):
                     candidate_total += len(candidates)
@@ -1614,6 +1992,7 @@ def main() -> None:
             args.image,
             with_analysis=args.with_analysis,
             output_json=args.output_json,
+            db_path=args.db,
         )
         return
 
@@ -1623,8 +2002,18 @@ def main() -> None:
             older_than_hours=args.recover_stale_after_hours,
         )
 
-    ocr = build_capture_ocr_adapter()
-    analyzer = LanguageSegmentAnalyzer()
+    # Engines and analyzers are picked per job from the database capture set (and
+    # capture profiles); warming up loads the current set before the first job.
+    pipeline = CapturePipeline()
+    warm_codes = pipeline.warm_up(args.db)
+    append_worker_log(
+        build_log_event(
+            "worker",
+            step="ready",
+            languages=",".join(warm_codes),
+            override=os.environ.get(CAPTURE_LANGUAGES_ENV) or None,
+        )
+    )
     translator = (
         GoogleGtxSourceTranslator(target_language=DEFAULT_SOURCE_TRANSLATION_TARGET)
         if DEFAULT_ENABLE_SOURCE_TRANSLATION
@@ -1632,7 +2021,7 @@ def main() -> None:
     )
 
     if args.mode == "once":
-        processed = process_job_once(args.db, ocr=ocr, analyzer=analyzer, translator=translator)
+        processed = process_job_once(args.db, translator=translator, pipeline=pipeline)
         if not processed:
             print("No pending capture jobs.")
             if DEBUG_ENABLED:
@@ -1645,9 +2034,8 @@ def main() -> None:
         while True:
             processed = process_job_once(
                 args.db,
-                ocr=ocr,
-                analyzer=analyzer,
                 translator=translator,
+                pipeline=pipeline,
             )
             if processed:
                 drained_jobs += 1
@@ -1666,9 +2054,8 @@ def main() -> None:
     while True:
         processed = process_job_once(
             args.db,
-            ocr=ocr,
-            analyzer=analyzer,
             translator=translator,
+            pipeline=pipeline,
         )
         if processed:
             idle_polls = 0

@@ -1,19 +1,61 @@
 from __future__ import annotations
 
+import difflib
 import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Iterable, Protocol
 
-import numpy as np
 from PIL import Image
+
+import languages
+
+
+def _numpy():
+    """numpy only matters when an OCR engine actually runs; the catalog env may lack it."""
+    import numpy as np  # noqa: WPS433 (lazy on purpose)
+
+    return np
 
 
 OCR_BACKEND_CHOICES = ("manga_ocr", "easyocr", "meikiocr")
-CAPTURE_OCR_BACKEND_CHOICES = ("meikiocr", "easyocr")
-DEFAULT_CAPTURE_OCR_BACKEND = "meikiocr"
+# `auto` routes by the enabled language set (meikiocr for Japanese, EasyOCR readers
+# for everything else); the explicit names force one engine for every language.
+CAPTURE_OCR_BACKEND_CHOICES = ("auto", "meikiocr", "easyocr")
+DEFAULT_CAPTURE_OCR_BACKEND = "auto"
 DEFAULT_EASYOCR_LANGUAGES = ("ja", "en")
+
+# EasyOCR language packs. Catalog codes map 1:1 except Chinese (``ch_sim``).
+# ``EXCLUSIVE`` packs and the script groups below can only share a reader with
+# English (EasyOCR raises otherwise), so each one becomes its own reader.
+EASYOCR_CODE_BY_LANGUAGE = {"zh": "ch_sim"}
+EASYOCR_LATIN_CODES = frozenset(
+    "af az bs cs cy da de en es et fr ga hr hu id is it ku la lt lv mi ms mt nl no oc pi pl pt "
+    "ro rs_latin sk sl sq sv sw tl tr uz vi".split()
+)
+EASYOCR_ARABIC_CODES = frozenset({"ar", "fa", "ug", "ur"})
+EASYOCR_CYRILLIC_CODES = frozenset(
+    "ru rs_cyrillic be bg uk mn abq ady kbd ava dar inh che lbe lez tab tjk".split()
+)
+EASYOCR_DEVANAGARI_CODES = frozenset("hi mr ne bh mai ang bho mah sck new gom sa bgc".split())
+EASYOCR_BENGALI_CODES = frozenset({"bn", "as", "mni"})
+EASYOCR_EXCLUSIVE_CODES = ("th", "ch_sim", "ch_tra", "ja", "ko", "ta", "te", "kn")
+EASYOCR_SCRIPT_GROUPS = (
+    EASYOCR_LATIN_CODES,
+    EASYOCR_ARABIC_CODES,
+    EASYOCR_CYRILLIC_CODES,
+    EASYOCR_DEVANAGARI_CODES,
+    EASYOCR_BENGALI_CODES,
+)
+EASYOCR_SUPPORTED_CODES = frozenset().union(*EASYOCR_SCRIPT_GROUPS, EASYOCR_EXCLUSIVE_CODES)
+# Cross-engine dedupe: boxes covering this share of the smaller box are the same
+# text; weaker overlaps need similar text too.
+MERGE_OVERLAP_DUPLICATE = 0.5
+MERGE_OVERLAP_PARTIAL = 0.2
+MERGE_TEXT_SIMILARITY = 0.6
+MIN_LINE_LETTERS = 2
+MIN_LINE_LETTER_RATIO = 0.3
 DEFAULT_EASYOCR_GPU_MODE = "auto"
 # Post-filter thresholds tuned on JP/ocr_bench (see ocr-precision-research.md).
 DEFAULT_MEIKIOCR_MIN_CHAR_CONFIDENCE = 0.3  # stray punctuation in word gaps scores ~0.1-0.2
@@ -77,6 +119,127 @@ def resolve_capture_ocr_backend(value: str | None = None) -> str:
             f"expected one of {', '.join(CAPTURE_OCR_BACKEND_CHOICES)}."
         )
     return normalized
+
+
+# ---------------------------------------------------------------------------
+# Engine routing by language set
+# ---------------------------------------------------------------------------
+
+
+def _base_codes(language_codes: Iterable[str]) -> tuple[str, ...]:
+    codes: list[str] = []
+    for code in language_codes:
+        base = languages.base_language_code(code)
+        if base and base not in codes:
+            codes.append(base)
+    return tuple(codes)
+
+
+def easyocr_language_code(code: str) -> str | None:
+    """EasyOCR pack for a catalog code, or ``None`` when EasyOCR has no model for it."""
+    base = languages.base_language_code(code)
+    mapped = EASYOCR_CODE_BY_LANGUAGE.get(base, base)
+    return mapped if mapped in EASYOCR_SUPPORTED_CODES else None
+
+
+def unsupported_easyocr_languages(language_codes: Iterable[str]) -> tuple[str, ...]:
+    return tuple(code for code in _base_codes(language_codes) if easyocr_language_code(code) is None)
+
+
+def plan_easyocr_reader_groups(
+    language_codes: Iterable[str],
+    *,
+    include_japanese: bool = False,
+) -> tuple[tuple[str, ...], ...]:
+    """Split the codes into reader groups EasyOCR accepts.
+
+    All Latin-script packs share one reader. Each of ``th``, ``ch_sim``, ``ja``,
+    ``ko``... and each non-Latin script group (Cyrillic, Arabic, Devanagari,
+    Bengali) gets its own reader, paired with English when English is enabled so
+    mixed lines still read. Japanese is left to meikiocr unless asked for.
+    """
+    requested: list[str] = []
+    for code in _base_codes(language_codes):
+        if code == "ja" and not include_japanese:
+            continue
+        mapped = easyocr_language_code(code)
+        if mapped is not None and mapped not in requested:
+            requested.append(mapped)
+    english = ("en",) if "en" in requested else ()
+    groups: list[tuple[str, ...]] = []
+    latin = tuple(code for code in requested if code in EASYOCR_LATIN_CODES)
+    if latin:
+        groups.append(latin)
+    for script_codes in EASYOCR_SCRIPT_GROUPS[1:]:
+        members = tuple(code for code in requested if code in script_codes)
+        if members:
+            groups.append(members + english)
+    for code in requested:
+        if code in EASYOCR_EXCLUSIVE_CODES:
+            groups.append((code,) + english)
+    return tuple(groups)
+
+
+@dataclass(frozen=True, slots=True)
+class OcrEnginePlan:
+    """Which engines run for a language set and which languages no engine covers."""
+
+    language_codes: tuple[str, ...]
+    use_meikiocr: bool
+    easyocr_groups: tuple[tuple[str, ...], ...]
+    unsupported: tuple[str, ...]
+    backend: str
+
+    @property
+    def engine_names(self) -> tuple[str, ...]:
+        names: list[str] = []
+        if self.use_meikiocr:
+            names.append("meikiocr")
+        names.extend("easyocr:" + "+".join(group) for group in self.easyocr_groups)
+        return tuple(names)
+
+    @property
+    def multi_engine(self) -> bool:
+        return len(self.engine_names) > 1
+
+
+def plan_ocr_engines(
+    language_codes: Iterable[str],
+    *,
+    backend: str | None = None,
+) -> OcrEnginePlan:
+    """Decide the engines for the enabled capture languages.
+
+    ``auto``: meikiocr covers Japanese (it is Japanese-only and the best engine
+    for game text), EasyOCR readers cover every other language, grouped by
+    EasyOCR's compatibility rule. ``meikiocr``/``easyocr`` force one engine for
+    the whole set, as before.
+    """
+    resolved_backend = resolve_capture_ocr_backend(backend)
+    codes = _base_codes(language_codes) or ("ja",)
+    if resolved_backend == "meikiocr":
+        return OcrEnginePlan(
+            language_codes=codes,
+            use_meikiocr=True,
+            easyocr_groups=(),
+            unsupported=tuple(code for code in codes if code != "ja"),
+            backend=resolved_backend,
+        )
+    if resolved_backend == "easyocr":
+        return OcrEnginePlan(
+            language_codes=codes,
+            use_meikiocr=False,
+            easyocr_groups=plan_easyocr_reader_groups(codes, include_japanese=True),
+            unsupported=unsupported_easyocr_languages(codes),
+            backend=resolved_backend,
+        )
+    return OcrEnginePlan(
+        language_codes=codes,
+        use_meikiocr="ja" in codes,
+        easyocr_groups=plan_easyocr_reader_groups(codes),
+        unsupported=tuple(code for code in unsupported_easyocr_languages(codes) if code != "ja"),
+        backend=resolved_backend,
+    )
 
 
 def torch_cuda_is_available() -> bool:
@@ -486,6 +649,37 @@ def is_plausible_japanese_line(text: str) -> bool:
     return japanese >= MIN_LINE_JAPANESE_CHARS and japanese >= MIN_LINE_JAPANESE_RATIO * len(visible)
 
 
+def allowed_scripts_for_languages(language_codes: Iterable[str]) -> frozenset[str]:
+    """Scripts that count as letters for the given languages (han rides with Japanese)."""
+    scripts: set[str] = set()
+    for code in _base_codes(language_codes):
+        profile = languages.get_language(code)
+        scripts.add(profile.script)
+        if profile.script in (languages.SCRIPT_JAPANESE, languages.SCRIPT_HAN):
+            scripts.update({languages.SCRIPT_JAPANESE, languages.SCRIPT_HAN})
+    return frozenset(scripts)
+
+
+def is_plausible_text_line(text: str, language_codes: Iterable[str] = ("ja",)) -> bool:
+    """Language-aware version of :func:`is_plausible_japanese_line`.
+
+    A line needs at least two letters of a script used by one of the languages,
+    making up 30% or more of its visible characters. With ``ja`` alone this is
+    exactly the Japanese rule the benchmark was tuned on.
+    """
+    codes = _base_codes(language_codes) or ("ja",)
+    if codes == ("ja",):
+        return is_plausible_japanese_line(text)
+    visible = [char for char in text if not char.isspace()]
+    if not visible:
+        return False
+    allowed = allowed_scripts_for_languages(codes)
+    letters = sum(
+        count for script, count in languages.script_histogram(text).items() if script in allowed
+    )
+    return letters >= MIN_LINE_LETTERS and letters >= MIN_LINE_LETTER_RATIO * len(visible)
+
+
 def drop_contained_boxes(boxes: list[OcrLineBox]) -> list[OcrLineBox]:
     """Drop a box mostly covered by a larger one (duplicate detections of the same text)."""
     kept: list[OcrLineBox] = []
@@ -532,19 +726,119 @@ def drop_furigana_boxes(boxes: list[OcrLineBox]) -> list[OcrLineBox]:
     return [box for box in boxes if not is_furigana_box(box, boxes)]
 
 
-def filter_ocr_line_boxes(boxes: list[OcrLineBox]) -> tuple[list[OcrLineBox], dict[str, int]]:
-    """Apply the line, duplicate and furigana filters in that order."""
-    plausible = [box for box in boxes if is_plausible_japanese_line(box.text)]
+def filter_ocr_line_boxes(
+    boxes: list[OcrLineBox],
+    *,
+    language_codes: Iterable[str] = ("ja",),
+) -> tuple[list[OcrLineBox], dict[str, int]]:
+    """Apply the line, duplicate and furigana filters in that order.
+
+    The plausibility filter follows ``language_codes``; the furigana (ruby)
+    filter is Japanese-specific and only runs when Japanese is among them.
+    """
+    codes = _base_codes(language_codes) or ("ja",)
+    plausible = [box for box in boxes if is_plausible_text_line(box.text, codes)]
     deduplicated = drop_contained_boxes(plausible)
-    kept = drop_furigana_boxes(deduplicated)
+    kept = drop_furigana_boxes(deduplicated) if "ja" in codes else list(deduplicated)
     stats = {
         "detected": len(boxes),
         "kept": len(kept),
-        "non_japanese": len(boxes) - len(plausible),
+        "off_language": len(boxes) - len(plausible),
         "contained": len(plausible) - len(deduplicated),
         "furigana": len(deduplicated) - len(kept),
     }
     return kept, stats
+
+
+# ---------------------------------------------------------------------------
+# Cross-engine block merging
+# ---------------------------------------------------------------------------
+
+
+def bbox_overlap_ratio(
+    first: list[list[float]] | None,
+    second: list[list[float]] | None,
+) -> float:
+    """Intersection area over the smaller box's area (0 when either box is missing)."""
+    first_bounds = bbox_bounds(first)
+    second_bounds = bbox_bounds(second)
+    if first_bounds is None or second_bounds is None:
+        return 0.0
+    overlap_width = min(first_bounds[2], second_bounds[2]) - max(first_bounds[0], second_bounds[0])
+    overlap_height = min(first_bounds[3], second_bounds[3]) - max(first_bounds[1], second_bounds[1])
+    if overlap_width <= 0 or overlap_height <= 0:
+        return 0.0
+    first_area = max(1.0, (first_bounds[2] - first_bounds[0]) * (first_bounds[3] - first_bounds[1]))
+    second_area = max(1.0, (second_bounds[2] - second_bounds[0]) * (second_bounds[3] - second_bounds[1]))
+    return (overlap_width * overlap_height) / min(first_area, second_area)
+
+
+def _comparable_text(value: str) -> str:
+    return "".join(char.casefold() for char in value if not char.isspace())
+
+
+def text_similarity(first: str, second: str) -> float:
+    left = _comparable_text(first)
+    right = _comparable_text(second)
+    if not left or not right:
+        return 0.0
+    return difflib.SequenceMatcher(None, left, right).ratio()
+
+
+def is_duplicate_block(
+    block: OcrBlock,
+    other: OcrBlock,
+    *,
+    overlap_duplicate: float = MERGE_OVERLAP_DUPLICATE,
+    overlap_partial: float = MERGE_OVERLAP_PARTIAL,
+    text_threshold: float = MERGE_TEXT_SIMILARITY,
+) -> bool:
+    """Two engines read the same screen region: a strong overlap is enough, a weak
+    one needs similar text as well. Boxless blocks compare by text only."""
+    if block.bbox is None or other.bbox is None:
+        return _comparable_text(block.text) == _comparable_text(other.text)
+    overlap = bbox_overlap_ratio(block.bbox, other.bbox)
+    if overlap >= overlap_duplicate:
+        return True
+    return overlap >= overlap_partial and text_similarity(block.text, other.text) >= text_threshold
+
+
+def merge_ocr_blocks(
+    primary: list[OcrBlock],
+    secondary: list[OcrBlock],
+    **thresholds: float,
+) -> list[OcrBlock]:
+    """Union of two engines' blocks, dropping secondary blocks that duplicate a primary one."""
+    kept = list(primary)
+    for block in secondary:
+        if any(is_duplicate_block(block, other, **thresholds) for other in kept):
+            continue
+        kept.append(block)
+    return sort_ocr_blocks_reading_order(kept)
+
+
+def merge_engine_blocks(
+    block_groups: Iterable[list[OcrBlock]],
+    **thresholds: float,
+) -> list[OcrBlock]:
+    """Fold several engines' outputs left to right; earlier engines win ties."""
+    merged: list[OcrBlock] = []
+    for index, blocks in enumerate(block_groups):
+        merged = list(blocks) if index == 0 else merge_ocr_blocks(merged, blocks, **thresholds)
+    return sort_ocr_blocks_reading_order(merged)
+
+
+def scale_ocr_blocks(blocks: list[OcrBlock], factor: float) -> list[OcrBlock]:
+    """Map boxes read on a downscaled image back to full-resolution coordinates."""
+    if factor == 1.0:
+        return list(blocks)
+    scaled: list[OcrBlock] = []
+    for block in blocks:
+        bbox = None
+        if block.bbox is not None:
+            bbox = [[point[0] * factor, point[1] * factor] for point in block.bbox]
+        scaled.append(OcrBlock(text=block.text, confidence=block.confidence, bbox=bbox))
+    return scaled
 
 
 def group_ocr_line_boxes_into_rows(boxes: list[OcrLineBox]) -> list[list[OcrLineBox]]:
@@ -617,7 +911,7 @@ class MangaOcrBackend:
 class EasyOcrBackend:
     name = "easyocr"
 
-    def __init__(self) -> None:
+    def __init__(self, languages_list: Iterable[str] | None = None) -> None:
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
         easyocr_cache = ensure_repo_cache_dir("easyocr")
         user_network_dir = ensure_repo_cache_dir("easyocr", "user_network")
@@ -630,7 +924,9 @@ class EasyOcrBackend:
                 "before using the OCR tooling."
             ) from exc
 
-        self.languages = resolve_easyocr_languages()
+        self.languages = (
+            tuple(languages_list) if languages_list is not None else resolve_easyocr_languages()
+        )
         self.gpu_mode = os.environ.get("LANG_JP_EASYOCR_GPU", DEFAULT_EASYOCR_GPU_MODE)
         self.gpu_enabled = resolve_easyocr_use_gpu(self.gpu_mode)
         self._reader = easyocr.Reader(
@@ -647,7 +943,7 @@ class EasyOcrBackend:
 
     def read_blocks(self, source: Image.Image | str | Path) -> list[OcrBlock]:
         if isinstance(source, Image.Image):
-            target = np.array(source.convert("RGB"))
+            target = _numpy().array(source.convert("RGB"))
         else:
             target = str(source)
         result = self._reader.readtext(target, detail=1, paragraph=False)
@@ -713,6 +1009,7 @@ class MeikiOcrBackend:
 
     def read_line_boxes(self, source: Image.Image | str | Path) -> list[OcrLineBox]:
         """One box per detected line, after dropping low-confidence characters."""
+        np = _numpy()
         if isinstance(source, Image.Image):
             rgb = np.array(source.convert("RGB"))
         else:
@@ -741,3 +1038,34 @@ def build_ocr_backend(name: str) -> OcrBackend:
     if name == "meikiocr":
         return MeikiOcrBackend()
     raise SystemExit(f"Unsupported backend: {name}")
+
+
+# ---------------------------------------------------------------------------
+# Reader cache: models load once per process, whatever the capture set does
+# ---------------------------------------------------------------------------
+
+_EASYOCR_BACKENDS: dict[tuple[str, ...], EasyOcrBackend] = {}
+_MEIKIOCR_BACKEND: MeikiOcrBackend | None = None
+
+
+def get_easyocr_backend(languages_list: Iterable[str]) -> EasyOcrBackend:
+    """One EasyOCR reader per language group, built on first use and reused after."""
+    key = tuple(languages_list)
+    backend = _EASYOCR_BACKENDS.get(key)
+    if backend is None:
+        backend = EasyOcrBackend(key)
+        _EASYOCR_BACKENDS[key] = backend
+    return backend
+
+
+def get_meikiocr_backend() -> MeikiOcrBackend:
+    global _MEIKIOCR_BACKEND
+    if _MEIKIOCR_BACKEND is None:
+        _MEIKIOCR_BACKEND = MeikiOcrBackend()
+    return _MEIKIOCR_BACKEND
+
+
+def clear_backend_cache() -> None:
+    _EASYOCR_BACKENDS.clear()
+    global _MEIKIOCR_BACKEND
+    _MEIKIOCR_BACKEND = None

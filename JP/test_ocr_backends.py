@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,16 +17,25 @@ from ocr_backends import (
     DEFAULT_CAPTURE_OCR_BACKEND,
     DEFAULT_EASYOCR_LANGUAGES,
     MeikiOcrBackend,
+    OcrBlock,
     OcrLineBox,
+    clear_backend_cache,
     drop_contained_boxes,
     drop_furigana_boxes,
     filter_ocr_line_boxes,
+    get_easyocr_backend,
     is_plausible_japanese_line,
+    is_plausible_text_line,
     meikiocr_line_to_box,
+    merge_engine_blocks,
+    merge_ocr_blocks,
     ocr_line_boxes_to_blocks,
+    plan_easyocr_reader_groups,
+    plan_ocr_engines,
     resolve_capture_ocr_backend,
     resolve_easyocr_languages,
     resolve_easyocr_use_gpu,
+    scale_ocr_blocks,
 )
 
 
@@ -74,10 +84,10 @@ class EasyOcrConfigTest(unittest.TestCase):
 
 
 class CaptureOcrBackendConfigTest(unittest.TestCase):
-    def test_defaults_to_meikiocr(self) -> None:
+    def test_defaults_to_auto_routing(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(resolve_capture_ocr_backend(), "meikiocr")
-        self.assertEqual(DEFAULT_CAPTURE_OCR_BACKEND, "meikiocr")
+            self.assertEqual(resolve_capture_ocr_backend(), "auto")
+        self.assertEqual(DEFAULT_CAPTURE_OCR_BACKEND, "auto")
 
     def test_env_selects_easyocr(self) -> None:
         with patch.dict(os.environ, {"LANG_JP_OCR_BACKEND": " EasyOCR "}, clear=True):
@@ -85,12 +95,157 @@ class CaptureOcrBackendConfigTest(unittest.TestCase):
 
     def test_blank_env_falls_back_to_default(self) -> None:
         with patch.dict(os.environ, {"LANG_JP_OCR_BACKEND": "  "}, clear=True):
-            self.assertEqual(resolve_capture_ocr_backend(), "meikiocr")
+            self.assertEqual(resolve_capture_ocr_backend(), "auto")
 
     def test_unknown_backend_is_rejected(self) -> None:
         with patch.dict(os.environ, {"LANG_JP_OCR_BACKEND": "paddle"}, clear=True):
             with self.assertRaises(ValueError):
                 resolve_capture_ocr_backend()
+
+
+class EngineRoutingTest(unittest.TestCase):
+    def test_japanese_only_uses_meikiocr_alone(self) -> None:
+        plan = plan_ocr_engines(("ja",), backend="auto")
+        self.assertTrue(plan.use_meikiocr)
+        self.assertEqual(plan.easyocr_groups, ())
+        self.assertEqual(plan.engine_names, ("meikiocr",))
+        self.assertFalse(plan.multi_engine)
+
+    def test_japanese_plus_latin_adds_one_latin_reader(self) -> None:
+        plan = plan_ocr_engines(("ja", "en", "es", "pt-BR"), backend="auto")
+        self.assertTrue(plan.use_meikiocr)
+        self.assertEqual(plan.easyocr_groups, (("en", "es", "pt"),))
+        self.assertTrue(plan.multi_engine)
+
+    def test_cjk_and_script_groups_each_get_their_own_reader_paired_with_english(self) -> None:
+        groups = plan_easyocr_reader_groups(("ja", "en", "ko", "zh", "th", "ru", "uk", "ar", "hi", "es"))
+        self.assertEqual(
+            groups,
+            (
+                ("en", "es"),
+                ("ar", "en"),
+                ("ru", "uk", "en"),
+                ("hi", "en"),
+                ("ko", "en"),
+                ("ch_sim", "en"),
+                ("th", "en"),
+            ),
+        )
+
+    def test_without_english_exclusive_packs_stay_alone(self) -> None:
+        self.assertEqual(plan_easyocr_reader_groups(("ko", "zh")), (("ko",), ("ch_sim",)))
+
+    def test_unsupported_languages_are_reported_not_dropped_silently(self) -> None:
+        plan = plan_ocr_engines(("ja", "el", "he", "ko"), backend="auto")
+        self.assertEqual(plan.unsupported, ("el", "he"))
+        self.assertEqual(plan.easyocr_groups, (("ko",),))
+
+    def test_no_japanese_means_no_meikiocr(self) -> None:
+        plan = plan_ocr_engines(("es", "en"), backend="auto")
+        self.assertFalse(plan.use_meikiocr)
+        self.assertEqual(plan.engine_names, ("easyocr:es+en",))
+
+    def test_forced_backends_keep_the_old_single_engine_behaviour(self) -> None:
+        meiki = plan_ocr_engines(("ja", "en"), backend="meikiocr")
+        self.assertEqual(meiki.engine_names, ("meikiocr",))
+        self.assertEqual(meiki.unsupported, ("en",))
+        easy = plan_ocr_engines(("ja", "en"), backend="easyocr")
+        self.assertFalse(easy.use_meikiocr)
+        self.assertEqual(easy.easyocr_groups, (("en",), ("ja", "en")))
+
+    def test_reader_cache_builds_each_group_once(self) -> None:
+        built: list[tuple[str, ...]] = []
+
+        class StubBackend:
+            def __init__(self, languages_list):
+                built.append(tuple(languages_list))
+
+        clear_backend_cache()
+        with patch("ocr_backends.EasyOcrBackend", StubBackend):
+            first = get_easyocr_backend(("en", "es"))
+            second = get_easyocr_backend(("en", "es"))
+            get_easyocr_backend(("ko", "en"))
+        clear_backend_cache()
+        self.assertIs(first, second)
+        self.assertEqual(built, [("en", "es"), ("ko", "en")])
+
+
+class LanguageAwareLineFilterTest(unittest.TestCase):
+    def test_japanese_set_keeps_the_benchmark_rule(self) -> None:
+        self.assertTrue(is_plausible_text_line("勇者の墓は", ("ja",)))
+        self.assertFalse(is_plausible_text_line("Steam Library あい", ("ja",)))
+
+    def test_latin_languages_accept_latin_lines_and_reject_icons(self) -> None:
+        self.assertTrue(is_plausible_text_line("Press START to continue", ("es", "en")))
+        self.assertTrue(is_plausible_text_line("¿Nos ha traicionado?", ("es",)))
+        self.assertFalse(is_plausible_text_line("12:45", ("es", "en")))
+        self.assertFalse(is_plausible_text_line("안녕하세요", ("es", "en")))
+
+    def test_mixed_sets_accept_every_enabled_script(self) -> None:
+        codes = ("ja", "en", "ko")
+        self.assertTrue(is_plausible_text_line("안녕하세요", codes))
+        self.assertTrue(is_plausible_text_line("勇者の墓は", codes))
+        self.assertTrue(is_plausible_text_line("Options", codes))
+        self.assertFalse(is_plausible_text_line("Привет", codes))
+
+    def test_filter_pipeline_only_drops_furigana_for_japanese(self) -> None:
+        latin = box("Press START", 600, 10, 900, 40)
+        kept, stats = filter_ocr_line_boxes(
+            [latin, RUBY_ABOVE_BODY, BODY_LINE], language_codes=("ja", "en")
+        )
+        self.assertEqual(kept, [latin, BODY_LINE])
+        self.assertEqual(stats["furigana"], 1)
+        self.assertEqual(stats["off_language"], 0)
+        kept_ko, stats_ko = filter_ocr_line_boxes(
+            [latin, RUBY_ABOVE_BODY, BODY_LINE], language_codes=("ko", "en")
+        )
+        self.assertEqual(kept_ko, [latin])
+        self.assertEqual(stats_ko["off_language"], 2)
+        self.assertEqual(stats_ko["furigana"], 0)
+
+
+class BlockMergeTest(unittest.TestCase):
+    @staticmethod
+    def block(text: str, left: float, top: float, right: float, bottom: float, conf: float = 0.9) -> OcrBlock:
+        return OcrBlock(
+            text=text,
+            confidence=conf,
+            bbox=[[left, top], [right, top], [right, bottom], [left, bottom]],
+        )
+
+    def test_overlapping_boxes_from_two_engines_collapse_into_the_primary_block(self) -> None:
+        meiki = [self.block("勇者の墓は", 100, 200, 400, 240)]
+        easy = [
+            self.block("勇者の墓は", 102, 198, 398, 242),  # same line, read again
+            self.block("Press START", 100, 400, 300, 430),  # Latin UI label only EasyOCR saw
+        ]
+        merged = merge_ocr_blocks(meiki, easy)
+        self.assertEqual([block.text for block in merged], ["勇者の墓は", "Press START"])
+
+    def test_latin_garbage_over_japanese_text_is_dropped_by_overlap_alone(self) -> None:
+        meiki = [self.block("勇者の墓は", 100, 200, 400, 240)]
+        easy = [self.block("ERJ RO E", 110, 205, 390, 238)]
+        self.assertEqual([block.text for block in merge_ocr_blocks(meiki, easy)], ["勇者の墓は"])
+
+    def test_weak_overlap_needs_similar_text(self) -> None:
+        primary = [self.block("Continue", 100, 100, 300, 140)]
+        similar = [self.block("Continu e", 250, 100, 460, 140)]  # 25% overlap, same words
+        different = [self.block("Options", 250, 100, 460, 140)]
+        self.assertEqual(len(merge_ocr_blocks(primary, similar)), 1)
+        self.assertEqual(len(merge_ocr_blocks(primary, different)), 2)
+
+    def test_merge_engine_blocks_keeps_reading_order(self) -> None:
+        merged = merge_engine_blocks(
+            [
+                [self.block("二行目", 100, 300, 300, 340)],
+                [self.block("First", 100, 100, 300, 140), self.block("二行目", 101, 301, 299, 339)],
+            ]
+        )
+        self.assertEqual([block.text for block in merged], ["First", "二行目"])
+
+    def test_scale_ocr_blocks_maps_downscaled_boxes_back(self) -> None:
+        scaled = scale_ocr_blocks([self.block("x", 10, 20, 30, 40)], 2.0)
+        self.assertEqual(scaled[0].bbox, [[20, 40], [60, 40], [60, 80], [20, 80]])
 
 
 class CharConfidenceFilterTest(unittest.TestCase):
@@ -206,7 +361,7 @@ class LineBoxPipelineTest(unittest.TestCase):
         self.assertEqual(kept, [BODY_LINE])
         self.assertEqual(
             stats,
-            {"detected": 5, "kept": 1, "non_japanese": 2, "contained": 1, "furigana": 1},
+            {"detected": 5, "kept": 1, "off_language": 2, "contained": 1, "furigana": 1},
         )
 
     def test_rows_are_joined_in_reading_order(self) -> None:
@@ -220,6 +375,7 @@ class LineBoxPipelineTest(unittest.TestCase):
 
 
 class MeikiOcrBackendTest(unittest.TestCase):
+    @unittest.skipUnless(find_spec("numpy") is not None, "numpy is only installed in the OCR environment")
     def test_read_blocks_filters_engine_output_without_loading_models(self) -> None:
         received: list[tuple[int, ...]] = []
 
