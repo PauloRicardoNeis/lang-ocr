@@ -91,13 +91,13 @@ The web UI has a language bar on every page (`?lang=es`, `lang=all`), and other 
 
 Databases created before this change are upgraded in place on the next command: existing rows become `ja` and canonical keys gain the `ja::` prefix once.
 
-For a shorter Windows entry point, run `..\open_jp_catalog.cmd` from the repository root.
-For the passive-capture tray, run `..\open_jp_capture_tray.cmd` from the repository root. The launcher reuses an existing compiled daemon when available and otherwise builds `desktop_capture_daemon.exe` once before starting it.
-To follow the capture log live in a console window, run `..\open_jp_capture_logs.cmd` from the repository root.
+On Windows, the single entry point is `..\open_lang.cmd` from the repository root. It builds `desktop_capture_daemon.exe` when Cargo is available (otherwise it reuses an existing build), starts the tray daemon, and opens the catalog in the browser. If the daemon is already running, it only opens the catalog.
+
+The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-open-browser` on `web_port` (default 8766), restarts it with backoff if it exits, and stops it on Quit. If something else is already serving that port (for example a manual `browse`), the daemon reuses it instead of starting a second server. Web server output goes to `data/catalog_web.log`. Use `Open Lang` in the tray menu, or double-click the tray icon, to open the catalog. Only one daemon runs at a time; launching it again just opens the catalog. To follow the capture log live, use `Tail logs` in the tray menu.
 
 ## Passive capture workflow
 1. Prepare a dedicated Python 3.12 environment for the capture worker and install `requirements-capture.txt`.
-2. Start the Rust tray daemon with `..\open_jp_capture_tray.cmd` from the repository root, or run `cargo run` inside `desktop_capture_daemon` if you want to launch it manually from a shell.
+2. Start the Rust tray daemon with `..\open_lang.cmd` from the repository root, or run `cargo run` inside `desktop_capture_daemon` if you want to launch it manually from a shell.
 3. The daemon captures the primary monitor either on a fixed interval or in an `after source ready` cadence, dedupes recent frames, writes spool PNGs, and enqueues `capture_jobs`.
 4. The Python worker consumes those jobs, runs `EasyOCR` with horizontal-box filtering + Japanese draft analysis, and creates pending `sources`.
 5. Review drafts with:

@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local};
@@ -22,6 +24,8 @@ use tokio::runtime::Runtime;
 use trayicon::{Icon, MenuBuilder, TrayIcon, TrayIconBuilder};
 use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
 use windows_capture::monitor::Monitor;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_BACK, VK_DELETE,
     VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
@@ -51,6 +55,7 @@ enum UserEvent {
     OpenLogs,
     TailLogs,
     ToggleDebug,
+    OpenCatalog,
     Quit,
     WorkerExited(WorkerLaunchMode),
 }
@@ -99,6 +104,11 @@ struct DaemonConfig {
     python_executable: String,
     python_args: Vec<String>,
     worker_script: PathBuf,
+    web_server_enabled: bool,
+    web_port: u16,
+    web_python_executable: Option<String>,
+    web_python_args: Option<Vec<String>>,
+    web_log_path: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,6 +128,11 @@ struct DaemonConfigPatch {
     python_executable: Option<String>,
     python_args: Option<Vec<String>>,
     worker_script: Option<PathBuf>,
+    web_server_enabled: Option<bool>,
+    web_port: Option<u16>,
+    web_python_executable: Option<String>,
+    web_python_args: Option<Vec<String>>,
+    web_log_path: Option<PathBuf>,
 }
 
 fn jp_root() -> PathBuf {
@@ -155,6 +170,18 @@ fn repo_local_storage_path(path: &Path) -> String {
 impl Default for DaemonConfig {
     fn default() -> Self {
         let jp_root = jp_root();
+        // The OCR deps (meikiocr etc.) live in the repo's capture venv; the bare
+        // `py -3.12` interpreter usually lacks them, so prefer the venv when present.
+        let capture_venv_python = jp_root
+            .join("..")
+            .join(".venv-capture312")
+            .join("Scripts")
+            .join("python.exe");
+        let (python_executable, python_args) = if capture_venv_python.is_file() {
+            (capture_venv_python.to_string_lossy().into_owned(), Vec::new())
+        } else {
+            ("py".to_string(), vec!["-3.12".to_string()])
+        };
         Self {
             interval_seconds: 60,
             capture_after_source_ready: false,
@@ -168,9 +195,14 @@ impl Default for DaemonConfig {
             db_path: jp_root.join("data").join("lang_jp.sqlite3"),
             spool_dir: jp_root.join("data").join("capture_spool"),
             log_path: jp_root.join("data").join("capture_daemon.log"),
-            python_executable: "py".to_string(),
-            python_args: vec!["-3.12".to_string()],
+            python_executable,
+            python_args,
             worker_script: jp_root.join("capture_worker.py"),
+            web_server_enabled: true,
+            web_port: DEFAULT_WEB_PORT,
+            web_python_executable: None,
+            web_python_args: None,
+            web_log_path: jp_root.join("data").join("catalog_web.log"),
         }
     }
 }
@@ -182,6 +214,13 @@ fn default_true() -> bool {
 fn default_ocr_max_side() -> u64 {
     1600
 }
+
+const DEFAULT_WEB_PORT: u16 = 8766;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const WEB_SERVER_HEALTHY_RUN: Duration = Duration::from_secs(30);
+const CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const INSTANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\LangJpDesktopCaptureDaemon";
 
 impl DaemonConfig {
     fn from_toml(raw: &str) -> Result<Self> {
@@ -235,7 +274,26 @@ impl DaemonConfig {
         if let Some(value) = patch.worker_script {
             self.worker_script = resolve_jp_config_path(value);
         }
+        if let Some(value) = patch.web_server_enabled {
+            self.web_server_enabled = value;
+        }
+        if let Some(value) = patch.web_port {
+            self.web_port = value;
+        }
+        if let Some(value) = patch.web_python_executable {
+            self.web_python_executable = Some(resolve_jp_command_path(value));
+        }
+        if let Some(value) = patch.web_python_args {
+            self.web_python_args = Some(value);
+        }
+        if let Some(value) = patch.web_log_path {
+            self.web_log_path = resolve_jp_config_path(value);
+        }
         self
+    }
+
+    fn catalog_url(&self) -> String {
+        format!("http://127.0.0.1:{}/", self.web_port)
     }
 
     fn load() -> Self {
@@ -442,6 +500,8 @@ struct Controller {
     stop_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
     debug_flag: Arc<AtomicBool>,
+    web_child: Arc<Mutex<Option<Child>>>,
+    web_stop_flag: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -469,6 +529,8 @@ impl Controller {
             stop_flag: Arc::new(AtomicBool::new(false)),
             pause_flag: Arc::new(AtomicBool::new(false)),
             debug_flag: Arc::new(AtomicBool::new(false)),
+            web_child: Arc::new(Mutex::new(None)),
+            web_stop_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -747,6 +809,121 @@ impl Controller {
         self.append_log("capture service stopped");
     }
 
+    fn shutdown(&self) {
+        self.stop();
+        self.stop_web_server();
+    }
+
+    fn open_catalog(&self) {
+        let config = self.config.clone();
+        std::thread::spawn(move || open_catalog_when_ready(&config));
+    }
+
+    fn spawn_web_server_supervisor(&self) {
+        if !self.config.web_server_enabled {
+            self.append_log("catalog web server supervision disabled by config");
+            return;
+        }
+        let config = self.config.clone();
+        let child_slot = Arc::clone(&self.web_child);
+        let stop_flag = Arc::clone(&self.web_stop_flag);
+        std::thread::spawn(move || {
+            let mut consecutive_failures: u32 = 0;
+            let mut started_at: Option<Instant> = None;
+            let mut next_attempt_at = Instant::now();
+            let mut port_busy_logged = false;
+            loop {
+                {
+                    // Checked under the lock so shutdown can never race a respawn.
+                    let mut guard = child_slot.lock().unwrap();
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(child) = guard.as_mut() {
+                        let exit_status = match child.try_wait() {
+                            Ok(None) => None,
+                            Ok(Some(status)) => Some(status.to_string()),
+                            Err(error) => Some(format!("unknown ({error})")),
+                        };
+                        if let Some(status) = exit_status {
+                            *guard = None;
+                            let ran_for = started_at.take().map(|at| at.elapsed()).unwrap_or_default();
+                            if ran_for >= WEB_SERVER_HEALTHY_RUN {
+                                consecutive_failures = 0;
+                            }
+                            consecutive_failures += 1;
+                            let delay = web_server_restart_delay(consecutive_failures);
+                            next_attempt_at = Instant::now() + delay;
+                            append_log_file(
+                                &config.log_path,
+                                &format!(
+                                    "catalog web server exited status={status} after {}s; restarting in {}s",
+                                    ran_for.as_secs(),
+                                    delay.as_secs()
+                                ),
+                            );
+                        }
+                    }
+                    if guard.is_none() && Instant::now() >= next_attempt_at {
+                        if local_port_accepts_connections(config.web_port) {
+                            if !port_busy_logged {
+                                append_log_file(
+                                    &config.log_path,
+                                    &format!(
+                                        "catalog web server not started because port {} is already in use; reusing whatever serves it",
+                                        config.web_port
+                                    ),
+                                );
+                                port_busy_logged = true;
+                            }
+                        } else {
+                            port_busy_logged = false;
+                            match spawn_web_server_process(&config) {
+                                Ok(child) => {
+                                    append_log_file(
+                                        &config.log_path,
+                                        &format!(
+                                            "spawned catalog web server pid={} url={}",
+                                            child.id(),
+                                            config.catalog_url()
+                                        ),
+                                    );
+                                    *guard = Some(child);
+                                    started_at = Some(Instant::now());
+                                }
+                                Err(error) => {
+                                    consecutive_failures += 1;
+                                    let delay = web_server_restart_delay(consecutive_failures);
+                                    next_attempt_at = Instant::now() + delay;
+                                    append_log_file(
+                                        &config.log_path,
+                                        &format!(
+                                            "failed to spawn catalog web server: {error:#}; retrying in {}s",
+                                            delay.as_secs()
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    fn stop_web_server(&self) {
+        let child = {
+            let mut guard = self.web_child.lock().unwrap();
+            self.web_stop_flag.store(true, Ordering::Relaxed);
+            guard.take()
+        };
+        if let Some(mut child) = child {
+            kill_process_tree(&mut child);
+            self.append_log("catalog web server stopped");
+        }
+    }
+
     fn open_logs(&self) {
         let log_path = self.config.log_path.clone();
         let _ = Command::new("cmd")
@@ -797,6 +974,16 @@ impl Controller {
         });
         if self.debug_enabled() {
             command.env("LANG_JP_CAPTURE_DEBUG", "1");
+        }
+        // Send worker tracebacks to the daemon log; otherwise a crash only shows up
+        // as "exited ... exit code: 1" with no reason.
+        command.env("PYTHONIOENCODING", "utf-8");
+        if let Ok(log_file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.config.log_path)
+        {
+            command.stderr(log_file);
         }
 
         match command.spawn() {
@@ -886,6 +1073,7 @@ impl Controller {
     fn restart_app(&self) -> Result<()> {
         let current_exe = std::env::current_exe().context("failed to locate current executable")?;
         Command::new(&current_exe)
+            .arg("--wait-for-instance")
             .spawn()
             .with_context(|| format!("failed to relaunch {}", current_exe.display()))?;
         self.append_log(&format!(
@@ -1265,7 +1453,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AutoProcessNextJob => self.controller.auto_process_next_job(),
             UserEvent::RestartApp => match self.controller.restart_app() {
                 Ok(()) => {
-                    self.controller.stop();
+                    self.controller.shutdown();
                     event_loop.exit();
                 }
                 Err(error) => self
@@ -1276,8 +1464,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenLogs => self.controller.open_logs(),
             UserEvent::TailLogs => self.controller.tail_logs(),
             UserEvent::ToggleDebug => self.controller.toggle_debug(),
+            UserEvent::OpenCatalog => self.controller.open_catalog(),
             UserEvent::Quit => {
-                self.controller.stop();
+                self.controller.shutdown();
                 event_loop.exit();
             }
             UserEvent::WorkerExited(mode) => match mode {
@@ -1296,7 +1485,7 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         if let WindowEvent::CloseRequested = event {
-            self.controller.stop();
+            self.controller.shutdown();
             event_loop.exit();
         }
     }
@@ -1314,8 +1503,11 @@ fn build_tray_icon(
         })
         .icon(icon)
         .tooltip("Lang JP Capture")
+        .on_double_click(UserEvent::OpenCatalog)
         .menu(
             MenuBuilder::new()
+                .item("Open Lang", UserEvent::OpenCatalog)
+                .separator()
                 .item("Start", UserEvent::Start)
                 .item("Pause", UserEvent::Pause)
                 .item("Resume", UserEvent::Resume)
@@ -1705,10 +1897,166 @@ fn append_log_file(path: &Path, message: &str) {
     }
 }
 
+fn web_server_restart_delay(consecutive_failures: u32) -> Duration {
+    Duration::from_secs((1u64 << consecutive_failures.min(6)).min(60))
+}
+
+fn local_port_accepts_connections(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+fn spawn_web_server_process(config: &DaemonConfig) -> Result<Child> {
+    let python_executable = config
+        .web_python_executable
+        .as_ref()
+        .unwrap_or(&config.python_executable);
+    let python_args = config.web_python_args.as_ref().unwrap_or(&config.python_args);
+    if let Some(parent) = config.web_log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.web_log_path)
+        .with_context(|| format!("failed to open {}", config.web_log_path.display()))?;
+    let stderr_file = log_file.try_clone()?;
+    let mut command = Command::new(python_executable);
+    command
+        .args(python_args)
+        .arg(jp_root().join("lang_jp.py"))
+        .arg("--db")
+        .arg(&config.db_path)
+        .args(["browse", "--host", "127.0.0.1", "--port"])
+        .arg(config.web_port.to_string())
+        .arg("--no-open-browser")
+        .current_dir(jp_root())
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::null())
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .creation_flags(CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .with_context(|| format!("failed to launch {python_executable}"))
+}
+
+/// Kills the whole tree: the `py` and venv launchers run the real interpreter as a child.
+fn kill_process_tree(child: &mut Child) {
+    let killed = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !killed {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn open_catalog_when_ready(config: &DaemonConfig) {
+    let url = config.catalog_url();
+    let deadline = Instant::now() + CATALOG_READY_TIMEOUT;
+    while !local_port_accepts_connections(config.web_port) {
+        if Instant::now() >= deadline {
+            append_log_file(
+                &config.log_path,
+                &format!("catalog web server did not answer on {url} in time; opening it anyway"),
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+struct SingleInstanceGuard(HANDLE);
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+fn try_acquire_single_instance() -> Option<SingleInstanceGuard> {
+    let name: Vec<u16> = SINGLE_INSTANCE_MUTEX_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        // A null handle means we cannot tell; prefer running over silently doing nothing.
+        if !handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(handle);
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+}
+
+fn acquire_single_instance(wait: bool) -> Option<SingleInstanceGuard> {
+    let deadline = Instant::now() + INSTANCE_WAIT_TIMEOUT;
+    loop {
+        if let Some(guard) = try_acquire_single_instance() {
+            return Some(guard);
+        }
+        if !wait || Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct LaunchOptions {
+    open_catalog: bool,
+    wait_for_instance: bool,
+}
+
+impl LaunchOptions {
+    fn from_args(args: impl IntoIterator<Item = String>) -> Self {
+        let mut options = Self::default();
+        for arg in args {
+            match arg.as_str() {
+                "--open-catalog" => options.open_catalog = true,
+                "--wait-for-instance" => options.wait_for_instance = true,
+                _ => {}
+            }
+        }
+        options
+    }
+}
+
 fn main() -> Result<()> {
+    let options = LaunchOptions::from_args(std::env::args().skip(1));
     let config = DaemonConfig::load();
+    let Some(_instance) = acquire_single_instance(options.wait_for_instance) else {
+        // Another daemon already owns the tray and the web server; just forward the request.
+        if options.open_catalog {
+            open_catalog_when_ready(&config);
+        }
+        return Ok(());
+    };
     let tray_config = config.clone();
     let controller = Arc::new(Controller::new(config)?);
+    controller.spawn_web_server_supervisor();
+    if options.open_catalog {
+        controller.open_catalog();
+    }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     spawn_manual_capture_hotkey_listener(&tray_config, proxy.clone());
@@ -1801,5 +2149,63 @@ interval_seconds = 15
         assert_eq!(config.interval_seconds, 15);
         assert_eq!(config.ocr_max_side, default_ocr_max_side());
         assert_eq!(config.dedupe_window, 12);
+        assert!(config.web_server_enabled);
+        assert_eq!(config.web_port, DEFAULT_WEB_PORT);
+        assert_eq!(config.web_python_executable, None);
+    }
+
+    #[test]
+    fn daemon_config_from_toml_reads_web_server_overrides() {
+        let config = DaemonConfig::from_toml(
+            r#"
+web_server_enabled = false
+web_port = 9000
+web_python_executable = "../.venv/Scripts/python.exe"
+web_python_args = []
+web_log_path = "data/web.log"
+"#,
+        )
+        .expect("web server config should parse");
+
+        assert!(!config.web_server_enabled);
+        assert_eq!(config.web_port, 9000);
+        assert_eq!(config.catalog_url(), "http://127.0.0.1:9000/");
+        assert_eq!(
+            config.web_python_executable,
+            Some(
+                jp_root()
+                    .join("../.venv/Scripts/python.exe")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(config.web_python_args, Some(Vec::new()));
+        assert_eq!(config.web_log_path, jp_root().join("data/web.log"));
+    }
+
+    #[test]
+    fn web_server_restart_delay_backs_off_and_caps() {
+        assert_eq!(web_server_restart_delay(1), Duration::from_secs(2));
+        assert_eq!(web_server_restart_delay(2), Duration::from_secs(4));
+        assert_eq!(web_server_restart_delay(5), Duration::from_secs(32));
+        assert_eq!(web_server_restart_delay(6), Duration::from_secs(60));
+        assert_eq!(web_server_restart_delay(40), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn launch_options_parse_known_flags_and_ignore_others() {
+        let options = LaunchOptions::from_args(
+            ["--open-catalog", "--unknown", "--wait-for-instance"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(
+            options,
+            LaunchOptions {
+                open_catalog: true,
+                wait_for_instance: true,
+            }
+        );
+        assert_eq!(LaunchOptions::from_args(Vec::new()), LaunchOptions::default());
     }
 }

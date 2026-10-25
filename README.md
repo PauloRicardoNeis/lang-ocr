@@ -55,9 +55,7 @@ O projeto nao e apenas um OCR nem apenas um gerador de flashcards. Ele funciona 
 - `README.md`: visao geral do projeto.
 - `AGENTS.md`: convencoes operacionais para agentes.
 - `setup_windows.ps1`: bootstrap para recriar os ambientes Python no Windows e rodar smoke tests.
-- `open_jp_catalog.cmd`: atalho Windows para abrir a interface web local.
-- `open_jp_capture_tray.cmd`: atalho Windows para abrir o tray de captura passiva.
-- `open_jp_capture_logs.cmd`: atalho Windows para acompanhar o log de captura em tempo real.
+- `open_lang.cmd`: ponto de entrada unico no Windows. Sobe o tray (que supervisiona a interface web e o worker de OCR) e abre o catalogo no navegador. Se o tray ja estiver rodando, so abre o catalogo.
 - `JP/README.md`: detalhes do catalogo JP, comandos e fluxo de uso.
 - `JP/ocr_capture_spec.md`: especificacao do pipeline de captura automatizada.
 - `JP/ocr_capture_review.md`: anotacoes de revisao do fluxo de OCR/captura.
