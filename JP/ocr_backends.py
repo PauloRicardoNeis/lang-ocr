@@ -803,17 +803,32 @@ def is_duplicate_block(
     return overlap >= overlap_partial and text_similarity(block.text, other.text) >= text_threshold
 
 
+def _block_confidence(block: OcrBlock) -> float:
+    return block.confidence if block.confidence is not None else 0.0
+
+
 def merge_ocr_blocks(
     primary: list[OcrBlock],
     secondary: list[OcrBlock],
     **thresholds: float,
 ) -> list[OcrBlock]:
-    """Union of two engines' blocks, dropping secondary blocks that duplicate a primary one."""
+    """Union of two engines' blocks; duplicates keep the more confident reading.
+
+    Ties go to the primary engine. The confidence rule matters because each
+    engine hallucinates in its own script: meikiocr reads Korean as kana with
+    low character confidence, EasyOCR's Latin reader reads kanji as Latin
+    garbage with low confidence, and the right reader scores high on both.
+    """
     kept = list(primary)
     for block in secondary:
-        if any(is_duplicate_block(block, other, **thresholds) for other in kept):
-            continue
-        kept.append(block)
+        duplicate_index = next(
+            (index for index, other in enumerate(kept) if is_duplicate_block(block, other, **thresholds)),
+            None,
+        )
+        if duplicate_index is None:
+            kept.append(block)
+        elif _block_confidence(block) > _block_confidence(kept[duplicate_index]):
+            kept[duplicate_index] = block
     return sort_ocr_blocks_reading_order(kept)
 
 

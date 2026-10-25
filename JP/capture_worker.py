@@ -1439,19 +1439,39 @@ def dominant_block_language(
     *,
     default: str = DEFAULT_LANGUAGE_CODE,
 ) -> tuple[str, float | None]:
-    """Pick the language covering most letters across all analyzed segments."""
-    weights: dict[str, int] = {}
-    total = 0
+    """Pick the language covering most text across all analyzed segments.
+
+    Characters are weighted by how much text they stand for: a kanji or a
+    Hangul syllable block carries a whole syllable or word, a Latin letter does
+    not, so "Press START to continue" does not outweigh a ten-character
+    Japanese sentence on the same screen.
+    """
+    weights: dict[str, float] = {}
+    total = 0.0
     for block_results in analyzed_blocks:
         for payload, _ in block_results:
             code = str(payload.get("language_code") or default)
-            letters = sum(languages.script_histogram(str(payload.get("raw_text") or "")).values())
-            weights[code] = weights.get(code, 0) + letters
-            total += letters
+            weight = weighted_text_length(str(payload.get("raw_text") or ""))
+            weights[code] = weights.get(code, 0.0) + weight
+            total += weight
     if not weights or total == 0:
         return default, None
-    code, letters = max(weights.items(), key=lambda item: (item[1], item[0] == default, item[0]))
-    return code, round(letters / total, 3)
+    code, weight = max(weights.items(), key=lambda item: (item[1], item[0] == default, item[0]))
+    return code, round(weight / total, 3)
+
+
+SCRIPT_TEXT_WEIGHTS: dict[str, float] = {
+    languages.SCRIPT_JAPANESE: 2.5,
+    languages.SCRIPT_HAN: 2.5,
+    languages.SCRIPT_HANGUL: 2.0,
+}
+
+
+def weighted_text_length(text: str) -> float:
+    return sum(
+        count * SCRIPT_TEXT_WEIGHTS.get(script, 1.0)
+        for script, count in languages.script_histogram(text).items()
+    )
 
 
 def job_field(job, name: str) -> str | None:

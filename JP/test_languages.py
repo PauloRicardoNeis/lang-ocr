@@ -657,11 +657,15 @@ class WorkerLanguageTest(unittest.TestCase):
             ["Press", "START"],
         )
         self.assertTrue(all(candidate["language_code"] == "en" for candidate in english_candidates))
+        # Five Hangul syllable blocks weigh as much as the ten Latin letters of the
+        # two UI words; the tie goes to the default language.
         source_language, confidence = capture_worker.dominant_block_language(
             [results], default="ko"
         )
-        self.assertEqual(source_language, "en")
+        self.assertEqual(source_language, "ko")
         self.assertIsNotNone(confidence)
+        source_language, _ = capture_worker.dominant_block_language([results], default="en")
+        self.assertEqual(source_language, "en")
 
 
 class WebLanguageTest(unittest.TestCase):

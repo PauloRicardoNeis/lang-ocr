@@ -227,6 +227,19 @@ class BlockMergeTest(unittest.TestCase):
         easy = [self.block("ERJ RO E", 110, 205, 390, 238)]
         self.assertEqual([block.text for block in merge_ocr_blocks(meiki, easy)], ["勇者の墓は"])
 
+    def test_duplicate_keeps_the_more_confident_reading(self) -> None:
+        # meikiocr hallucinated kana over a Korean line; the Korean reader is sure.
+        meiki = [self.block("あんにょん", 100, 200, 400, 240, conf=0.42)]
+        korean = [self.block("안녕하세요", 102, 198, 398, 242, conf=0.97)]
+        merged = merge_ocr_blocks(meiki, korean)
+        self.assertEqual([(block.text, block.confidence) for block in merged], [("안녕하세요", 0.97)])
+        # Ties stay with the primary engine.
+        tie = merge_ocr_blocks(
+            [self.block("勇者", 100, 200, 400, 240, conf=0.9)],
+            [self.block("ERJ", 100, 200, 400, 240, conf=0.9)],
+        )
+        self.assertEqual([block.text for block in tie], ["勇者"])
+
     def test_weak_overlap_needs_similar_text(self) -> None:
         primary = [self.block("Continue", 100, 100, 300, 140)]
         similar = [self.block("Continu e", 250, 100, 460, 140)]  # 25% overlap, same words

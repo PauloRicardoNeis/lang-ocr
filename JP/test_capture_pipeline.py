@@ -113,6 +113,19 @@ class MultiEngineAdapterTest(unittest.TestCase):
             self.assertEqual(plan.easyocr_groups, (("es",),))
 
 
+class DominantLanguageTest(unittest.TestCase):
+    def test_cjk_characters_outweigh_latin_ui_labels(self) -> None:
+        analyzed = [
+            [({"language_code": "ja", "raw_text": "勇者の墓はここにある"}, [])],
+            [({"language_code": "en", "raw_text": "Press START to continue"}, [])],
+        ]
+        code, share = capture_worker.dominant_block_language(analyzed, default="en")
+        self.assertEqual(code, "ja")
+        self.assertGreater(share, 0.5)
+        korean = [[({"language_code": "ko", "raw_text": "안녕하세요"}, [])], [({"language_code": "en", "raw_text": "OK"}, [])]]
+        self.assertEqual(capture_worker.dominant_block_language(korean, default="en")[0], "ko")
+
+
 class PipelineCacheTest(unittest.TestCase):
     def test_pipeline_reuses_adapters_and_analyzers_per_language_set(self) -> None:
         with patch.object(capture_worker, "build_capture_ocr_adapter", side_effect=lambda name, enabled_languages: object()) as build:
