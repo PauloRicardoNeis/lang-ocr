@@ -828,6 +828,77 @@ def merge_engine_blocks(
     return sort_ocr_blocks_reading_order(merged)
 
 
+def easyocr_box_key(box) -> tuple:
+    """Hashable identity of an EasyOCR detection box (horizontal ``[x0,x1,y0,y1]`` or polygon)."""
+    try:
+        return tuple(tuple(int(round(float(v))) for v in point) if isinstance(point, (list, tuple)) else int(round(float(point))) for point in box)
+    except (TypeError, ValueError):
+        return (repr(box),)
+
+
+def easyocr_box_to_bbox(box) -> list[list[float]] | None:
+    """EasyOCR horizontal box ``[x_min, x_max, y_min, y_max]`` or polygon -> OcrBlock bbox."""
+    if not isinstance(box, (list, tuple)) or not box:
+        return None
+    if isinstance(box[0], (list, tuple)):
+        return [[float(point[0]), float(point[1])] for point in box]
+    if len(box) >= 4:
+        x_min, x_max, y_min, y_max = (float(v) for v in box[:4])
+        return [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]]
+    return None
+
+
+def recognize_with_shared_detection(
+    backends: list,
+    color_image,
+    grey_image,
+    *,
+    confident: float = 0.7,
+    on_pass=None,
+) -> list[OcrBlock]:
+    """Detect once, recognize per reader, keep the best reading per box.
+
+    Every reader after the first only looks at boxes nobody has read with
+    confidence ``confident`` or better yet, so a Latin-heavy screen costs one
+    detection plus one cheap recognition pass for the exotic readers, and each
+    box ends up with the reading its best-matching script model produced.
+    """
+    if not backends:
+        return []
+    horizontal_list, free_list = backends[0].detect_boxes(color_image)
+    boxes = [(box, "h") for box in horizontal_list] + [(box, "f") for box in free_list]
+    best: dict[tuple, tuple[float, OcrBlock]] = {}
+    for backend in backends:
+        pending_h: list = []
+        pending_f: list = []
+        for box, kind in boxes:
+            key = easyocr_box_key(box)
+            current = best.get(key)
+            if current is not None and current[0] >= confident:
+                continue
+            (pending_h if kind == "h" else pending_f).append(box)
+        read = backend.recognize_boxes(grey_image, pending_h, pending_f)
+        improved = 0
+        for block, box in zip(read, pending_h + pending_f):
+            key = easyocr_box_key(box)
+            confidence = block.confidence if block.confidence is not None else 0.0
+            # Boxes come back in the order they were sent, with EasyOCR's own
+            # bbox (polygon); keep the detector's rectangle for stable keys.
+            block = OcrBlock(text=block.text, confidence=block.confidence, bbox=block.bbox or easyocr_box_to_bbox(box))
+            current = best.get(key)
+            if current is None or confidence > current[0]:
+                best[key] = (confidence, block)
+                improved += 1
+        if on_pass is not None:
+            on_pass(backend, len(pending_h) + len(pending_f), improved)
+    ordered: list[OcrBlock] = []
+    for box, _ in boxes:
+        entry = best.get(easyocr_box_key(box))
+        if entry is not None and entry[1] not in ordered:
+            ordered.append(entry[1])
+    return ordered
+
+
 def scale_ocr_blocks(blocks: list[OcrBlock], factor: float) -> list[OcrBlock]:
     """Map boxes read on a downscaled image back to full-resolution coordinates."""
     if factor == 1.0:
@@ -947,6 +1018,41 @@ class EasyOcrBackend:
         else:
             target = str(source)
         result = self._reader.readtext(target, detail=1, paragraph=False)
+        return self.blocks_from_result(result)
+
+    @staticmethod
+    def prepare_arrays(image: Image.Image):
+        """``(color, grey)`` numpy arrays in the layout EasyOCR's detect/recognize expect."""
+        from easyocr.utils import reformat_input
+
+        return reformat_input(_numpy().array(image.convert("RGB")))
+
+    def detect_boxes(self, color_image) -> tuple[list, list]:
+        """Text boxes only. The CRAFT detector is the same for every reader, so one
+        reader's detection serves all language groups."""
+        horizontal, free = self._reader.detect(color_image, reformat=False)
+        return list(horizontal[0]), list(free[0])
+
+    def recognize_boxes(
+        self,
+        grey_image,
+        horizontal_list: list,
+        free_list: list,
+    ) -> list[OcrBlock]:
+        if not horizontal_list and not free_list:
+            return []
+        result = self._reader.recognize(
+            grey_image,
+            horizontal_list,
+            free_list,
+            detail=1,
+            paragraph=False,
+            reformat=False,
+        )
+        return self.blocks_from_result(result)
+
+    @staticmethod
+    def blocks_from_result(result) -> list[OcrBlock]:
         blocks: list[OcrBlock] = []
         for item in result:
             if not isinstance(item, (list, tuple)) or len(item) < 3:

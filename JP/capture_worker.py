@@ -58,6 +58,7 @@ from ocr_backends import (
     merge_engine_blocks,
     ocr_line_boxes_to_blocks,
     plan_ocr_engines,
+    recognize_with_shared_detection,
     resolve_capture_ocr_backend,
     scale_ocr_blocks,
     sort_ocr_blocks_reading_order,
@@ -83,6 +84,8 @@ DEBUG_ENABLED = os.environ.get("LANG_JP_CAPTURE_DEBUG") == "1"
 DEFAULT_OCR_MAX_SIDE = int(os.environ.get("LANG_JP_OCR_MAX_SIDE", "1600"))
 DEFAULT_OCR_PROGRESS_INTERVAL = float(os.environ.get("LANG_JP_OCR_PROGRESS_INTERVAL", "5"))
 DEFAULT_OCR_MIN_CONFIDENCE = float(os.environ.get("LANG_JP_OCR_MIN_CONFIDENCE", "0.30"))
+# A box read with at least this confidence by one EasyOCR reader is not sent to the next ones.
+DEFAULT_OCR_CONFIDENT_READ = float(os.environ.get("LANG_JP_OCR_CONFIDENT_READ", "0.7"))
 DEFAULT_OCR_HORIZONTAL_MIN_RATIO = float(os.environ.get("LANG_JP_OCR_HORIZONTAL_MIN_RATIO", "1.2"))
 DEFAULT_OCR_HORIZONTAL_MAX_ANGLE = float(os.environ.get("LANG_JP_OCR_HORIZONTAL_MAX_ANGLE", "18"))
 DEFAULT_OCR_REGION_PADDING = int(os.environ.get("LANG_JP_OCR_REGION_PADDING", "12"))
@@ -1154,6 +1157,73 @@ class MultiEngineOcrAdapter:
             )
         )
 
+    @property
+    def easyocr_engines(self) -> list[EasyOcrGroupAdapter]:
+        return [engine for engine in self.engines if isinstance(engine, EasyOcrGroupAdapter)]
+
+    def _read_easyocr_groups(
+        self,
+        image_path: Path,
+        *,
+        label: str,
+        echo_stdout: bool,
+    ) -> list[OcrBlock]:
+        """All EasyOCR readers over one shared detection pass (see ``recognize_with_shared_detection``)."""
+        engines = self.easyocr_engines
+        if not engines:
+            return []
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise SystemExit("Pillow is required to prepare OCR input images.") from exc
+
+        def do_read() -> tuple[list[OcrBlock], float]:
+            with Image.open(image_path) as image_file:
+                rgb = image_file.convert("RGB")
+            target, factor = downscale_for_easyocr(rgb)
+            color, grey = EasyOcrBackend.prepare_arrays(target)
+
+            def on_pass(backend, sent: int, improved: int) -> None:
+                append_worker_log(
+                    build_log_event(
+                        label,
+                        status="recognize",
+                        engine="easyocr:" + "+".join(getattr(backend, "languages", ())),
+                        boxes=sent,
+                        improved=improved,
+                    )
+                )
+
+            blocks = recognize_with_shared_detection(
+                [engine._engine for engine in engines],
+                color,
+                grey,
+                confident=DEFAULT_OCR_CONFIDENT_READ,
+                on_pass=on_pass,
+            )
+            return blocks, factor
+
+        engine_label = "easyocr:" + "|".join("+".join(engine.group) for engine in engines)
+        detected_blocks, factor = run_with_progress_logs(
+            f"{label} engine={engine_label}", do_read, echo_stdout=echo_stdout
+        )
+        kept_blocks, stats = filter_easyocr_blocks(detected_blocks, self.enabled_languages)
+        append_worker_log(
+            build_log_event(
+                label,
+                status="filter",
+                engine=engine_label,
+                boxes=stats["detected"],
+                kept=stats["kept"],
+                drop_off_lang=stats["off_language"],
+                drop_vertical=stats["vertical"],
+                drop_low_conf=stats["low_confidence"],
+                drop_no_bbox=stats["missing_bbox"],
+                drop_empty=stats["empty"],
+            )
+        )
+        return scale_ocr_blocks(kept_blocks, factor)
+
     def extract_blocks(
         self,
         image_path: Path,
@@ -1164,21 +1234,29 @@ class MultiEngineOcrAdapter:
     ) -> list[OcrBlock]:
         label = progress_label or build_log_event("step=ocr", image=image_path)
         groups: list[list[OcrBlock]] = []
+        names: list[str] = []
         for engine in self.engines:
-            groups.append(
-                engine.extract_blocks(
-                    image_path,
-                    prepared=prepared,
-                    progress_label=progress_label,
-                    echo_stdout=echo_stdout,
+            # EasyOCR groups share one detection pass below; every other engine
+            # (meikiocr) reads the capture on its own.
+            if not isinstance(engine, EasyOcrGroupAdapter):
+                groups.append(
+                    engine.extract_blocks(
+                        image_path,
+                        prepared=prepared,
+                        progress_label=progress_label,
+                        echo_stdout=echo_stdout,
+                    )
                 )
-            )
+                names.append(getattr(engine, "engine_name", type(engine).__name__))
+        if self.easyocr_engines:
+            groups.append(self._read_easyocr_groups(image_path, label=label, echo_stdout=echo_stdout))
+            names.append("easyocr")
         merged = merge_engine_blocks(groups)
         append_worker_log(
             build_log_event(
                 label,
                 status="merge",
-                engines=",".join(engine.engine_name for engine in self.engines),
+                engines=",".join(names),
                 per_engine=",".join(str(len(group)) for group in groups),
                 merged=len(merged),
             )
@@ -1259,11 +1337,13 @@ class LanguageSegmentAnalyzer:
         )
         if not runs:
             # Nothing matched an enabled language; keep the raw segment so the
-            # reviewer still sees the text, tagged with the default language.
+            # reviewer still sees the text, tagged with the language it looks
+            # like (unrestricted detection) and without candidates.
+            guess = languages.detect_language(normalized_text, default=self.enabled_languages[0])
             payload, candidates = build_segment_candidates(
                 connection,
                 text=normalized_text,
-                language_code=self.enabled_languages[0],
+                language_code=guess.code,
                 tokens=[],
                 confidence=block.confidence,
                 bbox_json=bbox_json(block.bbox),

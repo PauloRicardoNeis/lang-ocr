@@ -25,7 +25,12 @@ use trayicon::{Icon, MenuBuilder, TrayIcon, TrayIconBuilder};
 use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
 use windows_capture::monitor::Monitor;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_BACK, VK_DELETE,
     VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
@@ -56,6 +61,10 @@ enum UserEvent {
     TailLogs,
     ToggleDebug,
     OpenCatalog,
+    OpenCaptureSettings,
+    ToggleCaptureLanguage(String),
+    CaptureAllLanguages,
+    CaptureJapaneseOnly,
     Quit,
     WorkerExited(WorkerLaunchMode),
 }
@@ -109,6 +118,8 @@ struct DaemonConfig {
     web_python_executable: Option<String>,
     web_python_args: Option<Vec<String>>,
     web_log_path: PathBuf,
+    #[serde(default = "default_true")]
+    record_foreground_window: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -133,6 +144,7 @@ struct DaemonConfigPatch {
     web_python_executable: Option<String>,
     web_python_args: Option<Vec<String>>,
     web_log_path: Option<PathBuf>,
+    record_foreground_window: Option<bool>,
 }
 
 fn jp_root() -> PathBuf {
@@ -203,6 +215,7 @@ impl Default for DaemonConfig {
             web_python_executable: None,
             web_python_args: None,
             web_log_path: jp_root.join("data").join("catalog_web.log"),
+            record_foreground_window: true,
         }
     }
 }
@@ -289,7 +302,14 @@ impl DaemonConfig {
         if let Some(value) = patch.web_log_path {
             self.web_log_path = resolve_jp_config_path(value);
         }
+        if let Some(value) = patch.record_foreground_window {
+            self.record_foreground_window = value;
+        }
         self
+    }
+
+    fn capture_settings_url(&self) -> String {
+        format!("{}capture", self.catalog_url())
     }
 
     fn catalog_url(&self) -> String {
@@ -819,6 +839,38 @@ impl Controller {
         std::thread::spawn(move || open_catalog_when_ready(&config));
     }
 
+    fn open_capture_settings(&self) {
+        let config = self.config.clone();
+        std::thread::spawn(move || open_url_when_ready(&config, &config.capture_settings_url()));
+    }
+
+    /// Flips one language's capture flag in the database (the worker reads it per job).
+    fn toggle_capture_language(&self, code: &str) {
+        let current = load_capture_languages(&self.config.db_path)
+            .into_iter()
+            .find(|language| language.code == code)
+            .map(|language| language.capture_enabled)
+            .unwrap_or(false);
+        match set_capture_language(&self.config.db_path, code, !current) {
+            Ok(()) => self.append_log(&format!(
+                "capture language {code} {}",
+                if current { "disabled" } else { "enabled" }
+            )),
+            Err(error) => self.append_log(&format!("failed to update capture language {code}: {error:#}")),
+        }
+    }
+
+    fn set_capture_preset(&self, japanese_only: bool) {
+        match set_capture_languages_preset(&self.config.db_path, japanese_only) {
+            Ok(()) => self.append_log(if japanese_only {
+                "capture languages set to Japanese only"
+            } else {
+                "capture languages set to every registered language"
+            }),
+            Err(error) => self.append_log(&format!("failed to update capture languages: {error:#}")),
+        }
+    }
+
     fn spawn_web_server_supervisor(&self) {
         if !self.config.web_server_enabled {
             self.append_log("catalog web server supervision disabled by config");
@@ -1250,19 +1302,34 @@ impl Controller {
                             );
                         }
 
+                        // The foreground window at capture time: capture profiles
+                        // match on it, and the source gets the title.
+                        let foreground = if config.record_foreground_window {
+                            foreground_window_info()
+                        } else {
+                            ForegroundWindowInfo::default()
+                        };
+
                         match enqueue_capture_job(
                             &config.db_path,
                             &temp_path,
                             &sha256,
                             &phash,
+                            &foreground,
                         ) {
                             Ok(job_id) => {
                                 append_log_file(
                                     &log_path,
                                     &format!(
-                                        "queue job={job_id} image={} sha={}",
+                                        "queue job={job_id} image={} sha={} window={} process={}",
                                         short_path(&temp_path),
                                         short_hash(&sha256),
+                                        foreground
+                                            .title
+                                            .as_deref()
+                                            .map(|value| format!("{value:?}"))
+                                            .unwrap_or_else(|| "-".to_string()),
+                                        foreground.process_name.as_deref().unwrap_or("-"),
                                     ),
                                 );
                                 recent.push_back(CaptureFingerprint { sha256, phash });
@@ -1398,6 +1465,155 @@ struct App {
     tray_icon: TrayIcon<UserEvent>,
     controller: Arc<Controller>,
     proxy: EventLoopProxy<UserEvent>,
+    menu_languages: Vec<CaptureLanguage>,
+    tick_count: u64,
+}
+
+const MENU_REFRESH_TICKS: u64 = 5;
+
+/// One row of the `languages` table as the tray needs it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CaptureLanguage {
+    code: String,
+    name: String,
+    enabled: bool,
+    capture_enabled: bool,
+}
+
+/// Title and process of the window that had focus when a frame was captured.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ForegroundWindowInfo {
+    title: Option<String>,
+    process_name: Option<String>,
+}
+
+fn foreground_window_info() -> ForegroundWindowInfo {
+    // SAFETY: plain Win32 queries on the current foreground window; buffers are
+    // sized up front and every handle we open is closed before returning.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return ForegroundWindowInfo::default();
+        }
+        let mut title_buffer = [0u16; 512];
+        let length = GetWindowTextW(hwnd, title_buffer.as_mut_ptr(), title_buffer.len() as i32);
+        let title = if length > 0 {
+            Some(String::from_utf16_lossy(&title_buffer[..length as usize]))
+        } else {
+            None
+        };
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let mut process_name = None;
+        if pid != 0 {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !handle.is_null() {
+                let mut path_buffer = [0u16; 1024];
+                let mut size: u32 = path_buffer.len() as u32;
+                if QueryFullProcessImageNameW(handle, 0, path_buffer.as_mut_ptr(), &mut size) != 0
+                    && size > 0
+                {
+                    let full_path = String::from_utf16_lossy(&path_buffer[..size as usize]);
+                    process_name = process_name_from_path(&full_path);
+                }
+                CloseHandle(handle);
+            }
+        }
+        ForegroundWindowInfo {
+            title: title.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()),
+            process_name,
+        }
+    }
+}
+
+fn process_name_from_path(full_path: &str) -> Option<String> {
+    let name = full_path
+        .rsplit(['\\', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(name.to_string())
+}
+
+fn load_capture_languages(db_path: &Path) -> Vec<CaptureLanguage> {
+    let Ok(connection) = open_db(db_path) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT code, name, enabled, capture_enabled
+         FROM languages
+         ORDER BY sort_order ASC, name COLLATE NOCASE ASC",
+    ) else {
+        // The column appears once the Python side upgrades the schema; until then
+        // the menu simply has no languages to show.
+        return Vec::new();
+    };
+    let rows = statement.query_map([], |row| {
+        Ok(CaptureLanguage {
+            code: row.get::<_, String>(0)?,
+            name: row.get::<_, String>(1)?,
+            enabled: row.get::<_, i64>(2)? != 0,
+            capture_enabled: row.get::<_, i64>(3)? != 0,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn set_capture_language(db_path: &Path, code: &str, enabled: bool) -> Result<()> {
+    let connection = open_db(db_path)?;
+    let changed = connection.execute(
+        "UPDATE languages
+         SET capture_enabled = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE code = ?2",
+        params![if enabled { 1 } else { 0 }, code],
+    )?;
+    if changed == 0 {
+        return Err(anyhow!("language {code} is not registered"));
+    }
+    Ok(())
+}
+
+fn set_capture_languages_preset(db_path: &Path, japanese_only: bool) -> Result<()> {
+    let connection = open_db(db_path)?;
+    if japanese_only {
+        connection.execute(
+            "UPDATE languages
+             SET capture_enabled = CASE WHEN code = 'ja' THEN 1 ELSE 0 END,
+                 updated_at = CURRENT_TIMESTAMP",
+            [],
+        )?;
+    } else {
+        connection.execute(
+            "UPDATE languages SET capture_enabled = 1, updated_at = CURRENT_TIMESTAMP",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn capture_languages_menu(languages: &[CaptureLanguage]) -> MenuBuilder<UserEvent> {
+    let mut menu = MenuBuilder::new()
+        .item("Open capture settings (web)", UserEvent::OpenCaptureSettings)
+        .item("Capture every language", UserEvent::CaptureAllLanguages)
+        .item("Capture Japanese only", UserEvent::CaptureJapaneseOnly)
+        .separator();
+    if languages.is_empty() {
+        menu = menu.item("(no languages registered yet)", UserEvent::OpenCaptureSettings);
+    }
+    for language in languages {
+        if !language.enabled {
+            continue;
+        }
+        menu = menu.checkable(
+            &format!("{} ({})", language.name, language.code),
+            language.capture_enabled,
+            UserEvent::ToggleCaptureLanguage(language.code.clone()),
+        );
+    }
+    menu
 }
 
 fn capture_now_menu_label(config: &DaemonConfig) -> String {
@@ -1413,8 +1629,32 @@ fn capture_now_menu_label(config: &DaemonConfig) -> String {
 }
 
 impl App {
+    /// Rebuilds the tray menu when the capture languages in the database changed
+    /// (or always, right after a toggle from the menu itself).
+    fn refresh_menu(&mut self, force: bool) {
+        let languages = load_capture_languages(&self.controller.config.db_path);
+        if !force && languages == self.menu_languages {
+            return;
+        }
+        self.menu_languages = languages;
+        let menu = build_tray_menu(&self.controller.config, &self.menu_languages);
+        if let Err(error) = self.tray_icon.set_menu(&menu) {
+            self.controller
+                .append_log(&format!("failed to refresh tray menu: {error:?}"));
+        }
+    }
+
     fn refresh_tooltip(&mut self) {
-        let tooltip = format!("Lang JP Capture: {}", self.controller.tooltip_details());
+        let captured = self
+            .menu_languages
+            .iter()
+            .filter(|language| language.enabled && language.capture_enabled)
+            .count();
+        let tooltip = format!(
+            "Lang Capture: {} | languages {}",
+            self.controller.tooltip_details(),
+            if captured == 0 { "none".to_string() } else { captured.to_string() }
+        );
         let decorated = if self.controller.debug_enabled() {
             format!("{tooltip} [debug]")
         } else {
@@ -1460,11 +1700,30 @@ impl ApplicationHandler<UserEvent> for App {
                     .controller
                     .append_log(&format!("failed to restart app: {error}")),
             },
-            UserEvent::TooltipTick => {}
+            UserEvent::TooltipTick => {
+                // The web UI and the CLI change the capture set too; pick those up.
+                self.tick_count = self.tick_count.wrapping_add(1);
+                if self.tick_count % MENU_REFRESH_TICKS == 0 {
+                    self.refresh_menu(false);
+                }
+            }
             UserEvent::OpenLogs => self.controller.open_logs(),
             UserEvent::TailLogs => self.controller.tail_logs(),
             UserEvent::ToggleDebug => self.controller.toggle_debug(),
             UserEvent::OpenCatalog => self.controller.open_catalog(),
+            UserEvent::OpenCaptureSettings => self.controller.open_capture_settings(),
+            UserEvent::ToggleCaptureLanguage(code) => {
+                self.controller.toggle_capture_language(&code);
+                self.refresh_menu(true);
+            }
+            UserEvent::CaptureAllLanguages => {
+                self.controller.set_capture_preset(false);
+                self.refresh_menu(true);
+            }
+            UserEvent::CaptureJapaneseOnly => {
+                self.controller.set_capture_preset(true);
+                self.refresh_menu(true);
+            }
             UserEvent::Quit => {
                 self.controller.shutdown();
                 event_loop.exit();
@@ -1491,9 +1750,54 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+fn build_tray_menu(config: &DaemonConfig, languages: &[CaptureLanguage]) -> MenuBuilder<UserEvent> {
+    MenuBuilder::new()
+        .item("Open Lang", UserEvent::OpenCatalog)
+        .submenu("Capture languages", capture_languages_menu(languages))
+        .separator()
+        .item("Start", UserEvent::Start)
+        .item("Pause", UserEvent::Pause)
+        .item("Resume", UserEvent::Resume)
+        .item(&capture_now_menu_label(config), UserEvent::CaptureNow)
+        .separator()
+        .item(
+            "Cadence: Fixed interval",
+            UserEvent::SetCadenceFixedInterval,
+        )
+        .item(
+            "Cadence: After source ready",
+            UserEvent::SetCadenceAfterSourceReady,
+        )
+        .separator()
+        .item("Capture interval: 5s", UserEvent::SetInterval(5))
+        .item("Capture interval: 15s", UserEvent::SetInterval(15))
+        .item("Capture interval: 30s", UserEvent::SetInterval(30))
+        .item("Capture interval: 60s", UserEvent::SetInterval(60))
+        .item("Capture interval: 120s", UserEvent::SetInterval(120))
+        .separator()
+        .item("OCR size: Original (4K)", UserEvent::SetOcrMaxSide(0))
+        .item("OCR size: 1600px", UserEvent::SetOcrMaxSide(1600))
+        .item("OCR size: 1920px", UserEvent::SetOcrMaxSide(1920))
+        .item("OCR size: 2560px", UserEvent::SetOcrMaxSide(2560))
+        .separator()
+        .item("Process next OCR job", UserEvent::ProcessNextJob)
+        .item(
+            "Process all pending OCR jobs",
+            UserEvent::ProcessPendingQueue,
+        )
+        .item("Restart app", UserEvent::RestartApp)
+        .separator()
+        .item("Open logs", UserEvent::OpenLogs)
+        .item("Tail logs", UserEvent::TailLogs)
+        .item("Toggle debug mode", UserEvent::ToggleDebug)
+        .separator()
+        .item("Quit", UserEvent::Quit)
+}
+
 fn build_tray_icon(
     proxy: EventLoopProxy<UserEvent>,
     config: &DaemonConfig,
+    languages: &[CaptureLanguage],
 ) -> Result<TrayIcon<UserEvent>> {
     let icon = Icon::from_buffer(build_tray_icon_ico(), Some(16), Some(16))
         .map_err(|error| anyhow!("failed to create tray icon: {error}"))?;
@@ -1502,50 +1806,9 @@ fn build_tray_icon(
             let _ = proxy.send_event(event.clone());
         })
         .icon(icon)
-        .tooltip("Lang JP Capture")
+        .tooltip("Lang Capture")
         .on_double_click(UserEvent::OpenCatalog)
-        .menu(
-            MenuBuilder::new()
-                .item("Open Lang", UserEvent::OpenCatalog)
-                .separator()
-                .item("Start", UserEvent::Start)
-                .item("Pause", UserEvent::Pause)
-                .item("Resume", UserEvent::Resume)
-                .item(&capture_now_menu_label(config), UserEvent::CaptureNow)
-                .separator()
-                .item(
-                    "Cadence: Fixed interval",
-                    UserEvent::SetCadenceFixedInterval,
-                )
-                .item(
-                    "Cadence: After source ready",
-                    UserEvent::SetCadenceAfterSourceReady,
-                )
-                .separator()
-                .item("Capture interval: 5s", UserEvent::SetInterval(5))
-                .item("Capture interval: 15s", UserEvent::SetInterval(15))
-                .item("Capture interval: 30s", UserEvent::SetInterval(30))
-                .item("Capture interval: 60s", UserEvent::SetInterval(60))
-                .item("Capture interval: 120s", UserEvent::SetInterval(120))
-                .separator()
-                .item("OCR size: Original (4K)", UserEvent::SetOcrMaxSide(0))
-                .item("OCR size: 1600px", UserEvent::SetOcrMaxSide(1600))
-                .item("OCR size: 1920px", UserEvent::SetOcrMaxSide(1920))
-                .item("OCR size: 2560px", UserEvent::SetOcrMaxSide(2560))
-                .separator()
-                .item("Process next OCR job", UserEvent::ProcessNextJob)
-                .item(
-                    "Process all pending OCR jobs",
-                    UserEvent::ProcessPendingQueue,
-                )
-                .item("Restart app", UserEvent::RestartApp)
-                .separator()
-                .item("Open logs", UserEvent::OpenLogs)
-                .item("Tail logs", UserEvent::TailLogs)
-                .item("Toggle debug mode", UserEvent::ToggleDebug)
-                .separator()
-                .item("Quit", UserEvent::Quit),
-        )
+        .menu(build_tray_menu(config, languages))
         .build()
         .map_err(|error| anyhow!("failed to build tray icon: {error}"))?;
     Ok(tray_icon)
@@ -1618,13 +1881,37 @@ fn open_db(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// Adds the window metadata columns on databases the Python side has not upgraded yet.
+fn ensure_capture_job_window_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(capture_jobs)")?;
+    let columns: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .collect();
+    for (name, column_type) in [
+        ("window_title", "TEXT"),
+        ("process_name", "TEXT"),
+        ("capture_profile_id", "INTEGER"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            connection.execute(
+                &format!("ALTER TABLE capture_jobs ADD COLUMN {name} {column_type}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn enqueue_capture_job(
     db_path: &Path,
     temp_path: &Path,
     sha256: &str,
     phash: &ImageHash,
+    foreground: &ForegroundWindowInfo,
 ) -> Result<i64> {
     let connection = open_db(db_path)?;
+    ensure_capture_job_window_columns(&connection)?;
     let now: DateTime<Local> = Local::now();
     let temp_image_path = repo_local_storage_path(temp_path);
     connection.execute(
@@ -1634,15 +1921,19 @@ fn enqueue_capture_job(
             status,
             temp_image_path,
             image_sha256,
-            image_phash
+            image_phash,
+            window_title,
+            process_name
         )
-        VALUES (?1, 'pending', ?2, ?3, ?4)
+        VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6)
         ",
         params![
             now.to_rfc3339(),
             temp_image_path,
             sha256,
             phash.to_base64(),
+            foreground.title.as_deref(),
+            foreground.process_name.as_deref(),
         ],
     )?;
     Ok(connection.last_insert_rowid())
@@ -1962,7 +2253,10 @@ fn kill_process_tree(child: &mut Child) {
 }
 
 fn open_catalog_when_ready(config: &DaemonConfig) {
-    let url = config.catalog_url();
+    open_url_when_ready(config, &config.catalog_url());
+}
+
+fn open_url_when_ready(config: &DaemonConfig, url: &str) {
     let deadline = Instant::now() + CATALOG_READY_TIMEOUT;
     while !local_port_accepts_connections(config.web_port) {
         if Instant::now() >= deadline {
@@ -1975,7 +2269,7 @@ fn open_catalog_when_ready(config: &DaemonConfig) {
         std::thread::sleep(Duration::from_millis(250));
     }
     let _ = Command::new("cmd")
-        .args(["/C", "start", "", &url])
+        .args(["/C", "start", "", url])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 }
@@ -2069,12 +2363,15 @@ fn main() -> Result<()> {
             }
         });
     }
-    let tray_icon = build_tray_icon(proxy.clone(), &tray_config)?;
+    let menu_languages = load_capture_languages(&tray_config.db_path);
+    let tray_icon = build_tray_icon(proxy.clone(), &tray_config, &menu_languages)?;
     let mut app = App {
         window: None,
         tray_icon,
         controller,
         proxy,
+        menu_languages,
+        tick_count: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -2181,6 +2478,95 @@ web_log_path = "data/web.log"
         );
         assert_eq!(config.web_python_args, Some(Vec::new()));
         assert_eq!(config.web_log_path, jp_root().join("data/web.log"));
+    }
+
+    #[test]
+    fn daemon_config_reads_foreground_window_flag() {
+        let config = DaemonConfig::from_toml("record_foreground_window = false")
+            .expect("flag should parse");
+        assert!(!config.record_foreground_window);
+        assert!(DaemonConfig::default().record_foreground_window);
+        assert_eq!(config.capture_settings_url(), "http://127.0.0.1:8766/capture");
+    }
+
+    #[test]
+    fn process_name_is_the_last_path_component() {
+        assert_eq!(
+            process_name_from_path(r"C:\Games\DQ11\DQXI.exe"),
+            Some("DQXI.exe".to_string())
+        );
+        assert_eq!(process_name_from_path("game/bin/vn.exe"), Some("vn.exe".to_string()));
+        assert_eq!(process_name_from_path(""), None);
+    }
+
+    #[test]
+    fn capture_languages_menu_lists_enabled_languages_as_checkboxes() {
+        let languages = vec![
+            CaptureLanguage {
+                code: "ja".into(),
+                name: "Japanese".into(),
+                enabled: true,
+                capture_enabled: true,
+            },
+            CaptureLanguage {
+                code: "es".into(),
+                name: "Spanish".into(),
+                enabled: false,
+                capture_enabled: true,
+            },
+        ];
+        let menu = capture_languages_menu(&languages);
+        let rendered = format!("{menu:?}");
+        assert!(rendered.contains("Japanese (ja)"));
+        assert!(!rendered.contains("Spanish (es)"));
+    }
+
+    #[test]
+    fn enqueue_adds_window_columns_and_stores_foreground_metadata() {
+        let dir = std::env::temp_dir().join(format!("lang-daemon-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let db_path = dir.join("jobs.sqlite3");
+        let _ = fs::remove_file(&db_path);
+        {
+            let connection = open_db(&db_path).expect("open db");
+            connection
+                .execute_batch(
+                    "CREATE TABLE capture_jobs (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        captured_at TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        temp_image_path TEXT,
+                        image_sha256 TEXT,
+                        image_phash TEXT
+                    );",
+                )
+                .expect("legacy table");
+        }
+        let foreground = ForegroundWindowInfo {
+            title: Some("DRAGON QUEST XI".to_string()),
+            process_name: Some("DQXI.exe".to_string()),
+        };
+        let job_id = enqueue_capture_job(
+            &db_path,
+            &dir.join("frame.png"),
+            "abc",
+            &sample_hash(1),
+            &foreground,
+        )
+        .expect("enqueue");
+        let connection = open_db(&db_path).expect("open db");
+        let (title, process): (String, String) = connection
+            .query_row(
+                "SELECT window_title, process_name FROM capture_jobs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(title, "DRAGON QUEST XI");
+        assert_eq!(process, "DQXI.exe");
+        drop(connection);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
