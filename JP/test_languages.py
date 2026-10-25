@@ -136,6 +136,201 @@ class AnalyzerTest(unittest.TestCase):
         self.assertEqual(combined, "我是中国人")
 
 
+class ReadingTest(unittest.TestCase):
+    def test_hangul_revised_romanization(self) -> None:
+        self.assertEqual(languages.romanize("안녕하세요", "ko"), "annyeonghaseyo")
+        self.assertEqual(languages.romanize("반갑습니다", "ko"), "bangapseupnida")
+        self.assertEqual(languages.romanize_hangul("한국어 OK"), "hangugeo OK")
+
+    def test_cyrillic_transliteration_per_language(self) -> None:
+        self.assertEqual(languages.romanize("Привет мир", "ru"), "Privet mir")
+        self.assertEqual(languages.romanize("щука", "ru"), "shchuka")
+        self.assertEqual(languages.romanize("Київ їжак", "uk"), "Kyyiv yizhak")
+        self.assertEqual(languages.romanize("Київ", "ru"), "Kiyiv")
+
+    def test_pinyin_through_pypinyin_or_clear_fallback(self) -> None:
+        reading = languages.romanize("中国", "zh")
+        if languages.romanizer_available("zh"):
+            self.assertEqual(reading, "zhōng guó")
+        else:
+            self.assertIsNone(reading)
+
+    def test_languages_without_romanizer_get_no_reading(self) -> None:
+        self.assertIsNone(languages.romanize("hola", "es"))
+        self.assertIsNone(languages.romanize("回復", "ja"))
+        self.assertIsNone(languages.romanize("", "ko"))
+        self.assertTrue(languages.get_language("ru").has_readings)
+        self.assertFalse(languages.get_language("es").has_readings)
+
+    def test_analyzers_attach_readings_for_languages_with_readings(self) -> None:
+        korean = languages.GenericAnalyzer("ko").analyze("안녕하세요 Press")
+        self.assertEqual([(token.surface, token.reading) for token in korean][0], ("안녕하세요", "annyeonghaseyo"))
+        self.assertIsNone(korean[1].reading)
+        russian = languages.GenericAnalyzer("ru").analyze("Привет")
+        self.assertEqual(russian[0].reading, "Privet")
+        spanish = languages.GenericAnalyzer("es").analyze("hola")
+        self.assertIsNone(spanish[0].reading)
+        chinese = languages.HanAnalyzer().analyze("中国")
+        if languages.romanizer_available("zh"):
+            self.assertEqual(chinese[0].reading, "zhōng guó")
+            self.assertEqual([sub.reading for sub in chinese[0].sub_tokens], ["zhōng", "guó"])
+
+
+class CaptureConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "capture.sqlite3"
+        connection = db_connect(self.db_path)
+        try:
+            connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_fresh_database_captures_every_builtin_language(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            codes = lang_jp.capture_language_codes(connection, override="")
+            rows = connection.execute(
+                "SELECT code, enabled, capture_enabled FROM languages"
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(set(codes), set(languages.BUILTIN_LANGUAGES))
+        self.assertEqual(codes[0], "ja")
+        self.assertTrue(all(row["enabled"] and row["capture_enabled"] for row in rows))
+
+    def test_capture_flags_are_stored_and_env_is_only_an_override(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es", "en", "ko", "ja"])
+            stored = lang_jp.capture_language_codes(connection, override="")
+            lang_jp.set_language_capture_enabled(connection, "de", True)
+            lang_jp.set_language_capture_enabled(connection, "en", False)
+            after_toggle = lang_jp.capture_language_codes(connection, override="")
+            overridden = lang_jp.capture_language_codes(connection, override="pt, it")
+            lang_jp.set_capture_languages(connection, [])
+            empty = lang_jp.capture_language_codes(connection, override="")
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(stored, ("ja", "en", "es", "ko"))
+        self.assertEqual(after_toggle, ("ja", "de", "es", "ko"))
+        self.assertEqual(overridden, ("pt", "it"))
+        self.assertEqual(empty, ("ja",))
+
+    def test_capture_profiles_match_window_and_process_patterns(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            spanish_id = lang_jp.upsert_capture_profile(
+                connection,
+                name="Spanish RPG",
+                language_codes="es,en",
+                window_title_pattern="*dragon quest*",
+            )
+            korean_id = lang_jp.upsert_capture_profile(
+                connection,
+                name="Korean VN",
+                language_codes="ko",
+                process_name_pattern="kvn.exe",
+                priority=10,
+            )
+            lang_jp.upsert_capture_profile(
+                connection,
+                name="Disabled",
+                language_codes="de",
+                window_title_pattern="dragon",
+                enabled=False,
+                priority=1,
+            )
+            spanish = lang_jp.match_capture_profile(
+                connection, window_title="DRAGON QUEST XI - Steam", process_name="dq11.exe"
+            )
+            korean = lang_jp.match_capture_profile(
+                connection, window_title="anything", process_name="C:\\Games\\KVN.exe"
+            )
+            nothing = lang_jp.match_capture_profile(
+                connection, window_title="Notepad", process_name="notepad.exe"
+            )
+            replaced_id = lang_jp.upsert_capture_profile(
+                connection,
+                name="Spanish RPG",
+                language_codes="pt",
+                window_title_pattern="dragon quest",
+            )
+            removed = lang_jp.delete_capture_profile(connection, name="Korean VN")
+            rows = lang_jp.list_capture_profiles(connection)
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(spanish["id"], spanish_id)
+        self.assertEqual(lang_jp.capture_profile_languages(spanish), ("es", "en"))
+        self.assertEqual(korean["id"], korean_id)
+        self.assertEqual(lang_jp.capture_profile_languages(korean), ("ko",))
+        self.assertIsNone(nothing)
+        self.assertEqual(replaced_id, spanish_id)
+        self.assertTrue(removed)
+        self.assertEqual([row["name"] for row in rows], ["Disabled", "Spanish RPG"])
+        self.assertEqual(rows[1]["language_codes"], "pt")
+
+    def test_worker_resolves_languages_from_profile_or_capture_set(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["ja", "en"])
+            lang_jp.upsert_capture_profile(
+                connection,
+                name="Korean VN",
+                language_codes="ko",
+                window_title_pattern="VN",
+            )
+            codes, profile, forced = capture_worker.resolve_job_languages(
+                connection, window_title="My VN", process_name=None
+            )
+            default_codes, default_profile, default_forced = capture_worker.resolve_job_languages(
+                connection, window_title="Notepad", process_name="notepad.exe"
+            )
+        finally:
+            connection.close()
+        self.assertEqual((codes, profile["name"], forced), (("ko",), "Korean VN", True))
+        self.assertEqual((default_codes, default_profile, default_forced), (("ja", "en"), None, False))
+
+    def test_forced_language_analyzer_skips_detection(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            analyzer = capture_worker.LanguageSegmentAnalyzer(("pt",), forced_language="pt")
+            results = analyzer.analyze_block(
+                connection, OcrBlock(text="Press START", confidence=0.9, bbox=None)
+            )
+        finally:
+            connection.close()
+        self.assertEqual([payload["language_code"] for payload, _ in results], ["pt"])
+
+    def test_capture_job_keeps_window_metadata(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            job_id = lang_jp.create_capture_job(
+                connection,
+                captured_at="2026-10-24T10:00:00-03:00",
+                temp_image_path="data/capture_spool/x.png",
+                image_sha256="abc",
+                image_phash=None,
+                window_title="DRAGON QUEST XI",
+                process_name="dq11.exe",
+            )
+            lang_jp.update_capture_job_status(
+                connection, job_id=job_id, status="accepted", capture_profile_id=7
+            )
+            row = connection.execute("SELECT * FROM capture_jobs WHERE id = ?", (job_id,)).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(row["window_title"], "DRAGON QUEST XI")
+        self.assertEqual(row["process_name"], "dq11.exe")
+        self.assertEqual(row["capture_profile_id"], 7)
+
+
 class CatalogLanguageTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -531,6 +726,25 @@ class WebLanguageTest(unittest.TestCase):
         page = lang_jp_web.dashboard_page(self.db_path, {"lang": ["es"]})
         self.assertIn("Lang::Spanish", page)
         self.assertIn("Idiomas", page)
+
+    def test_lang_all_is_accepted_everywhere(self) -> None:
+        params = {"lang": ["all"]}
+        self.assertEqual(lang_jp_web.current_language(params), "all")
+        terms = lang_jp_web.api_terms_payload(self.db_path, params)
+        self.assertEqual(terms["meta"]["lang"], "all")
+        self.assertEqual({term["language_code"] for term in terms["terms"]}, {"es", "en"})
+        sources = lang_jp_web.api_sources_payload(self.db_path, params)
+        self.assertEqual({row["language_code"] for row in sources["sources"]}, {"es", "en"})
+        cards = lang_jp_web.api_flashcards_payload(self.db_path, params)
+        self.assertEqual(cards["meta"]["lang"], "all")
+        for page in (
+            lang_jp_web.dashboard_page(self.db_path, params),
+            lang_jp_web.terms_page(self.db_path, params),
+            lang_jp_web.kanji_page(self.db_path, params),
+            lang_jp_web.sources_page(self.db_path, params),
+            lang_jp_web.flashcards_page(self.db_path, params),
+        ):
+            self.assertIn('class="lang-bar"', page)
 
 
 if __name__ == "__main__":

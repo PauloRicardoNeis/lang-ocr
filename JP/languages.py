@@ -13,6 +13,8 @@ Main entry points:
 - :func:`split_script_runs` splits mixed text into runs of one script.
 - :func:`get_analyzer` returns the tokenizer/lemmatizer for a language.
 - :func:`analyze_text` detects, splits and tokenizes in one call.
+- :func:`romanize` gives non-Japanese languages with readings a Latin reading
+  (pinyin via ``pypinyin`` when installed, Hangul and Cyrillic built in).
 """
 
 from __future__ import annotations
@@ -127,8 +129,15 @@ BUILTIN_LANGUAGES: dict[str, LanguageProfile] = {
             analyzer="han",
             romanizer="pinyin",
         ),
-        _profile("ru", "Russian", "Русский", SCRIPT_CYRILLIC, romanizer="cyrillic"),
-        _profile("uk", "Ukrainian", "Українська", SCRIPT_CYRILLIC, romanizer="cyrillic"),
+        _profile("ru", "Russian", "Русский", SCRIPT_CYRILLIC, has_readings=True, romanizer="cyrillic"),
+        _profile(
+            "uk",
+            "Ukrainian",
+            "Українська",
+            SCRIPT_CYRILLIC,
+            has_readings=True,
+            romanizer="cyrillic",
+        ),
         _profile("el", "Greek", "Ελληνικά", SCRIPT_GREEK),
         _profile("ar", "Arabic", "العربية", SCRIPT_ARABIC, rtl=True),
         _profile("he", "Hebrew", "עברית", SCRIPT_HEBREW, rtl=True),
@@ -536,6 +545,138 @@ def detect_language(
 
 
 # ---------------------------------------------------------------------------
+# Readings (romanizer hook, plan item E5)
+# ---------------------------------------------------------------------------
+#
+# Japanese readings come from Sudachi (kana) and are romanized by lang_jp; the
+# romanizers below give the other languages with readings a Latin reading:
+# pinyin for Chinese (pypinyin, optional), Revised Romanization for Hangul and a
+# transliteration table for Cyrillic (both standard library).
+
+HANGUL_BASE = 0xAC00
+HANGUL_END = 0xD7A3
+HANGUL_INITIALS = (
+    "g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t", "p", "h",
+)
+HANGUL_MEDIALS = (
+    "a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo", "we",
+    "wi", "yu", "eu", "ui", "i",
+)
+HANGUL_FINALS = (
+    "", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "l", "l", "l", "p", "l", "m", "p", "p",
+    "t", "t", "ng", "t", "t", "k", "t", "p", "t",
+)
+# A final consonant carried into a following vowel-initial syllable (ㅇ) keeps its
+# own sound: 한국어 -> han-gug-eo, not han-guk-eo.
+HANGUL_FINALS_BEFORE_VOWEL: dict[int, str] = {
+    1: "g", 2: "kk", 3: "ks", 4: "n", 5: "nj", 6: "nh", 7: "d", 8: "r", 9: "lg", 10: "lm",
+    11: "lb", 12: "ls", 13: "lt", 14: "lp", 15: "lh", 16: "m", 17: "b", 18: "ps", 19: "s",
+    20: "ss", 21: "ng", 22: "j", 23: "ch", 24: "k", 25: "t", 26: "p", 27: "h",
+}
+
+CYRILLIC_TABLE_RU: dict[str, str] = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "zh", "з": "z",
+    "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    # Letters that only exist in neighbouring alphabets still get a sensible value.
+    "є": "ye", "і": "i", "ї": "yi", "ґ": "g",
+}
+CYRILLIC_TABLE_UK: dict[str, str] = {
+    **CYRILLIC_TABLE_RU,
+    "г": "h", "ґ": "g", "е": "e", "є": "ye", "и": "y", "і": "i", "ї": "yi", "й": "y", "щ": "shch",
+}
+CYRILLIC_TABLES: dict[str, dict[str, str]] = {"ru": CYRILLIC_TABLE_RU, "uk": CYRILLIC_TABLE_UK}
+
+
+def romanize_hangul(text: str) -> str:
+    """Revised Romanization, syllable by syllable (no sound-change rules)."""
+    pieces: list[str] = []
+    for position, char in enumerate(text):
+        codepoint = ord(char)
+        if HANGUL_BASE <= codepoint <= HANGUL_END:
+            index = codepoint - HANGUL_BASE
+            initial = HANGUL_INITIALS[index // 588]
+            medial = HANGUL_MEDIALS[(index % 588) // 28]
+            final_index = index % 28
+            final = HANGUL_FINALS[final_index]
+            next_char = text[position + 1] if position + 1 < len(text) else ""
+            if final_index and next_char and HANGUL_BASE <= ord(next_char) <= HANGUL_END:
+                next_initial = (ord(next_char) - HANGUL_BASE) // 588
+                if next_initial == 11:  # ㅇ: the final is pronounced as the next initial
+                    final = HANGUL_FINALS_BEFORE_VOWEL.get(final_index, final)
+            pieces.append(f"{initial}{medial}{final}")
+        else:
+            pieces.append(char)
+    return "".join(pieces)
+
+
+def romanize_cyrillic(text: str, language_code: str = "ru") -> str:
+    table = CYRILLIC_TABLES.get(base_language_code(language_code), CYRILLIC_TABLE_RU)
+    pieces: list[str] = []
+    for char in text:
+        lowered = char.lower()
+        mapped = table.get(lowered)
+        if mapped is None:
+            pieces.append(char)
+            continue
+        pieces.append(mapped.capitalize() if char != lowered and mapped else mapped)
+    return "".join(pieces)
+
+
+@lru_cache(maxsize=1)
+def _pypinyin_module():
+    try:
+        import pypinyin  # type: ignore
+    except ImportError:
+        return None
+    return pypinyin
+
+
+def romanize_pinyin(text: str) -> str | None:
+    """Tone-marked pinyin via ``pypinyin``; ``None`` when it is not installed."""
+    pypinyin = _pypinyin_module()
+    if pypinyin is None:
+        return None
+    try:
+        syllables = pypinyin.lazy_pinyin(text, style=pypinyin.Style.TONE)
+    except Exception:  # pragma: no cover - defensive around third-party input handling
+        return None
+    return " ".join(piece for piece in syllables if piece) or None
+
+
+def romanizer_available(code: str | None) -> bool:
+    profile = get_language(code)
+    if profile.romanizer == "pinyin":
+        return _pypinyin_module() is not None
+    return profile.romanizer in ("hangul", "cyrillic")
+
+
+def romanize(text: str | None, code: str | None) -> str | None:
+    """Reading for ``text`` in language ``code`` through the profile's romanizer.
+
+    Returns ``None`` for languages without a romanizer, for Japanese (its
+    readings are kana from Sudachi) and when an optional dependency is missing,
+    so callers simply store no reading in those cases.
+    """
+    normalized = _normalize(text)
+    if not normalized:
+        return None
+    profile = get_language(code)
+    if profile.romanizer == "hangul":
+        reading = romanize_hangul(normalized)
+    elif profile.romanizer == "cyrillic":
+        reading = romanize_cyrillic(normalized, profile.code)
+    elif profile.romanizer == "pinyin":
+        reading = romanize_pinyin(normalized)
+    else:
+        return None
+    if not reading or reading == normalized:
+        return None
+    return reading
+
+
+# ---------------------------------------------------------------------------
 # Analyzers
 # ---------------------------------------------------------------------------
 
@@ -656,6 +797,10 @@ class GenericAnalyzer:
         self.language_code = normalize_language_code(language_code) or "en"
         self._base = base_language_code(self.language_code)
         self._simplemma = _simplemma_module()
+        self._has_readings = get_language(self.language_code).has_readings
+
+    def reading(self, surface: str) -> str | None:
+        return romanize(surface, self.language_code) if self._has_readings else None
 
     def lemmatize(self, surface: str) -> str:
         # Acronyms and UI labels (HP, START) keep their case so they stay recognizable.
@@ -697,7 +842,7 @@ class GenericAnalyzer:
                     Token(
                         surface=part,
                         lemma=self.lemmatize(part),
-                        reading=None,
+                        reading=self.reading(part),
                         pos=None,
                         language_code=self.language_code,
                     )
@@ -737,13 +882,19 @@ class HanAnalyzer:
             sub_tokens: list[Token] = []
             if len(piece) > 1 and all(char_script(char) == SCRIPT_HAN for char in piece):
                 sub_tokens = [
-                    Token(surface=char, lemma=char, language_code=self.language_code)
+                    Token(
+                        surface=char,
+                        lemma=char,
+                        reading=romanize(char, self.language_code),
+                        language_code=self.language_code,
+                    )
                     for char in piece
                 ]
             tokens.append(
                 Token(
                     surface=piece,
                     lemma=piece,
+                    reading=romanize(piece, self.language_code),
                     sub_tokens=sub_tokens,
                     language_code=self.language_code,
                 )
