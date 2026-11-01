@@ -48,7 +48,7 @@ python .\lang_jp.py sync-anki
 python .\lang_jp.py sync-anki-words
 python .\lang_jp.py generate-kanji-flashcards
 python .\lang_jp.py sync-anki-kanji
-python .\lang_jp.py export-anki-tsv --include-header
+python .\lang_jp.py export-anki-tsv
 python .\lang_jp.py rebuild-stats
 ```
 
@@ -122,6 +122,16 @@ The web UI has a language bar on every page (`?lang=es`, `lang=all`), and other 
 Searches (`q`) ignore case in every script (`água` finds `ÁGUA`, `привет` finds `ПРИВЕТ`) without folding accents, so kana, hangul and Devanagari match exactly.
 
 `lang=all` (or no `lang`) works on every page and every endpoint. The dashboard shows one card per language with counts and top terms; a source page lets you change the source language and re-run its analysis.
+
+### Anki across languages
+
+- **Decks.** Each card goes to its language's deck (`languages.deck_name`, default `Lang::<Name>`); characters share the word deck of their language (kanji in `Lang::Japanese`, hanzi in `Lang::Chinese`). `--deck-name` still forces one deck for everything.
+- **What `--language all` generates.** Every enabled language except the gloss language (`LANG_JP_TERM_TRANSLATION_TARGET`, `pt` by default), whose cards would show the same word on both sides. `generate-flashcards --language pt` still creates them on request. Existing cards are exported and synced whatever their language.
+- **Fields.** Readings appear only for languages that have them: kana plus romaji for Japanese, then `Pinyin` (zh), `Romanization` (ko) or `Transliteration` (ru, uk). Character cards exist only for languages with characters, and on/kun readings are Japanese-only. Term meanings are in the gloss language, kanji meanings stay in English. Non-Japanese fields carry `lang="xx" dir="auto"`, so Arabic and Hebrew render right to left and Han text picks the right font. Japanese fields are byte-identical to before.
+- **Tags.** Every note gets `lang_xx` (Japanese notes also keep `jp`). Older cards that only have `jp` get `lang_ja` on export and sync.
+- **Identity.** AnkiConnect notes are found by their stored note id, then by the `term_N` tag, then by front text in the deck. A front match never links a note tagged for another language. Japanese keeps Anki's collection-wide duplicate check; other languages check duplicates per deck, so `ser` (es) and `ser` (it) both get a note.
+- **TSV.** `export-anki-tsv` writes Anki 2.1.54+ file headers and the columns `Front, Back, Tags, Deck, Notetype, GUID`, so one import fills every language deck. Non-Japanese rows carry a deterministic GUID built from the language-scoped canonical key, so re-imports update them and same-spelling words never overwrite each other. Japanese rows leave the GUID empty and are matched on the first field, as before. `--format basic` writes the old `Front, Back, Tags` file. Use one path per language: a TSV import cannot match a non-Japanese note that `sync-anki` created (Anki gave it its own GUID), so the import would add a second copy.
+- **Sync state.** `export_status`, `exported_at` and `anki_note_id` live on each card, so `--mark-exported` and `sync-anki --language es` only advance that language. A single-language sync only reorders the new cards of that language's decks.
 
 Databases created before this change are upgraded in place on the next command: existing rows become `ja` and canonical keys gain the `ja::` prefix once.
 
@@ -229,9 +239,9 @@ py -3.12 .\single_image_ocr.py `
 - `sync-anki` also repositions existing Anki new cards by the current score when AnkiConnect exposes the custom `repositionNewCards` action.
 - `sync-anki` creates decks on demand and keeps track of the linked Anki note id.
 - `sync-anki-words` regenerates vocabulary flashcards before syncing, so missing term cards are created and existing ones are refreshed in one step.
-- `generate-kanji-flashcards` and `sync-anki-kanji` now use the main `Lang::Japanese` deck so kanji and vocabulary share the same new-card queue.
+- `generate-kanji-flashcards` and `sync-anki-kanji` use the word deck of the character's language (`Lang::Japanese` for kanji), so kanji and vocabulary share the same new-card queue. Both accept `--language`.
 - `refresh-kanji-metadata` fetches canonical kanji meanings plus `on/kun` readings from `kanjiapi.dev`.
 - `sync-anki-kanji` regenerates kanji payloads before syncing, so the current score/order is what gets pushed to Anki.
 - The `/kanji` page includes a button that runs the same kanji sync flow without using the terminal.
-- `export-anki-tsv` writes UTF-8 with BOM for better Windows compatibility.
+- `export-anki-tsv` writes UTF-8 with BOM for better Windows compatibility (Anki skips the BOM before its file headers).
 - `browse` now defaults to port `8766` so it does not conflict with AnkiConnect on `8765`.
