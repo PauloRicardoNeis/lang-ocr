@@ -585,9 +585,7 @@ def resolve_language_code(
 
 def is_gloss_language(code: str | None) -> bool:
     """True for the language term meanings are translated into (``pt`` by default)."""
-    return bool(code) and languages.base_language_code(code) == languages.base_language_code(
-        DEFAULT_TERM_TRANSLATION_TARGET
-    )
+    return bool(code) and languages.base_language_code(code) == gloss_language_code()
 
 
 def ensure_language_row(
