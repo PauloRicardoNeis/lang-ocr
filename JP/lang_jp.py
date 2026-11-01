@@ -4507,10 +4507,14 @@ def build_card_front_text(
     reading: str | None = None,
     *,
     extra_lines: list[str] | None = None,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
 ) -> str:
+    # Japanese fronts stay byte-identical to the pre-polyglot ones; other
+    # languages get lang (font choice for Han/Hangul) and dir="auto" (Arabic,
+    # Hebrew) on the main line.
     reading_hiragana = katakana_to_hiragana(normalize_token(reading))
     front_lines = [
-        '<div style="font-size: 2.5em; line-height: 1.1;">'
+        f'<div{card_language_attributes(language_code)} style="font-size: 2.5em; line-height: 1.1;">'
         f"{html_text(main_text)}"
         "</div>"
     ]
@@ -4542,8 +4546,12 @@ def reading_with_romaji(label: str, reading: str | None) -> str | None:
     return f"{label}: {normalized}"
 
 
-def build_front_text(surface_form: str, reading: str | None) -> str:
-    return build_card_front_text(surface_form, reading)
+def build_front_text(
+    surface_form: str,
+    reading: str | None,
+    language_code: str | None = DEFAULT_LANGUAGE_CODE,
+) -> str:
+    return build_card_front_text(surface_form, reading, language_code=language_code)
 
 
 def build_kanji_back_text(surface_form: str, lemma: str) -> str:
@@ -4774,6 +4782,173 @@ def language_tag(code: str | None) -> str:
     return f"lang_{make_tag(normalize_language_code(code) or DEFAULT_LANGUAGE_CODE) or 'xx'}"
 
 
+# ---------------------------------------------------------------------------
+# Anki export identity per language
+#
+# Japanese keeps the pre-polyglot identity on purpose: no GUID in the TSV
+# (Anki matches on the first field) and AnkiConnect's collection-wide duplicate
+# check, so notes a user already has are never duplicated or orphaned. Every
+# other language is scoped by language, so the same spelling in two languages
+# (``ser`` in es and pt, ``die`` in de and en) never collides or overwrites.
+# ---------------------------------------------------------------------------
+
+
+def term_language_sql(column: str = "t.language_code") -> str:
+    """SQL for a term's language where NULL or blank (legacy rows) count as Japanese."""
+    return f"COALESCE(NULLIF(TRIM({column}), ''), '{DEFAULT_LANGUAGE_CODE}')"
+
+
+def term_language_filter_clause(
+    language: str | None,
+    column: str = "t.language_code",
+) -> tuple[str, list[object]]:
+    return language_filter_clause(term_language_sql(column), language)
+
+
+def is_japanese_code(code: str | None) -> bool:
+    return languages.base_language_code(code or DEFAULT_LANGUAGE_CODE) == DEFAULT_LANGUAGE_CODE
+
+
+def tags_with_language(
+    tags: str | Iterable[str] | None,
+    language_code: str | None,
+) -> list[str]:
+    """Return ``tags`` carrying exactly one ``lang_xx`` tag for ``language_code``.
+
+    Cards generated before the polyglot change only have ``jp``; the language tag
+    goes right after it, where ``build_flashcard_payload`` puts it today.
+    """
+    if tags is None or isinstance(tags, str):
+        tag_list = split_tags(tags)
+    else:
+        tag_list = [str(tag) for tag in tags if str(tag).strip()]
+    wanted = language_tag(language_code)
+    kept = [
+        tag
+        for tag in tag_list
+        if not tag.lower().startswith("lang_") or tag.lower() == wanted
+    ]
+    if any(tag.lower() == wanted for tag in kept):
+        return kept
+    index = 1 if kept and kept[0].lower() == "jp" else 0
+    return [*kept[:index], wanted, *kept[index:]]
+
+
+def anki_note_language_tag(tags: Iterable[object] | None) -> str | None:
+    """Language of an existing Anki note from its tags (``jp`` alone means Japanese)."""
+    lowered = [str(tag).lower() for tag in tags or []]
+    for tag in lowered:
+        if tag.startswith("lang_"):
+            return tag
+    if "jp" in lowered:
+        return language_tag(DEFAULT_LANGUAGE_CODE)
+    return None
+
+
+def anki_add_note_options(language_code: str | None, deck_name: str) -> dict[str, object]:
+    """``addNote`` options: Japanese keeps the collection-wide duplicate check."""
+    if is_japanese_code(language_code):
+        return {"allowDuplicate": False}
+    return {
+        "allowDuplicate": False,
+        "duplicateScope": "deck",
+        "duplicateScopeOptions": {
+            "deckName": deck_name,
+            "checkChildren": False,
+            "checkAllModels": False,
+        },
+    }
+
+
+def anki_note_guid(
+    language_code: str | None,
+    canonical_key: str | None,
+    template_name: str | None,
+    *,
+    fallback_id: object | None = None,
+) -> str:
+    """Deterministic, language-scoped note GUID for the TSV ``#guid column``.
+
+    Empty for Japanese: those notes were imported or synced with Anki-generated
+    GUIDs, so they keep being matched on the first field as before.
+    """
+    code = normalize_language_code(language_code) or DEFAULT_LANGUAGE_CODE
+    if is_japanese_code(code):
+        return ""
+    identity = normalize_token(canonical_key) or f"term_{fallback_id}"
+    digest = hashlib.sha256(
+        f"lang_jp::{code}::{identity}::{normalize_token(template_name)}".encode("utf-8")
+    ).hexdigest()
+    return f"lang-{make_tag(code) or 'xx'}-{digest[:20]}"
+
+
+def card_language_attributes(language_code: str | None) -> str:
+    """``lang``/``dir`` attributes for card HTML; empty for Japanese (unchanged fronts)."""
+    code = normalize_language_code(language_code) or DEFAULT_LANGUAGE_CODE
+    if is_japanese_code(code):
+        return ""
+    return f' lang="{html.escape(code, quote=True)}" dir="auto"'
+
+
+def card_language_text(value: str | None, language_code: str | None) -> str:
+    """Escaped text in the card language, isolated for RTL scripts on the back."""
+    escaped = html_text(value)
+    attributes = card_language_attributes(language_code)
+    if not escaped or not attributes:
+        return escaped
+    return f"<span{attributes}>{escaped}</span>"
+
+
+READING_LABELS_BY_ROMANIZER = {
+    "pinyin": "Pinyin",
+    "hangul": "Romanization",
+    "cyrillic": "Transliteration",
+}
+
+
+def character_label(language_code: str | None) -> str:
+    base = languages.base_language_code(language_code or DEFAULT_LANGUAGE_CODE)
+    if base == DEFAULT_LANGUAGE_CODE:
+        return "Kanji"
+    if base == "zh":
+        return "Hanzi"
+    return "Characters"
+
+
+def character_language_codes() -> tuple[str, ...]:
+    return tuple(
+        code
+        for code, profile in languages.BUILTIN_LANGUAGES.items()
+        if profile.has_characters
+    )
+
+
+def character_language_sql(column: str = "k.language_code") -> str:
+    """SQL restricting character cards to languages whose profile has characters."""
+    expression = term_language_sql(column)
+    clauses = []
+    for code in character_language_codes():
+        clauses.append(f"{expression} = '{code}'")
+        clauses.append(f"{expression} LIKE '{code}-%'")
+    return "(" + " OR ".join(clauses) + ")" if clauses else "0"
+
+
+def excluded_generation_language_codes(connection: sqlite3.Connection) -> list[str]:
+    """Disabled languages, which ``--language all`` does not generate cards for."""
+    excluded: list[str] = []
+    if table_exists(connection, "languages"):
+        for row in connection.execute("SELECT code FROM languages WHERE enabled = 0").fetchall():
+            code = normalize_language_code(row["code"])
+            if code and code not in excluded:
+                excluded.append(code)
+    return excluded
+
+
+def gloss_language_code() -> str:
+    """Base code of the meaning language (``pt``): its own terms would be glossed as themselves."""
+    return languages.base_language_code(DEFAULT_TERM_TRANSLATION_TARGET) or ""
+
+
 def build_flashcard_payload(
     term_row: sqlite3.Row,
     source_row: sqlite3.Row | None,
@@ -4795,21 +4970,28 @@ def build_flashcard_payload(
         else preferred_surface_form
     )
     reading = normalize_token(term_row["reading"]) if profile.has_readings else ""
-    front_text = build_front_text(surface_form, reading or None)
+    front_text = build_front_text(surface_form, reading or None, language_code)
     back_parts = []
     reading_romaji = romanize_kana(reading) if profile.romanizer == "kana" else ""
     if profile.has_characters:
         kanji_text = preferred_kanji_text(surface_form, str(term_row["lemma"]))
         display_text = normalize_token(surface_form)
         if extract_kanji_sequence(kanji_text) and kanji_text != display_text:
-            back_parts.append(f"Kanji: {html_text(kanji_text)}")
+            back_parts.append(
+                f"{character_label(language_code)}: "
+                f"{card_language_text(kanji_text, language_code)}"
+            )
 
     if reading:
-        back_parts.append(f"Reading: {html_text(reading)}")
+        # Kana for Japanese (plus romaji below); a Latin reading elsewhere.
+        reading_label = READING_LABELS_BY_ROMANIZER.get(profile.romanizer or "", "Reading")
+        back_parts.append(f"{reading_label}: {html_text(reading)}")
     if reading_romaji:
         back_parts.append(f"Romaji: {html_text(reading_romaji)}")
     if normalize_token(surface_form) != normalize_token(str(term_row["lemma"])):
-        back_parts.append(f"Lemma: {html_text(str(term_row['lemma']))}")
+        back_parts.append(
+            f"Lemma: {card_language_text(str(term_row['lemma']), language_code)}"
+        )
     if term_row["meaning_pt"]:
         back_parts.append(f"Meaning: {html_text(term_row['meaning_pt'])}")
 
@@ -4924,20 +5106,37 @@ def build_kanji_flashcard_payload(
     note_type: str,
     template_name: str,
 ) -> dict[str, str | int | None]:
+    language_code = row_language_code(kanji_row)
+    is_japanese = is_japanese_code(language_code)
+    literal = str(kanji_row["literal"])
     canonical_meanings = normalize_token(kanji_row["canonical_meanings"])
     derived_meaning = normalize_token(kanji_row["meaning_pt"])
-    on_readings = normalize_token(kanji_row["on_readings"])
-    kun_readings = normalize_token(kanji_row["kun_readings"])
-    front_text = build_card_front_text(
-        str(kanji_row["literal"]),
-        extra_lines=[
+    # On/kun readings (kanjiapi.dev) are Japanese; other character languages
+    # get their own reading through the profile's romanizer (pinyin for zh).
+    on_readings = normalize_token(kanji_row["on_readings"]) if is_japanese else ""
+    kun_readings = normalize_token(kanji_row["kun_readings"]) if is_japanese else ""
+    reading_lines: list[str] = []
+    if is_japanese:
+        reading_lines = [
             line
             for line in (
                 reading_with_romaji("On", on_readings),
                 reading_with_romaji("Kun", kun_readings),
             )
             if line
-        ],
+        ]
+    else:
+        romanized = normalize_token(languages.romanize(literal, language_code))
+        if romanized:
+            label = READING_LABELS_BY_ROMANIZER.get(
+                get_language(language_code).romanizer or "",
+                "Reading",
+            )
+            reading_lines = [f"{label}: {romanized}"]
+    front_text = build_card_front_text(
+        literal,
+        extra_lines=reading_lines,
+        language_code=language_code,
     )
 
     back_parts = []
@@ -4950,14 +5149,18 @@ def build_kanji_flashcard_payload(
             back_parts.append(f"On: {html_text(on_readings)}")
         if kun_readings:
             back_parts.append(f"Kun: {html_text(kun_readings)}")
+        if not is_japanese:
+            back_parts.extend(html_text(line) for line in reading_lines)
 
     tags = [
-        "jp",
+        language_tag(language_code),
         "kanji",
         "auto_generated",
         f"kanji_{kanji_row['id']}",
         f"template_{template_name}",
     ]
+    if is_japanese:
+        tags.insert(0, "jp")
     if source_row is not None:
         tags.append(f"source_{source_row['source_id']}")
 
@@ -4988,7 +5191,10 @@ KANJI_FLASHCARD_PRIORITY_ORDER_SQL = """
 """
 
 
-def flashcard_candidates(args: argparse.Namespace) -> tuple[str, list[object]]:
+def flashcard_candidates(
+    args: argparse.Namespace,
+    connection: sqlite3.Connection | None = None,
+) -> tuple[str, list[object]]:
     filters = [
         "COALESCE(ts.total_occurrences, 0) > 0",
         "COALESCE(ts.priority_score, 0) >= ?",
@@ -4999,12 +5205,29 @@ def flashcard_candidates(args: argparse.Namespace) -> tuple[str, list[object]]:
         filters.append("t.id = ?")
         params.append(args.term_id)
 
-    language_sql, language_params = language_filter_clause(
-        "t.language_code", getattr(args, "language", None)
+    language_sql, language_params = term_language_filter_clause(
+        getattr(args, "language", None)
     )
     if language_sql:
         filters.append(language_sql)
         params.extend(language_params)
+    elif args.term_id is None:
+        # "all" means every studied language: not the disabled ones, and not the
+        # gloss language (a Portuguese card glossed in Portuguese repeats itself).
+        # An explicit --language or --term-id still generates them.
+        language_expression = term_language_sql()
+        excluded = excluded_generation_language_codes(connection) if connection else []
+        if excluded:
+            filters.append(
+                f"{language_expression} NOT IN ({', '.join('?' for _ in excluded)})"
+            )
+            params.extend(excluded)
+        gloss_code = gloss_language_code()
+        if gloss_code:
+            filters.append(
+                f"NOT ({language_expression} = ? OR {language_expression} LIKE ?)"
+            )
+            params.extend([gloss_code, f"{gloss_code}-%"])
 
     if args.existing_only:
         filters.append(
@@ -5077,7 +5300,7 @@ def upsert_flashcards(
     created = 0
     updated = 0
     refresh_all_source_kanji(connection)
-    query, params = flashcard_candidates(args)
+    query, params = flashcard_candidates(args, connection)
     term_rows = connection.execute(query, params).fetchall()
     term_rows = filter_blacklisted_term_rows(term_rows)
 
@@ -5199,6 +5422,16 @@ def kanji_flashcard_candidates(args: argparse.Namespace) -> tuple[str, list[obje
         filters.append("k.id = ?")
         params.append(args.kanji_id)
 
+    # Character cards only exist for languages whose profile has characters.
+    filters.append(character_language_sql("k.language_code"))
+    language_sql, language_params = term_language_filter_clause(
+        getattr(args, "language", None),
+        "k.language_code",
+    )
+    if language_sql:
+        filters.append(language_sql)
+        params.extend(language_params)
+
     if args.existing_only:
         filters.append(
             """
@@ -5228,6 +5461,7 @@ def kanji_flashcard_candidates(args: argparse.Namespace) -> tuple[str, list[obje
         SELECT
             k.id,
             k.literal,
+            {term_language_sql("k.language_code")} AS language_code,
             COALESCE(k.meaning_pt, '') AS meaning_pt,
             COALESCE(k.canonical_meanings, '') AS canonical_meanings,
             COALESCE(k.on_readings, '') AS on_readings,
@@ -5279,14 +5513,21 @@ def upsert_kanji_flashcards(
     query, params = kanji_flashcard_candidates(args)
     kanji_rows = connection.execute(query, params).fetchall()
 
+    deck_cache: dict[str, str] = {}
     for kanji_row in kanji_rows:
         source_row = best_source_for_kanji(connection, int(kanji_row["id"]))
         related_terms = related_terms_for_kanji(connection, int(kanji_row["id"]))
+        # Without an explicit deck, characters share their language's word deck
+        # (Lang::Japanese for kanji, Lang::Chinese for hanzi).
+        deck_name = getattr(args, "deck_name", None)
+        if not deck_name:
+            code = row_language_code(kanji_row)
+            deck_name = deck_cache.setdefault(code, language_deck_name(connection, code))
         payload = build_kanji_flashcard_payload(
             kanji_row,
             related_terms,
             source_row,
-            deck_name=args.deck_name,
+            deck_name=deck_name,
             note_type=args.note_type,
             template_name=args.template_name,
         )
@@ -5365,9 +5606,7 @@ def list_flashcards(args: argparse.Namespace) -> None:
     if args.status != "all":
         filters.append("f.export_status = ?")
         params.append(args.status)
-    language_sql, language_params = language_filter_clause(
-        "t.language_code", getattr(args, "language", None)
-    )
+    language_sql, language_params = term_language_filter_clause(getattr(args, "language", None))
     if language_sql:
         filters.append(language_sql)
         params.extend(language_params)
@@ -5380,6 +5619,7 @@ def list_flashcards(args: argparse.Namespace) -> None:
         SELECT
             f.id,
             t.lemma,
+            {term_language_sql()} AS language_code,
             printf('%.1f', COALESCE(ts.priority_score, 0)) AS priority_score,
             f.template_name,
             f.deck_name,
@@ -5404,6 +5644,7 @@ def list_flashcards(args: argparse.Namespace) -> None:
         (
             "id",
             "lemma",
+            "language_code",
             "priority_score",
             "template_name",
             "deck_name",
@@ -5413,16 +5654,54 @@ def list_flashcards(args: argparse.Namespace) -> None:
     )
 
 
+ANKI_TSV_FORMAT_ANKI = "anki"
+ANKI_TSV_FORMAT_BASIC = "basic"
+# Front/Back/Tags keep their pre-polyglot positions; Anki (2.1.54+) reads the
+# rest from the file headers, so every row lands in its own language deck.
+ANKI_TSV_COLUMNS = ("Front", "Back", "Tags", "Deck", "Notetype", "GUID")
+
+
+def anki_tsv_header_lines() -> list[str]:
+    return [
+        "#separator:tab",
+        "#html:true",
+        "#columns:" + "\t".join(ANKI_TSV_COLUMNS),
+        f"#tags column:{ANKI_TSV_COLUMNS.index('Tags') + 1}",
+        f"#deck column:{ANKI_TSV_COLUMNS.index('Deck') + 1}",
+        f"#notetype column:{ANKI_TSV_COLUMNS.index('Notetype') + 1}",
+        f"#guid column:{ANKI_TSV_COLUMNS.index('GUID') + 1}",
+    ]
+
+
+def anki_tsv_record(row: sqlite3.Row, *, tsv_format: str) -> tuple[str, ...]:
+    language_code = row_language_code(row)
+    tags = " ".join(tags_with_language(row["tags"], language_code))
+    if tsv_format == ANKI_TSV_FORMAT_BASIC:
+        return (row["front_text"], row["back_text"], tags)
+    return (
+        row["front_text"],
+        row["back_text"],
+        tags,
+        row["deck_name"],
+        row["note_type"] or "Basic",
+        anki_note_guid(
+            language_code,
+            row["canonical_key"],
+            row["template_name"],
+            fallback_id=row["term_id"],
+        ),
+    )
+
+
 def export_anki_tsv(args: argparse.Namespace) -> None:
     ensure_output_parent(args.output)
+    tsv_format = getattr(args, "format", None) or ANKI_TSV_FORMAT_ANKI
     filters = []
     params: list[object] = []
     if args.status != "all":
         filters.append("f.export_status = ?")
         params.append(args.status)
-    language_sql, language_params = language_filter_clause(
-        "t.language_code", getattr(args, "language", None)
-    )
+    language_sql, language_params = term_language_filter_clause(getattr(args, "language", None))
     if language_sql:
         filters.append(language_sql)
         params.extend(language_params)
@@ -5434,7 +5713,13 @@ def export_anki_tsv(args: argparse.Namespace) -> None:
     query = f"""
         SELECT
             f.id,
+            f.term_id,
             t.lemma,
+            t.canonical_key,
+            {term_language_sql()} AS language_code,
+            f.template_name,
+            f.deck_name,
+            f.note_type,
             f.front_text,
             f.back_text,
             f.tags
@@ -5451,11 +5736,17 @@ def export_anki_tsv(args: argparse.Namespace) -> None:
         rows = connection.execute(query, params).fetchall()
         rows = filter_blacklisted_term_rows(rows)
         with args.output.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.writer(handle, delimiter="\t")
-            if args.include_header:
-                writer.writerow(("Front", "Back", "Tags"))
+            if tsv_format == ANKI_TSV_FORMAT_BASIC:
+                writer = csv.writer(handle, delimiter="\t")
+                if args.include_header:
+                    writer.writerow(("Front", "Back", "Tags"))
+            else:
+                # The #columns header names the columns; a header row would be a note.
+                writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+                for line in anki_tsv_header_lines():
+                    handle.write(line + "\n")
             for row in rows:
-                writer.writerow((row["front_text"], row["back_text"], row["tags"] or ""))
+                writer.writerow(anki_tsv_record(row, tsv_format=tsv_format))
 
         if args.mark_exported and rows:
             ids = [row["id"] for row in rows]
@@ -5570,19 +5861,47 @@ def anki_note_info(
     return note
 
 
+def anki_front_lookup_key(
+    deck_name: str,
+    note_type: str,
+    front_value: str,
+    language_tag_value: str | None,
+) -> tuple[str, str, str, str]:
+    return (deck_name, note_type, front_value.strip(), language_tag_value or "")
+
+
+def anki_front_lookup_get(
+    lookup: dict[tuple[str, str, str, str], int],
+    row: sqlite3.Row,
+) -> int | None:
+    """Note with the row's front in its deck, never one tagged for another language.
+
+    Notes tagged with the row's language win; untagged notes (made by hand or by
+    an old export) still match, as they did before languages existed.
+    """
+    deck_name = str(row["deck_name"])
+    note_type = str(row["note_type"])
+    front_value = str(row["front_text"])
+    wanted = language_tag(row_language_code(row))
+    note_id = lookup.get(anki_front_lookup_key(deck_name, note_type, front_value, wanted))
+    if note_id is not None:
+        return note_id
+    return lookup.get(anki_front_lookup_key(deck_name, note_type, front_value, None))
+
+
 def anki_front_note_lookup(
     rows: Iterable[sqlite3.Row],
     *,
     host: str,
     port: int,
     front_field: str,
-) -> dict[tuple[str, str, str], int]:
+) -> dict[tuple[str, str, str, str], int]:
     by_scope: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for row in rows:
         key = (str(row["deck_name"]), str(row["note_type"]))
         by_scope.setdefault(key, []).append(row)
 
-    lookup: dict[tuple[str, str, str], int] = {}
+    lookup: dict[tuple[str, str, str, str], int] = {}
     for (deck_name, note_type), scoped_rows in by_scope.items():
         note_ids = anki_connect_request(
             host=host,
@@ -5624,7 +5943,13 @@ def anki_front_note_lookup(
                 front_value = str(front.get("value") or "").strip()
                 if front_value not in wanted_fronts:
                     continue
-                key = (deck_name, note_type, front_value)
+                note_tags = note.get("tags")
+                key = anki_front_lookup_key(
+                    deck_name,
+                    note_type,
+                    front_value,
+                    anki_note_language_tag(note_tags if isinstance(note_tags, list) else []),
+                )
                 if key not in lookup:
                     lookup[key] = int(note["noteId"])
 
@@ -5791,20 +6116,54 @@ def flashcard_surface_form(
     return surface_form or fallback_lemma
 
 
+def learning_path_deck_names(
+    connection: sqlite3.Connection,
+    language: str | None,
+) -> list[str]:
+    """Decks ordered as a learning path (characters before the words using them).
+
+    One per language with characters in scope: Japanese always (it was the
+    only one before languages existed), Chinese when it is registered.
+    """
+    wanted = normalize_language_code(language)
+    single = wanted and wanted not in (ALL_LANGUAGES_CODE, AUTO_LANGUAGE_CODE)
+    codes = [DEFAULT_LANGUAGE_CODE]
+    if table_exists(connection, "languages"):
+        codes.extend(
+            normalize_language_code(row["code"])
+            for row in connection.execute(
+                "SELECT code FROM languages ORDER BY sort_order ASC, code ASC"
+            ).fetchall()
+        )
+    decks: list[str] = []
+    for code in codes:
+        if not code or not get_language(code).has_characters:
+            continue
+        if single and code != wanted:
+            continue
+        deck_name = language_deck_name(connection, code)
+        if deck_name not in decks:
+            decks.append(deck_name)
+    return decks
+
+
 def reprioritize_anki_learning_path(
     connection: sqlite3.Connection,
     *,
     host: str,
     port: int,
+    deck_name: str | None = None,
 ) -> int:
+    deck_name = deck_name or language_deck_name(connection, DEFAULT_LANGUAGE_CODE)
     term_rows = connection.execute(
-        """
+        f"""
         SELECT
             f.id AS flashcard_id,
             f.term_id,
             f.source_id,
             f.anki_note_id,
             t.lemma,
+            {term_language_sql()} AS language_code,
             COALESCE(ts.priority_score, 0) AS priority_score,
             COALESCE(ts.last_seen_at, ts.first_seen_at) AS seen_at
         FROM flashcards AS f
@@ -5816,7 +6175,7 @@ def reprioritize_anki_learning_path(
             f.deck_name = ?
             AND f.anki_note_id IS NOT NULL
         """,
-        (DEFAULT_JP_DECK_NAME,),
+        (deck_name,),
     ).fetchall()
     term_rows = filter_blacklisted_term_rows(term_rows)
     kanji_rows = connection.execute(
@@ -5837,7 +6196,7 @@ def reprioritize_anki_learning_path(
             f.deck_name = ?
             AND f.anki_note_id IS NOT NULL
         """,
-        (DEFAULT_JP_KANJI_DECK_NAME,),
+        (deck_name,),
     ).fetchall()
 
     note_ids = list(
@@ -6011,7 +6370,8 @@ def reprioritize_anki_deck(
         f"""
         SELECT
             f.anki_note_id,
-            t.lemma
+            t.lemma,
+            {term_language_sql()} AS language_code
         FROM flashcards AS f
         JOIN terms AS t
             ON t.id = f.term_id
@@ -6166,9 +6526,8 @@ def sync_anki(args: argparse.Namespace) -> None:
     if args.status != "all":
         filters.append("f.export_status = ?")
         params.append(args.status)
-    language_sql, language_params = language_filter_clause(
-        "t.language_code", getattr(args, "language", None)
-    )
+    language = getattr(args, "language", None)
+    language_sql, language_params = term_language_filter_clause(language)
     if language_sql:
         filters.append(language_sql)
         params.extend(language_params)
@@ -6189,6 +6548,7 @@ def sync_anki(args: argparse.Namespace) -> None:
                 f.id,
                 f.term_id,
                 t.lemma,
+                {term_language_sql()} AS language_code,
                 f.template_name,
                 f.deck_name,
                 f.note_type,
@@ -6217,22 +6577,30 @@ def sync_anki(args: argparse.Namespace) -> None:
             port=args.port,
             front_field=args.front_field,
         )
+        # Only the decks of the languages being synced are reordered, so
+        # `sync-anki --language es` never touches the Japanese deck.
+        reprioritize_language_sql, reprioritize_language_params = term_language_filter_clause(
+            language
+        )
         reprioritize_deck_names = sorted(
             {
                 str(row["deck_name"])
                 for row in connection.execute(
-                """
+                f"""
                 SELECT DISTINCT
                     deck_name,
-                    t.lemma
+                    t.lemma,
+                    {term_language_sql()} AS language_code
                 FROM flashcards
                 JOIN terms AS t
                     ON t.id = flashcards.term_id
                 WHERE anki_note_id IS NOT NULL
+                    {"AND " + reprioritize_language_sql if reprioritize_language_sql else ""}
                 ORDER BY deck_name COLLATE NOCASE ASC
-                """
+                """,
+                reprioritize_language_params,
             ).fetchall()
-                if term_blacklist_reason(row["lemma"]) is None
+                if term_blacklist_reason(row["lemma"], language_code=row["language_code"]) is None
             }
         )
 
@@ -6281,14 +6649,10 @@ def sync_anki(args: argparse.Namespace) -> None:
                 )
             )
             if note_id is None:
-                note_id = front_note_lookup.get(
-                    (
-                        str(row["deck_name"]),
-                        str(row["note_type"]),
-                        str(row["front_text"]).strip(),
-                    )
-                )
-            desired_tags = split_tags(row["tags"])
+                note_id = anki_front_lookup_get(front_note_lookup, row)
+            row_language = row_language_code(row)
+            desired_tags = tags_with_language(row["tags"], row_language)
+            add_note_options = anki_add_note_options(row_language, str(row["deck_name"]))
 
             if note_id is None:
                 note_id_result = anki_connect_request(
@@ -6304,7 +6668,7 @@ def sync_anki(args: argparse.Namespace) -> None:
                                 args.back_field: row["back_text"],
                             },
                             "tags": desired_tags,
-                            "options": {"allowDuplicate": False},
+                            "options": add_note_options,
                         }
                     },
                 )
@@ -6314,10 +6678,11 @@ def sync_anki(args: argparse.Namespace) -> None:
                 note_id = int(note_id_result)
                 created += 1
                 front_note_lookup[
-                    (
+                    anki_front_lookup_key(
                         str(row["deck_name"]),
                         str(row["note_type"]),
-                        str(row["front_text"]).strip(),
+                        str(row["front_text"]),
+                        language_tag(row_language),
                     )
                 ] = note_id
             else:
@@ -6340,7 +6705,7 @@ def sync_anki(args: argparse.Namespace) -> None:
                                     args.back_field: row["back_text"],
                                 },
                                 "tags": desired_tags,
-                                "options": {"allowDuplicate": False},
+                                "options": add_note_options,
                             }
                         },
                     )
@@ -6409,17 +6774,20 @@ def sync_anki(args: argparse.Namespace) -> None:
         reprioritization_warning = None
 
         if "repositionNewCards" in actions:
-            learning_path_cards = reprioritize_anki_learning_path(
-                connection,
-                host=args.host,
-                port=args.port,
-            )
-            if learning_path_cards > 0:
-                reprioritized_cards += learning_path_cards
-                reprioritized_decks += 1
+            learning_decks = learning_path_deck_names(connection, language)
+            for learning_deck in learning_decks:
+                learning_path_cards = reprioritize_anki_learning_path(
+                    connection,
+                    host=args.host,
+                    port=args.port,
+                    deck_name=learning_deck,
+                )
+                if learning_path_cards > 0:
+                    reprioritized_cards += learning_path_cards
+                    reprioritized_decks += 1
 
             for deck_name in reprioritize_deck_names:
-                if deck_name == DEFAULT_JP_DECK_NAME:
+                if deck_name in learning_decks:
                     continue
                 count = reprioritize_anki_deck(
                     connection,
@@ -6602,6 +6970,11 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
     if args.status != "all":
         filters.append("export_status = ?")
         params.append(args.status)
+    language = getattr(args, "language", None)
+    language_sql, language_params = term_language_filter_clause(language, "k.language_code")
+    if language_sql:
+        filters.append(language_sql)
+        params.extend(language_params)
 
     where_clause = ""
     if filters:
@@ -6626,6 +6999,7 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
             SELECT
                 f.id,
                 f.kanji_id,
+                {term_language_sql("k.language_code")} AS language_code,
                 f.template_name,
                 f.deck_name,
                 f.note_type,
@@ -6647,15 +7021,23 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
         ).fetchall()
 
         sync_deck_names = sorted({str(row["deck_name"]) for row in rows})
+        reprioritize_language_sql, reprioritize_language_params = term_language_filter_clause(
+            language,
+            "k.language_code",
+        )
         reprioritize_deck_names = [
             str(row["deck_name"])
             for row in connection.execute(
-                """
-                SELECT DISTINCT deck_name
-                FROM kanji_flashcards
-                WHERE anki_note_id IS NOT NULL
-                ORDER BY deck_name COLLATE NOCASE ASC
-                """
+                f"""
+                SELECT DISTINCT f.deck_name
+                FROM kanji_flashcards AS f
+                JOIN kanji AS k
+                    ON k.id = f.kanji_id
+                WHERE f.anki_note_id IS NOT NULL
+                    {"AND " + reprioritize_language_sql if reprioritize_language_sql else ""}
+                ORDER BY f.deck_name COLLATE NOCASE ASC
+                """,
+                reprioritize_language_params,
             ).fetchall()
         ]
 
@@ -6701,7 +7083,9 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
                     port=args.port,
                 )
             )
-            desired_tags = split_tags(row["tags"])
+            row_language = row_language_code(row)
+            desired_tags = tags_with_language(row["tags"], row_language)
+            add_note_options = anki_add_note_options(row_language, str(row["deck_name"]))
 
             if note_id is None:
                 note_id_result = anki_connect_request(
@@ -6717,7 +7101,7 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
                                 args.back_field: row["back_text"],
                             },
                             "tags": desired_tags,
-                            "options": {"allowDuplicate": False},
+                            "options": add_note_options,
                         }
                     },
                 )
@@ -6743,7 +7127,7 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
                                     args.back_field: row["back_text"],
                                 },
                                 "tags": desired_tags,
-                                "options": {"allowDuplicate": False},
+                                "options": add_note_options,
                             }
                         },
                     )
@@ -6812,17 +7196,20 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
         reprioritization_warning = None
 
         if "repositionNewCards" in actions:
-            learning_path_cards = reprioritize_anki_learning_path(
-                connection,
-                host=args.host,
-                port=args.port,
-            )
-            if learning_path_cards > 0:
-                reprioritized_cards += learning_path_cards
-                reprioritized_decks += 1
+            learning_decks = learning_path_deck_names(connection, language)
+            for learning_deck in learning_decks:
+                learning_path_cards = reprioritize_anki_learning_path(
+                    connection,
+                    host=args.host,
+                    port=args.port,
+                    deck_name=learning_deck,
+                )
+                if learning_path_cards > 0:
+                    reprioritized_cards += learning_path_cards
+                    reprioritized_decks += 1
 
             for deck_name in reprioritize_deck_names:
-                if deck_name == DEFAULT_JP_KANJI_DECK_NAME:
+                if deck_name in learning_decks:
                     continue
                 count = reprioritize_anki_kanji_deck(
                     connection,
@@ -7375,7 +7762,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_kanji_cards_parser.add_argument(
         "--deck-name",
-        default=DEFAULT_JP_KANJI_DECK_NAME,
+        default=None,
+        help="Anki deck for every card. Default: the deck of the character's language (Lang::Japanese for kanji).",
     )
     generate_kanji_cards_parser.add_argument(
         "--note-type",
@@ -7384,6 +7772,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate_kanji_cards_parser.add_argument("--min-priority", type=float, default=0.0)
     generate_kanji_cards_parser.add_argument("--limit", type=int, default=5000)
     generate_kanji_cards_parser.add_argument("--kanji-id", type=int)
+    generate_kanji_cards_parser.add_argument(
+        "--language",
+        default=ALL_LANGUAGES_CODE,
+        help="Only languages with characters get cards (ja, zh). Default: all of them.",
+    )
     generate_kanji_cards_parser.add_argument(
         "--refresh-metadata",
         action="store_true",
@@ -7431,9 +7824,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="pending",
     )
     export_cards_parser.add_argument(
+        "--format",
+        choices=(ANKI_TSV_FORMAT_ANKI, ANKI_TSV_FORMAT_BASIC),
+        default=ANKI_TSV_FORMAT_ANKI,
+        help=(
+            "anki (default): Front, Back, Tags, Deck, Notetype, GUID with Anki 2.1.54+ "
+            "file headers, so every language goes to its own deck and non-Japanese notes "
+            "carry a language-scoped GUID. basic: the old Front, Back, Tags layout."
+        ),
+    )
+    export_cards_parser.add_argument(
         "--include-header",
         action="store_true",
-        help="Write Front, Back, Tags as the first TSV row.",
+        help="basic format only: write Front, Back, Tags as the first TSV row.",
     )
     export_cards_parser.add_argument(
         "--mark-exported",
@@ -7540,7 +7943,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_kanji_cards_parser.add_argument(
         "--deck-name",
-        default=DEFAULT_JP_KANJI_DECK_NAME,
+        default=None,
+        help="Anki deck for every card. Default: the deck of the character's language (Lang::Japanese for kanji).",
     )
     sync_kanji_cards_parser.add_argument(
         "--note-type",
@@ -7548,6 +7952,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_kanji_cards_parser.add_argument("--min-priority", type=float, default=0.0)
     sync_kanji_cards_parser.add_argument("--kanji-id", type=int)
+    sync_kanji_cards_parser.add_argument(
+        "--language",
+        default=ALL_LANGUAGES_CODE,
+        help="Only sync characters of one language (ja, zh). Default: all.",
+    )
     sync_kanji_cards_parser.add_argument(
         "--refresh-metadata",
         action="store_true",
