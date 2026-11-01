@@ -82,13 +82,15 @@ Japanese keeps JMdict meanings, Sudachi analysis, kanji and romaji. Other langua
 
 ### Passive capture in every language
 
-The passive capture catalogs every language that appears on screen; nothing is dropped only because of its language. Which languages are kept lives in the database (`languages.enabled` plus `languages.capture_enabled`), defaults to every built-in profile, and is edited from three places that all write the same flags:
+The passive capture catalogs every language that appears on screen; nothing is dropped only because of its language. Which languages are kept lives in the database (`languages.enabled` plus `languages.capture_enabled`), defaults to every built-in profile except the gloss language (`LANG_JP_TERM_TRANSLATION_TARGET`, `pt` by default: meanings are written in it, so its screens are not study material), and is edited from three places that all write the same flags:
 
 - the tray menu `Capture languages` (checkbox per language, `Capture every language`, `Capture Japanese only`);
 - the web page `/capture` (also lists the OCR plan, the capture profiles and the recent captures with their window titles);
 - the CLI: `set-capture-languages --codes ja,en,es,ko`, `set-capture-languages --all`, `enable-language --code de --capture` / `--no-capture`.
 
 The worker reads the set per job, so changes apply to the next capture without a restart. `LANG_CAPTURE_LANGUAGES` is no longer required; when set in the worker environment it overrides the database for that run.
+
+Latin-script lines are detected against every language, not only the captured ones, and the screen's Latin text as a whole sets a prior that decides short strings with no stop word ("Seguir", "Mostrar mais"). A Portuguese screen with Portuguese off is therefore rejected instead of being filed as Spanish or English. Non-Japanese lines read with OCR confidence below `LANG_JP_MIN_TERM_CONFIDENCE` (default 0.5) are kept as segments without candidates. The word tokenizer skips links, e-mail addresses, @handles, #hashtags, letters stuck to numbers (`21k`) and oddly cased tokens (`kStrear`, `YouTube`), and folds all-caps lines and all-caps words longer than five letters to lower case. Single letters that are not words in their language and Latin lemmas without a vowel (unless written in capitals) are blacklisted.
 
 OCR engines follow the set automatically (`LANG_JP_OCR_BACKEND=auto`, the default): `meikiocr` alone when only `ja` is enabled, otherwise `meikiocr` for the Japanese pass plus one EasyOCR reader per compatible language group (all Latin-script languages share one reader; `ko`, `zh`, `th`, Cyrillic, Arabic and Devanagari each get their own, paired with English when English is enabled). Readers are cached for the life of the worker, EasyOCR detection runs once per capture and later readers only re-read boxes nobody read confidently, and the blocks of every engine are merged by bounding-box overlap and text similarity. Greek and Hebrew have no EasyOCR model, so their text only enters through `ingest-text`. `LANG_JP_OCR_BACKEND=meikiocr` or `easyocr` still force the old single-engine flows.
 

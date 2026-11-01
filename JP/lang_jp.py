@@ -460,9 +460,11 @@ def term_blacklist_reason(
     if not any(unicodedata.category(char).startswith("L") for char in normalized_lemma):
         return "placeholder_or_punctuation"
     base_code = languages.base_language_code(language_code) or DEFAULT_LANGUAGE_CODE
-    if base_code == DEFAULT_LANGUAGE_CODE and is_single_kana_character(normalized_lemma):
-        return "single_kana_syllable"
-    return None
+    if base_code == DEFAULT_LANGUAGE_CODE:
+        if is_single_kana_character(normalized_lemma):
+            return "single_kana_syllable"
+        return None
+    return languages.junk_word_reason(normalized_lemma, base_code)
 
 
 def ensure_term_not_blacklisted(
@@ -581,6 +583,13 @@ def resolve_language_code(
     return guess.code, guess.confidence
 
 
+def is_gloss_language(code: str | None) -> bool:
+    """True for the language term meanings are translated into (``pt`` by default)."""
+    return bool(code) and languages.base_language_code(code) == languages.base_language_code(
+        DEFAULT_TERM_TRANSLATION_TARGET
+    )
+
+
 def ensure_language_row(
     connection: sqlite3.Connection,
     code: str | None,
@@ -593,7 +602,9 @@ def ensure_language_row(
     """Make sure ``languages`` has a row for ``code`` and return its profile.
 
     New rows are enabled for capture by default, so a fresh install captures
-    every registered language until the user turns some off.
+    every registered language until the user turns some off. The gloss language
+    (``LANG_JP_TERM_TRANSLATION_TARGET``) is the exception: it is the language
+    meanings are written in, so its screens are not study material.
     """
     profile = get_language(code)
     existing = connection.execute(
@@ -601,6 +612,8 @@ def ensure_language_row(
         (profile.code,),
     ).fetchone()
     if existing is None:
+        if capture_enabled is None:
+            capture_enabled = not is_gloss_language(profile.code)
         connection.execute(
             """
             INSERT INTO languages (
@@ -615,7 +628,7 @@ def ensure_language_row(
                 profile.script,
                 deck_name or profile.deck_name,
                 1 if enabled is None or enabled else 0,
-                1 if capture_enabled is None or capture_enabled else 0,
+                1 if capture_enabled else 0,
                 0 if profile.code == DEFAULT_LANGUAGE_CODE else 100,
             ),
         )

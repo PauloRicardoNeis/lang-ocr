@@ -15,6 +15,20 @@ import lang_jp
 from lang_jp import SCHEMA_PATH, db_connect
 from ocr_backends import OcrBlock, OcrEnginePlan, recognize_with_shared_detection
 
+_LOG_DIR = tempfile.TemporaryDirectory()
+_LOG_PATCH = patch.object(capture_worker, "DEFAULT_LOG_PATH", Path(_LOG_DIR.name) / "worker.log")
+
+
+def setUpModule() -> None:
+    # The worker logs every analyzer and job step; keep that out of the real
+    # data/capture_daemon.log.
+    _LOG_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _LOG_PATCH.stop()
+    _LOG_DIR.cleanup()
+
 
 class StubReader:
     """Stands in for ``EasyOcrBackend``: fixed readings per box index and language group."""
@@ -247,6 +261,34 @@ class ProcessJobTest(unittest.TestCase):
         self.assertEqual(term_languages, ["en", "ko"])
         self.assertEqual(source["title"], "Some VN")
         self.assertEqual((korean["lemma"], korean["reading"]), ("안녕하세요", "annyeonghaseyo"))
+
+    def test_screen_only_in_a_language_not_captured_is_rejected(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["en", "es"])
+            job_id = self.enqueue(connection, "feed", window_title="Home / X", process_name="chrome.exe")
+            connection.commit()
+        finally:
+            connection.close()
+        stub = StubEngine(
+            "stub",
+            [
+                block("O que está acontecendo?", 10, 10, 300, 40),
+                block("Mostrar mais", 10, 60, 200, 90),
+                block("Seguir", 10, 110, 200, 140),
+            ],
+        )
+        with patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        connection = db_connect(self.db_path)
+        try:
+            job = connection.execute("SELECT status FROM capture_jobs WHERE id = ?", (job_id,)).fetchone()
+            sources = connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+            terms = connection.execute("SELECT COUNT(*) FROM terms").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(job["status"], "rejected")
+        self.assertEqual((sources, terms), (0, 0))
 
 
 if __name__ == "__main__":

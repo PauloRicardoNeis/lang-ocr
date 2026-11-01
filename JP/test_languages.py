@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 TESTS_ROOT = Path(__file__).resolve().parent
 if str(TESTS_ROOT) not in sys.path:
@@ -17,6 +18,20 @@ import lang_jp_web
 import languages
 from lang_jp import SCHEMA_PATH, db_connect
 from ocr_backends import OcrBlock
+
+_LOG_DIR = tempfile.TemporaryDirectory()
+_LOG_PATCH = patch.object(capture_worker, "DEFAULT_LOG_PATH", Path(_LOG_DIR.name) / "worker.log")
+
+
+def setUpModule() -> None:
+    # The worker logs every analyzer and job step; keep that out of the real
+    # data/capture_daemon.log.
+    _LOG_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _LOG_PATCH.stop()
+    _LOG_DIR.cleanup()
 
 
 class LanguageDetectionTest(unittest.TestCase):
@@ -55,6 +70,35 @@ class LanguageDetectionTest(unittest.TestCase):
             languages.detect_language("no puede ser", candidates=["en", "pt"]).code,
             "pt",
         )
+
+    def test_short_ui_strings_follow_the_screen_language(self) -> None:
+        # Real Portuguese UI strings that used to land in en, fr, pl and es.
+        for text in ("Seguir", "Mostrar mais", "Assunto do Momento", "História", "Arthur do Val"):
+            with self.subTest(text=text):
+                self.assertEqual(languages.detect_language(text, prior="pt").code, "pt")
+        # A real English stop word still beats the prior.
+        self.assertEqual(languages.detect_language("Press START to continue", prior="pt").code, "en")
+
+    def test_ties_and_lone_hints_are_not_overconfident(self) -> None:
+        self.assertEqual(languages.detect_language("Press START to continue").code, "en")
+        # pt and fr share "mais"; the tie goes by language order, not alphabetically.
+        self.assertEqual(languages.detect_language("Mostrar mais").code, "pt")
+        self.assertLess(languages.detect_language("História").confidence, 0.5)
+        self.assertLess(languages.detect_language("Press START to continue").confidence, 0.5)
+        self.assertGreater(languages.detect_language("Eu não sei o que fazer com isso").confidence, 0.6)
+
+    def test_latin_language_prior_reads_the_whole_screen(self) -> None:
+        screen = [
+            "Para você",
+            "Seguindo",
+            "O que está acontecendo?",
+            "Mostrar mais",
+            "Eu não sei o que fazer com isso",
+            "回復しました",
+        ]
+        self.assertEqual(languages.latin_language_prior(screen), "pt")
+        self.assertIsNone(languages.latin_language_prior(["Seguir", "Options"]))
+        self.assertIsNone(languages.latin_language_prior(["回復しました"]))
 
     def test_empty_text_falls_back_to_default(self) -> None:
         guess = languages.detect_language("", default="es")
@@ -103,6 +147,47 @@ class AnalyzerTest(unittest.TestCase):
         self.assertEqual(tokens[0].lemma, "no")
         self.assertEqual(tokens[-1].lemma, "HP")
         self.assertTrue(all(token.language_code == "es" for token in tokens))
+
+    def test_generic_analyzer_skips_links_handles_and_ocr_noise(self) -> None:
+        analyzer = languages.GenericAnalyzer("en")
+        self.assertEqual(analyzer.analyze("@lucianosouza-j6s #news"), [])
+        self.assertEqual(analyzer.analyze("https //vayoutube com /feed subscriptions"), [])
+        self.assertEqual(
+            [token.surface for token in analyzer.analyze("Visit x.com or mail me@example.org")],
+            ["Visit", "or", "mail"],
+        )
+        self.assertEqual(
+            [token.surface for token in analyzer.analyze("21k views 1ok 3.3kStrear")],
+            ["views"],
+        )
+        self.assertEqual(
+            [token.surface for token in analyzer.analyze("YouTube UiUies GHANGEMYMINn Search")],
+            ["Search"],
+        )
+
+    def test_all_caps_lines_are_folded_but_acronyms_stay(self) -> None:
+        shouting = languages.GenericAnalyzer("pt").analyze("DEBATE PÚBLICO NO MACKENZIE")
+        self.assertEqual(len(shouting), 4)
+        self.assertTrue(all(token.lemma == token.lemma.lower() for token in shouting))
+        english = languages.GenericAnalyzer("en")
+        self.assertEqual(
+            [token.lemma for token in english.analyze("Press START to continue")][1],
+            "START",
+        )
+        self.assertEqual(english.analyze("MBL TV")[0].lemma, "MBL")
+        self.assertEqual(english.analyze("SETTINGS")[0].lemma, english.lemmatize("settings"))
+
+    def test_analyze_text_drops_latin_text_in_languages_not_captured(self) -> None:
+        # Portuguese is recognized and dropped instead of being filed as Spanish.
+        self.assertEqual(
+            languages.analyze_text("Eu não sei o que fazer com isso", candidates=["ja", "en", "es"]),
+            [],
+        )
+        # A string with no evidence follows the screen prior...
+        self.assertEqual(languages.analyze_text("Seguir", candidates=["en", "es"], prior="pt"), [])
+        # ...and, with nothing to go on, still lands in a captured language.
+        runs = languages.analyze_text("Seguir", candidates=["en", "es"])
+        self.assertEqual([run.language_code for run in runs], ["en"])
 
     def test_french_clitics_are_split(self) -> None:
         tokens = languages.GenericAnalyzer("fr").analyze("L'homme qui n'est pas là")
@@ -190,7 +275,7 @@ class CaptureConfigTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_fresh_database_captures_every_builtin_language(self) -> None:
+    def test_fresh_database_captures_every_builtin_language_but_the_gloss_language(self) -> None:
         connection = db_connect(self.db_path)
         try:
             codes = lang_jp.capture_language_codes(connection, override="")
@@ -199,9 +284,14 @@ class CaptureConfigTest(unittest.TestCase):
             ).fetchall()
         finally:
             connection.close()
-        self.assertEqual(set(codes), set(languages.BUILTIN_LANGUAGES))
+        gloss = lang_jp.DEFAULT_TERM_TRANSLATION_TARGET
+        self.assertEqual(set(codes), set(languages.BUILTIN_LANGUAGES) - {gloss})
         self.assertEqual(codes[0], "ja")
-        self.assertTrue(all(row["enabled"] and row["capture_enabled"] for row in rows))
+        self.assertTrue(all(row["enabled"] for row in rows))
+        self.assertEqual(
+            {row["code"] for row in rows if not row["capture_enabled"]},
+            {gloss},
+        )
 
     def test_capture_flags_are_stored_and_env_is_only_an_override(self) -> None:
         connection = db_connect(self.db_path)
@@ -389,6 +479,17 @@ class CatalogLanguageTest(unittest.TestCase):
             lang_jp.term_blacklist_reason("?", language_code="es"),
             "placeholder_or_punctuation",
         )
+        # Single letters are only words where the language has them as words.
+        self.assertEqual(lang_jp.term_blacklist_reason("s", language_code="en"), "single_letter")
+        self.assertEqual(lang_jp.term_blacklist_reason("П", language_code="ru"), "single_letter")
+        self.assertIsNone(lang_jp.term_blacklist_reason("y", language_code="es"))
+        self.assertIsNone(lang_jp.term_blacklist_reason("и", language_code="ru"))
+        # Latin lemmas without a vowel are OCR fragments, unless they are acronyms.
+        self.assertEqual(lang_jp.term_blacklist_reason("dc", language_code="en"), "no_vowel")
+        self.assertEqual(lang_jp.term_blacklist_reason("Wr", language_code="en"), "no_vowel")
+        self.assertIsNone(lang_jp.term_blacklist_reason("MTG", language_code="en"))
+        self.assertIsNone(lang_jp.term_blacklist_reason("rhythm", language_code="en"))
+        self.assertIsNone(lang_jp.term_blacklist_reason("안", language_code="ko"))
 
     def test_source_language_auto_detection(self) -> None:
         connection = db_connect(self.db_path)
@@ -666,6 +767,50 @@ class WorkerLanguageTest(unittest.TestCase):
         self.assertIsNotNone(confidence)
         source_language, _ = capture_worker.dominant_block_language([results], default="en")
         self.assertEqual(source_language, "en")
+
+    def test_screen_in_the_gloss_language_gives_no_candidates(self) -> None:
+        captured = tuple(code for code in languages.BUILTIN_LANGUAGES if code not in ("pt", "ja"))
+        screen = [
+            "Assunto do Momento",
+            "Mostrar mais",
+            "Seguir",
+            "História",
+            "Eu não sei o que fazer com isso, você sabe?",
+            "Press START to continue",
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            connection = db_connect(Path(temp_dir) / "worker.sqlite3")
+            try:
+                connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+                analyzer = capture_worker.LanguageSegmentAnalyzer(captured)
+                analyzed = analyzer.analyze_blocks(
+                    connection,
+                    [OcrBlock(text=text, confidence=0.9, bbox=None) for text in screen],
+                )
+            finally:
+                connection.close()
+        with_candidates = {
+            payload["raw_text"]: payload["language_code"]
+            for block_results in analyzed
+            for payload, candidates in block_results
+            if candidates
+        }
+        self.assertEqual(with_candidates, {"Press START to continue": "en"})
+        # The Portuguese lines are kept as context, tagged with their real language.
+        self.assertEqual(analyzed[0][0][0]["language_code"], "pt")
+
+    def test_low_confidence_lines_give_no_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            connection = db_connect(Path(temp_dir) / "worker.sqlite3")
+            try:
+                connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+                analyzer = capture_worker.LanguageSegmentAnalyzer(("en",))
+                noisy = analyzer.analyze_block(connection, OcrBlock(text="Googic Shc", confidence=0.35, bbox=None))
+                clear = analyzer.analyze_block(connection, OcrBlock(text="Show more", confidence=0.82, bbox=None))
+            finally:
+                connection.close()
+        self.assertEqual([candidates for _, candidates in noisy], [[]])
+        self.assertEqual([candidate["surface_form"] for candidate in clear[0][1]], ["Show", "more"])
 
 
 class WebLanguageTest(unittest.TestCase):

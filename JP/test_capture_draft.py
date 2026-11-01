@@ -13,6 +13,7 @@ TESTS_ROOT = Path(__file__).resolve().parent
 if str(TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(TESTS_ROOT))
 
+import capture_worker
 import lang_jp
 import lang_jp_web
 from capture_worker import (
@@ -35,6 +36,20 @@ from lang_jp import (
     upsert_source_translation,
 )
 from ocr_backends import OcrBlock, sort_ocr_blocks_reading_order
+
+_LOG_DIR = tempfile.TemporaryDirectory()
+_LOG_PATCH = patch.object(capture_worker, "DEFAULT_LOG_PATH", Path(_LOG_DIR.name) / "worker.log")
+
+
+def setUpModule() -> None:
+    # The worker logs every analyzer and job step; keep that out of the real
+    # data/capture_daemon.log.
+    _LOG_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _LOG_PATCH.stop()
+    _LOG_DIR.cleanup()
 
 
 class StubSourceTranslator(GoogleGtxSourceTranslator):

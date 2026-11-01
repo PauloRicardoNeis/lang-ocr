@@ -369,22 +369,26 @@ SCRIPT_DEFAULT_LANGUAGE: dict[str, str] = {
 }
 
 # Small, high-frequency function-word lists. They only need to tell Latin-script
-# languages apart, not to be complete.
+# languages apart, not to be complete. Their order is also the tie-break order
+# when two languages score the same.
 LATIN_STOPWORDS: dict[str, frozenset[str]] = {
     "en": frozenset(
-        "the and you that was for with this have from they are not but what all were when there can "
+        "a an i the and of to in on at by is it be as or if no so do up my we me us our "
+        "you that was for with this have from they are not but what all were when there can "
         "your will one would about which their said them into than then its also been has had his her "
-        "she him who get got just like know think".split()
+        "she him who get got just like know think how why now new more some any only out over "
+        "after here off very much these those may should could must does did let yes".split()
     ),
     "es": frozenset(
-        "el la los las de del que y en un una por con para es no se su al lo como más pero sus le ya "
+        "a e u el la los las de del que y en un una por con para es no se su al lo como más pero sus le ya "
         "o este esta fue son muy hay está están todo también puede ser sin sobre entre cuando donde "
         "nos ha has he mi tu te me qué cómo esto eso aquí ahora".split()
     ),
     "pt": frozenset(
-        "o a os as de do da dos das que e em um uma por com para é não se seu sua ao lo como mais mas "
-        "seus suas lhe já ou este esta foi são muito há está estão tudo também pode ser sem sobre entre "
-        "quando onde nos você vocês eu tu me te meu minha isso isto aqui agora".split()
+        "o a os as de do da dos das no na nos nas que e em um uma por pelo pela com para é não se seu "
+        "sua ao aos à às lo como mais mas seus suas lhe já ou nem este esta foi são muito há está estão "
+        "tudo também pode ser sem sobre entre quando onde você vocês eu tu me te meu minha isso isto "
+        "aqui agora ele ela eles elas dele dela num numa tem ter vai vão só bem porque então".split()
     ),
     "de": frozenset(
         "der die das und du ich er sie es wir ihr nicht ein eine einer eines einem einen ist sind war "
@@ -427,9 +431,11 @@ LATIN_STOPWORDS: dict[str, frozenset[str]] = {
     ),
 }
 
+# Acute accents (á, é, í, ó, ú) are as common in Portuguese as in Spanish, so
+# they are no hint for either.
 LATIN_DIACRITIC_HINTS: dict[str, dict[str, float]] = {
-    "pt": {"ã": 3.0, "õ": 3.0, "ç": 1.0, "ê": 0.5, "â": 0.5},
-    "es": {"ñ": 3.0, "¿": 3.0, "¡": 3.0, "á": 0.5, "í": 0.5, "ó": 0.5, "ú": 0.5},
+    "pt": {"ã": 3.0, "õ": 3.0, "ç": 1.0, "ê": 0.5, "â": 0.5, "nh": 1.0, "lh": 1.0},
+    "es": {"ñ": 3.0, "¿": 3.0, "¡": 3.0},
     "de": {"ß": 3.0, "ä": 1.5, "ö": 1.5, "ü": 1.5},
     "fr": {"ç": 0.5, "è": 1.0, "ê": 0.5, "œ": 3.0, "à": 1.0, "ù": 2.0},
     "it": {"ì": 2.0, "ò": 1.5, "à": 0.5, "è": 0.5},
@@ -445,6 +451,17 @@ CYRILLIC_HINTS: dict[str, dict[str, float]] = {
 }
 
 WORD_PATTERN = re.compile(r"[^\W\d_]+(?:['’\-][^\W\d_]+)*", re.UNICODE)
+
+LATIN_TIE_ORDER: dict[str, int] = {code: index for index, code in enumerate(LATIN_STOPWORDS)}
+# Two-letter function words ("no", "do", "to") are shared by many languages, so
+# they count less than longer ones ("ser", "the").
+SHORT_STOPWORD_WEIGHT = 1.5
+STOPWORD_WEIGHT = 2.0
+# What the rest of the screen says: enough to settle a tie or a lone accent, not
+# enough to beat a real stop word of another language.
+PRIOR_WEIGHT = 1.0
+# Stop-word score at which a guess counts as fully backed by evidence.
+FULL_EVIDENCE_SCORE = 6.0
 
 
 def _words(text: str) -> list[str]:
@@ -476,11 +493,15 @@ def detect_language(
     *,
     candidates: Iterable[str] | None = None,
     default: str | None = None,
+    prior: str | None = None,
 ) -> LanguageGuess:
     """Guess the language of ``text`` without any network call.
 
     ``candidates`` restricts the answer to those languages (the enabled set for
     capture, for example). ``default`` wins when the text carries no evidence.
+    ``prior`` is the Latin-script language the surrounding text is in (the rest
+    of the screen): it breaks ties and decides short strings with no stop word,
+    but a clear stop word of another language still wins.
     """
     text = text or ""
     restricted = _restrict(candidates)
@@ -521,12 +542,20 @@ def detect_language(
     for code, stopwords in LATIN_STOPWORDS.items():
         if not allowed(code):
             continue
-        hits = sum(1 for word in words if word in stopwords)
-        if hits:
-            scores[code] = scores.get(code, 0.0) + hits * 2.0
+        score = sum(
+            STOPWORD_WEIGHT if len(word) > 2 else SHORT_STOPWORD_WEIGHT
+            for word in words
+            if word in stopwords
+        )
+        if score:
+            scores[code] = scores.get(code, 0.0) + score
     for code, value in _hint_scores(text, LATIN_DIACRITIC_HINTS).items():
         if allowed(code):
             scores[code] = scores.get(code, 0.0) + value
+    evidence_score = max(scores.values(), default=0.0)
+    prior_code = base_language_code(prior) if prior else ""
+    if prior_code and allowed(prior_code) and get_language(prior_code).script == SCRIPT_LATIN:
+        scores[prior_code] = scores.get(prior_code, 0.0) + PRIOR_WEIGHT
     if not scores:
         latin_fallback = fallback if get_language(fallback).script == SCRIPT_LATIN else "en"
         if not allowed(latin_fallback):
@@ -535,13 +564,52 @@ def detect_language(
                 latin_fallback,
             )
         return LanguageGuess(code=latin_fallback, confidence=0.2, script=script, scores={})
-    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    ranked = sorted(
+        scores.items(),
+        key=lambda item: (-item[1], LATIN_TIE_ORDER.get(item[0], len(LATIN_TIE_ORDER)), item[0]),
+    )
     best_code, best_score = ranked[0]
     second_score = ranked[1][1] if len(ranked) > 1 else 0.0
     total = sum(scores.values()) or 1.0
     margin = (best_score - second_score) / total
-    confidence = min(0.95, 0.35 + margin * 0.6 + min(best_score, 10) / 40)
-    return LanguageGuess(code=best_code, confidence=confidence, script=script, scores=scores)
+    # One accent or one shared stop word is a hint, not a verdict: the margin
+    # only counts in proportion to how much evidence there is.
+    evidence = min(1.0, evidence_score / FULL_EVIDENCE_SCORE)
+    confidence = min(0.95, 0.3 + margin * 0.5 * evidence + evidence * 0.15)
+    return LanguageGuess(code=best_code, confidence=round(confidence, 3), script=script, scores=scores)
+
+
+PRIOR_MIN_SCORE = 3.0
+PRIOR_MIN_LEAD = 1.5
+
+
+def latin_language_prior(texts: Iterable[str]) -> str | None:
+    """The Latin-script language of a whole screen, when its text says so clearly.
+
+    Detection runs over every language, not only the captured ones, so a screen
+    in a language that is not captured (the gloss language, usually) is
+    recognized as such and its short strings are dropped with it instead of
+    being filed under the closest captured language. "Clearly" means a few stop
+    words and a lead of at least one distinctive word over the runner-up
+    (Portuguese and Spanish share most of their short function words).
+    """
+    latin_text = " ".join(
+        run.text
+        for text in texts
+        for run in split_script_runs(text or "")
+        if run.script == SCRIPT_LATIN
+    )
+    if not _words(latin_text):
+        return None
+    guess = detect_language(latin_text)
+    if guess.script != SCRIPT_LATIN or not guess.scores:
+        return None
+    ranked = sorted(guess.scores.values(), reverse=True)
+    best = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else 0.0
+    if best < PRIOR_MIN_SCORE or best - second < PRIOR_MIN_LEAD:
+        return None
+    return guess.code
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +839,80 @@ GENERIC_TOKEN_PATTERN = re.compile(
 APOSTROPHE_PREFIX_LANGUAGES = frozenset({"fr", "it"})
 APOSTROPHE_CLITIC_PATTERN = re.compile(r"^([^\W\d_]{1,2})['’]([^\W\d_].*)$", re.UNICODE)
 HYPHEN_SPLIT_LANGUAGES = frozenset({"fr", "pt", "es"})
+# Screen chrome that is not vocabulary: links (OCR often turns "https://" into
+# "https //", so a link runs to the end of the line), e-mail addresses, domains,
+# @handles and #hashtags.
+NON_WORD_PATTERN = re.compile(
+    r"(?:\bhttps?\b|\bwww\.)[^\n]*"
+    r"|\S+@\S+\.\S+"
+    r"|[@#][\w.\-]+"
+    r"|\b[\w\-]+(?:\.[\w\-]+)*\.(?:com|net|org|io|gg|tv|dev|app|info|br|jp|kr|cn|uk|ru)\b\S*",
+    re.UNICODE | re.IGNORECASE,
+)
+# All-caps words this short stay as they are (HP, START, RPG); longer ones and
+# every word of an all-caps line are folded so "VOTAÇÃO" and "votação" merge.
+ACRONYM_MAX_LENGTH = 5
+WORD_PART_PATTERN = re.compile(r"['’\-]")
+SINGLE_LETTER_WORDS: dict[str, frozenset[str]] = {
+    "ru": frozenset("а в и к о с у я".split()),
+    "uk": frozenset("а в з і й о у я".split()),
+    "el": frozenset("ο η ή α σ".split()),
+}
+VOWELS = frozenset("aeiouyæøœı")
+JUNK_CHECK_SCRIPTS = frozenset({SCRIPT_LATIN, SCRIPT_CYRILLIC, SCRIPT_GREEK})
+
+
+def _irregular_case(word: str) -> bool:
+    """``YouTube``, ``kStrear``, ``GHANGEMYMINn``: OCR noise or brand names, not words."""
+    for part in WORD_PART_PATTERN.split(word):
+        cased = [char for char in part if char.isupper() or char.islower()]
+        rest = cased[1:]
+        if any(char.isupper() for char in rest) and any(char.islower() for char in rest):
+            return True
+    return False
+
+
+def _glued_to_digit(text: str, start: int, end: int) -> bool:
+    """``21k``, ``1ok``, ``3.3kStrear``: letters stuck to a number are units or noise."""
+    return (start > 0 and text[start - 1].isdigit()) or (end < len(text) and text[end].isdigit())
+
+
+def _is_shouting(words: list[str]) -> bool:
+    """A line written in capitals (``DEBATE PÚBLICO NO MACKENZIE``), not one acronym."""
+    cased = [word for word in words if any(char.isalpha() for char in word)]
+    upper = [word for word in cased if word.isupper()]
+    return (
+        len(upper) >= 2
+        and len(upper) >= 0.8 * len(cased)
+        and any(len(word) > 3 for word in upper)
+    )
+
+
+def _has_vowel(word: str) -> bool:
+    return any(
+        unicodedata.normalize("NFD", char)[0].lower() in VOWELS for char in word
+    )
+
+
+def junk_word_reason(word: str | None, code: str | None) -> str | None:
+    """Why a lemma of an alphabetic language is not a word worth cataloging.
+
+    Single letters are noise unless the language has them as words (``a``,
+    ``y``, ``и``); Latin-script lemmas without a vowel (``dc``, ``Wr``, ``tpg``)
+    are OCR fragments unless written in capitals (acronyms).
+    """
+    word = (word or "").strip()
+    profile = get_language(code)
+    if not word or profile.script not in JUNK_CHECK_SCRIPTS:
+        return None
+    letters = [char for char in word if char.isalpha()]
+    base = base_language_code(profile.code)
+    if len(letters) == 1:
+        allowed = LATIN_STOPWORDS.get(base, frozenset()) | SINGLE_LETTER_WORDS.get(base, frozenset())
+        return None if word.lower() in allowed else "single_letter"
+    if profile.script == SCRIPT_LATIN and not word.isupper() and not _has_vowel(word):
+        return "no_vowel"
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -788,7 +930,8 @@ class GenericAnalyzer:
     Lemmas come from ``simplemma`` when it is installed, otherwise the lower-cased
     surface is used (acronyms keep their case). Clitics attached with apostrophes
     in French and Italian (``l'homme``) are split so the content word becomes a
-    term of its own.
+    term of its own. Links, handles, letters stuck to numbers and oddly cased
+    tokens (OCR noise, brand names) are skipped.
     """
 
     name = "generic"
@@ -802,10 +945,12 @@ class GenericAnalyzer:
     def reading(self, surface: str) -> str | None:
         return romanize(surface, self.language_code) if self._has_readings else None
 
-    def lemmatize(self, surface: str) -> str:
+    def lemmatize(self, surface: str, *, fold_caps: bool = False) -> str:
         # Acronyms and UI labels (HP, START) keep their case so they stay recognizable.
         if len(surface) > 1 and surface.isupper():
-            return surface
+            if not fold_caps and len(surface) <= ACRONYM_MAX_LENGTH:
+                return surface
+            surface = surface.lower()
         if self._simplemma is not None:
             try:
                 # A real inflection ("Häuser" -> "Haus") wins as is; a token simplemma
@@ -822,13 +967,19 @@ class GenericAnalyzer:
         return surface.lower()
 
     def analyze(self, text: str) -> list[Token]:
-        normalized = _normalize(text)
+        normalized = _normalize(NON_WORD_PATTERN.sub(" ", text or ""))
         if not normalized:
             return []
+        matches = [
+            match
+            for match in GENERIC_TOKEN_PATTERN.finditer(normalized)
+            if match.group(0) and not match.group(0)[0].isdigit()
+        ]
+        fold_caps = _is_shouting([match.group(0) for match in matches])
         tokens: list[Token] = []
-        for match in GENERIC_TOKEN_PATTERN.finditer(normalized):
+        for match in matches:
             surface = match.group(0)
-            if not surface or surface[0].isdigit():
+            if _glued_to_digit(normalized, match.start(), match.end()) or _irregular_case(surface):
                 continue
             parts = [surface]
             if self._base in APOSTROPHE_PREFIX_LANGUAGES:
@@ -841,7 +992,7 @@ class GenericAnalyzer:
                 tokens.append(
                     Token(
                         surface=part,
-                        lemma=self.lemmatize(part),
+                        lemma=self.lemmatize(part, fold_caps=fold_caps),
                         reading=self.reading(part),
                         pos=None,
                         language_code=self.language_code,
@@ -980,12 +1131,31 @@ def _script_matches_language(script: str | None, code: str) -> bool:
     return profile.script == script
 
 
+def _detect_run_language(
+    run: ScriptRun,
+    candidates: list[str] | None,
+    prior: str | None,
+) -> LanguageGuess:
+    if candidates is None or run.script != SCRIPT_LATIN:
+        return detect_language(run.text, candidates=candidates, prior=prior)
+    # Latin runs are detected against every language first: Portuguese text on a
+    # screen where Portuguese is not captured must be dropped, not filed as the
+    # closest captured language. Only text with no evidence at all (no stop
+    # word, no accent, no screen prior) falls back to the captured languages.
+    guess = detect_language(run.text, prior=prior)
+    allowed = {base_language_code(code) for code in candidates}
+    if base_language_code(guess.code) in allowed or guess.scores:
+        return guess
+    return detect_language(run.text, candidates=candidates, prior=prior)
+
+
 def analyze_text(
     text: str | None,
     *,
     language: str | None = AUTO_LANGUAGE_CODE,
     candidates: Iterable[str] | None = None,
     split_mixed: bool = True,
+    prior: str | None = None,
 ) -> list[AnalyzedRun]:
     """Detect, split and tokenize ``text``.
 
@@ -993,7 +1163,8 @@ def analyze_text(
     With ``auto`` the text is split into script runs; runs are detected
     separately and only runs whose language is in ``candidates`` (when given)
     are analyzed. Neighbouring runs that resolve to the same language are merged
-    back so that word order inside a sentence is preserved.
+    back so that word order inside a sentence is preserved. ``prior`` is the
+    screen's Latin-script language (:func:`latin_language_prior`).
     """
     text = text or ""
     if not _normalize(text):
@@ -1007,7 +1178,7 @@ def analyze_text(
     runs = split_script_runs(text) if split_mixed else [ScriptRun(text=text, script=dominant_script(text), start=0, end=len(text))]
     labelled: list[tuple[str, str, float]] = []
     for run in runs:
-        guess = detect_language(run.text, candidates=candidate_list)
+        guess = _detect_run_language(run, candidate_list, prior)
         if candidate_list is not None and base_language_code(guess.code) not in {
             base_language_code(code) for code in candidate_list
         }:

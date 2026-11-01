@@ -90,6 +90,9 @@ DEFAULT_OCR_HORIZONTAL_MIN_RATIO = float(os.environ.get("LANG_JP_OCR_HORIZONTAL_
 DEFAULT_OCR_HORIZONTAL_MAX_ANGLE = float(os.environ.get("LANG_JP_OCR_HORIZONTAL_MAX_ANGLE", "18"))
 DEFAULT_OCR_REGION_PADDING = int(os.environ.get("LANG_JP_OCR_REGION_PADDING", "12"))
 DEFAULT_OCR_MAX_REGIONS = int(os.environ.get("LANG_JP_OCR_MAX_REGIONS", "3"))
+# Non-Japanese OCR lines read below this confidence keep their segment but give
+# no candidates: on real screens they are mostly garbage ("Lcqallc", "Googic").
+DEFAULT_MIN_TERM_CONFIDENCE = float(os.environ.get("LANG_JP_MIN_TERM_CONFIDENCE", "0.5"))
 DEFAULT_AUTO_PROMOTE_SOURCE_TERMS = (
     os.environ.get("LANG_JP_AUTO_PROMOTE_SOURCE_TERMS", "1") != "0"
 )
@@ -1322,10 +1325,23 @@ class LanguageSegmentAnalyzer:
             )
         )
 
+    def analyze_blocks(
+        self,
+        connection,
+        blocks: list[OcrBlock],
+    ) -> list[list[tuple[dict[str, Any], list[dict[str, Any]]]]]:
+        """Analyze a whole screen: its Latin text as a whole settles the short strings."""
+        prior = None
+        if self.forced_language is None:
+            prior = languages.latin_language_prior(block.text for block in blocks)
+        return [self.analyze_block(connection, block, prior=prior) for block in blocks]
+
     def analyze_block(
         self,
         connection,
         block: OcrBlock,
+        *,
+        prior: str | None = None,
     ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
         normalized_text = normalize_token(block.text)
         if not normalized_text:
@@ -1334,12 +1350,15 @@ class LanguageSegmentAnalyzer:
             normalized_text,
             language=self.forced_language or languages.AUTO_LANGUAGE_CODE,
             candidates=self.enabled_languages,
+            prior=prior,
         )
         if not runs:
             # Nothing matched an enabled language; keep the raw segment so the
             # reviewer still sees the text, tagged with the language it looks
             # like (unrestricted detection) and without candidates.
-            guess = languages.detect_language(normalized_text, default=self.enabled_languages[0])
+            guess = languages.detect_language(
+                normalized_text, default=self.enabled_languages[0], prior=prior
+            )
             payload, candidates = build_segment_candidates(
                 connection,
                 text=normalized_text,
@@ -1354,11 +1373,18 @@ class LanguageSegmentAnalyzer:
             run_text = normalize_token(run.text)
             if not run_text:
                 continue
+            tokens = run.tokens
+            if (
+                block.confidence is not None
+                and block.confidence < DEFAULT_MIN_TERM_CONFIDENCE
+                and languages.base_language_code(run.language_code) != DEFAULT_LANGUAGE_CODE
+            ):
+                tokens = []
             payload, candidates = build_segment_candidates(
                 connection,
                 text=run_text,
                 language_code=run.language_code,
-                tokens=run.tokens,
+                tokens=tokens,
                 confidence=block.confidence,
                 bbox_json=bbox_json(block.bbox),
             )
@@ -1663,10 +1689,24 @@ def process_job_once(
             kept=len(normalized_blocks),
             text_len=len(raw_text),
         )
-        if not any(
+        target_found = any(
             contains_target_language_text(block.text, enabled_languages=enabled_languages)
             for block in normalized_blocks
-        ):
+        )
+        analyzed_blocks: list[list[tuple[dict[str, Any], list[dict[str, Any]]]]] = []
+        if target_found:
+            connection = db_connect(db_path)
+            try:
+                analyzed_blocks = analyzer.analyze_blocks(connection, normalized_blocks)
+            finally:
+                connection.close()
+            # Text that passed the quick check can still turn out to be in a language
+            # that is not captured (a Portuguese screen with Portuguese off) or too
+            # noisy to give a single candidate.
+            target_found = any(
+                candidates for block_results in analyzed_blocks for _, candidates in block_results
+            )
+        if not target_found:
             connection = db_connect(db_path)
             try:
                 update_capture_job_status(
@@ -1705,11 +1745,13 @@ def process_job_once(
 
         connection = db_connect(db_path)
         try:
-            analyzed_blocks = [
-                analyzer.analyze_block(connection, block) for block in normalized_blocks
-            ]
+            # The source is filed under the captured language that covers most of it,
+            # not under the language of lines that were kept only as context.
             source_language, source_language_confidence = dominant_block_language(
-                analyzed_blocks,
+                [
+                    [(payload, candidates) for payload, candidates in block_results if candidates]
+                    for block_results in analyzed_blocks
+                ],
                 default=enabled_languages[0],
             )
             source_id = create_source_record(
