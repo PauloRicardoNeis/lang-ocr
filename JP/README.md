@@ -115,7 +115,9 @@ The web UI has a language bar on every page (`?lang=es`, `lang=all`), and other 
 - `GET /api/terms?lang=es&q=&order=priority|recent|lemma&limit=&page=`
 - `GET /api/terms/{id}`
 - `GET /api/sources?lang=es&q=&limit=&page=`
-- `GET /api/flashcards?lang=es&status=pending&limit=&page=`
+- `GET /api/flashcards?lang=es&status=pending&q=&limit=&page=`
+
+Searches (`q`) ignore case in every script (`água` finds `ÁGUA`, `привет` finds `ПРИВЕТ`) without folding accents, so kana, hangul and Devanagari match exactly.
 
 `lang=all` (or no `lang`) works on every page and every endpoint. The dashboard shows one card per language with counts and top terms; a source page lets you change the source language and re-run its analysis.
 
