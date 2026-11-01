@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import http.client
 import sys
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import timedelta, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlencode
 
 TESTS_ROOT = Path(__file__).resolve().parent
 if str(TESTS_ROOT) not in sys.path:
@@ -392,6 +396,327 @@ class CatalogWebPaginationTest(unittest.TestCase):
         self.assertEqual(term_page.count('<a href="/sources/'), lang_jp_web.DETAIL_TABLE_LIMIT)
         self.assertIn(note, kanji_page)
         self.assertEqual(kanji_page.count('<a href="/sources/'), lang_jp_web.DETAIL_TABLE_LIMIT)
+
+
+class MultilingualPagesTest(unittest.TestCase):
+    """Pages and API routes for languages other than Japanese."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "lang_jp_web_multilingual.sqlite3"
+        connection = db_connect(self.db_path)
+        try:
+            connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+            self.ja_term = self.insert_term(connection, "ja", "回復", reading="かいふく", meaning="cura")
+            self.es_term = self.insert_term(connection, "es", "batalla", meaning="batalha")
+            self.es_water = self.insert_term(connection, "es", "agua", meaning="ÁGUA")
+            self.ru_term = self.insert_term(connection, "ru", "Привет", reading="privet", meaning="olá")
+            self.ar_term = self.insert_term(connection, "ar", "مرحبا", meaning="olá")
+            self.kanji_id = connection.execute(
+                "INSERT INTO kanji (literal, language_code, canonical_meanings) VALUES ('回', 'ja', 'times')"
+            ).lastrowid
+
+            # A Spanish capture with one Japanese line, as the polyglot worker files it.
+            self.mixed_source = self.insert_source(connection, "es", "¡Vamos a la batalla!\n回復")
+            self.link(connection, self.mixed_source, self.es_term, "batalla", "Vamos a la batalla", "es")
+            self.link(connection, self.mixed_source, self.ja_term, "回復", "回復", "ja", reading="かいふく")
+            connection.execute(
+                "INSERT INTO source_kanji (source_id, kanji_id, count_in_source) VALUES (?, ?, 1)",
+                (self.mixed_source, self.kanji_id),
+            )
+            self.es_source = self.insert_source(connection, "es", "agua")
+            self.link(connection, self.es_source, self.es_water, "agua", "agua", "es")
+            self.ar_source = self.insert_source(connection, "ar", "مرحبا بالعالم")
+
+            spanish_segment = self.insert_analysis_segment(connection, self.mixed_source, 0, "Vamos a la batalla", "es")
+            for status in ("approved", "approved", "rejected"):
+                self.insert_candidate(connection, spanish_segment, status)
+            japanese_segment = self.insert_analysis_segment(connection, self.mixed_source, 1, "回復", "ja")
+            self.insert_candidate(connection, japanese_segment, "pending")
+            # Approved candidates of another source must not leak into these counts.
+            other_segment = self.insert_analysis_segment(connection, self.es_source, 0, "agua", "es")
+            for _ in range(4):
+                self.insert_candidate(connection, other_segment, "approved")
+
+            for term_id, front in ((self.es_term, "<div>batalla</div>"), (self.ja_term, "<div>回復</div>")):
+                connection.execute(
+                    "INSERT INTO flashcards (term_id, front_text, back_text) VALUES (?, ?, 'back')",
+                    (term_id, front),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def insert_term(
+        self,
+        connection,
+        language_code: str,
+        lemma: str,
+        *,
+        reading: str | None = None,
+        meaning: str | None = None,
+    ) -> int:
+        return connection.execute(
+            """
+            INSERT INTO terms (canonical_key, language_code, lemma, reading, meaning_pt)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (f"{language_code}::{lemma}::{reading or ''}", language_code, lemma, reading, meaning),
+        ).lastrowid
+
+    def insert_source(self, connection, language_code: str, raw_text: str) -> int:
+        return connection.execute(
+            """
+            INSERT INTO sources (source_type, language_code, title, raw_text, created_at)
+            VALUES ('text', ?, ?, ?, '2026-10-25 10:00:00')
+            """,
+            (language_code, f"{language_code} source", raw_text),
+        ).lastrowid
+
+    def link(
+        self,
+        connection,
+        source_id: int,
+        term_id: int,
+        surface: str,
+        segment_text: str,
+        segment_language: str,
+        *,
+        reading: str | None = None,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO source_terms (source_id, term_id, surface_form, count_in_source) VALUES (?, ?, ?, 1)",
+            (source_id, term_id, surface),
+        )
+        segment_id = connection.execute(
+            """
+            INSERT INTO source_segments (source_id, segment_key, segment_text, language_code, reading)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (source_id, f"{segment_text}::", segment_text, segment_language, reading),
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO source_segment_terms (source_segment_id, term_id, surface_form) VALUES (?, ?, ?)",
+            (segment_id, term_id, surface),
+        )
+
+    def insert_analysis_segment(self, connection, source_id: int, index: int, text: str, language_code: str) -> int:
+        return connection.execute(
+            """
+            INSERT INTO source_analysis_segments (source_id, segment_index, raw_text, normalized_text, language_code)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (source_id, index, text, text, language_code),
+        ).lastrowid
+
+    def insert_candidate(self, connection, segment_id: int, status: str) -> None:
+        connection.execute(
+            """
+            INSERT INTO source_analysis_candidates (
+                source_analysis_segment_id, candidate_type, surface_form, dictionary_form, approval_status
+            )
+            VALUES (?, 'term', 'x', 'x', ?)
+            """,
+            (segment_id, status),
+        )
+
+    def test_term_detail_shows_language_and_only_relevant_panels(self) -> None:
+        spanish = lang_jp_web.term_detail_page(self.db_path, self.es_term)
+        self.assertIn("Idioma: Spanish (es)", spanish)
+        self.assertIn('<h2 lang="es" dir="auto">batalla</h2>', spanish)
+        self.assertNotIn("Kanji derivados", spanish)
+        self.assertNotIn("Leitura:", spanish)
+        self.assertNotIn("Leitura do segmento", spanish)
+        self.assertIn("Idioma do segmento", spanish)
+
+        japanese = lang_jp_web.term_detail_page(self.db_path, self.ja_term)
+        self.assertIn("Idioma: Japanese (ja)", japanese)
+        self.assertIn("Kanji derivados", japanese)
+        self.assertIn('Leitura: <span lang="ja" dir="auto">かいふく</span>', japanese)
+        self.assertIn('>回</a>', japanese)
+
+        russian = lang_jp_web.term_detail_page(self.db_path, self.ru_term)
+        self.assertIn('Leitura: <span lang="ru-Latn" dir="auto">privet</span>', russian)
+        self.assertNotIn("Kanji derivados", russian)
+
+        arabic = lang_jp_web.term_detail_page(self.db_path, self.ar_term)
+        self.assertIn('<h2 lang="ar" dir="auto">مرحبا</h2>', arabic)
+
+    def test_listings_carry_language_through_links_forms_and_pagination(self) -> None:
+        page = lang_jp_web.terms_page(self.db_path, {"lang": ["es"], "limit": ["1"]})
+
+        self.assertIn('href="/terms?limit=1&amp;lang=es&amp;page=2"', page)
+        self.assertIn(
+            f'href="/terms/{self.es_term}?lang=es" lang="es" dir="auto"',
+            lang_jp_web.terms_page(self.db_path, {"lang": ["es"]}),
+        )
+        self.assertIn('<input type="hidden" name="lang" value="es">', page)
+        # "Limpar filtros" drops the search but keeps the language.
+        self.assertIn('class="secondary-link" href="/terms?lang=es"', page)
+        # Spanish has no readings, so the column is gone; it stays for all languages.
+        self.assertNotIn(">Leitura<", page)
+        self.assertIn(">Leitura<", lang_jp_web.terms_page(self.db_path, {}))
+        self.assertIn(">Leitura<", lang_jp_web.terms_page(self.db_path, {"lang": ["ru"]}))
+
+        connection = db_connect(self.db_path)
+        try:
+            connection.execute("INSERT INTO kanji (literal, language_code) VALUES ('復', 'ja')")
+            connection.commit()
+        finally:
+            connection.close()
+        kanji = lang_jp_web.kanji_page(self.db_path, {"lang": ["ja"], "limit": ["1"]})
+        self.assertIn('href="/kanji?limit=1&amp;lang=ja&amp;page=2"', kanji)
+        self.assertIn('<input type="hidden" name="lang" value="ja">', kanji)
+
+        cards = lang_jp_web.flashcards_page(self.db_path, {"lang": ["es"], "q": ["bat"]})
+        self.assertIn('class="secondary-link" href="/flashcards?lang=es"', cards)
+        self.assertNotIn(">Leitura<", cards)
+
+        sources = lang_jp_web.sources_live_payload(self.db_path, {"lang": ["es"]})
+        self.assertIn(f'href="/sources/{self.mixed_source}?lang=es"', sources["table_html"])
+
+    def test_term_and_source_search_ignore_case_outside_ascii(self) -> None:
+        russian = lang_jp_web.terms_page(self.db_path, {"q": ["привет"]})
+        self.assertIn("Mostrando 1 a 1 de 1 resultado.", russian)
+        self.assertIn(">Привет</a>", russian)
+
+        accented = lang_jp_web.api_terms_payload(self.db_path, {"q": ["água"]})
+        self.assertEqual([term["id"] for term in accented["terms"]], [self.es_water])
+
+        japanese = lang_jp_web.api_terms_payload(self.db_path, {"q": ["回復"]})
+        self.assertEqual([term["id"] for term in japanese["terms"]], [self.ja_term])
+
+        sources = lang_jp_web.api_sources_payload(self.db_path, {"q": ["¡VAMOS"]})
+        self.assertEqual([row["id"] for row in sources["sources"]], [self.mixed_source])
+
+        cards = lang_jp_web.api_flashcards_payload(self.db_path, {"q": ["BATALLA"]})
+        self.assertEqual(cards["meta"]["q"], "BATALLA")
+        self.assertEqual([card["term_id"] for card in cards["flashcards"]], [self.es_term])
+
+    def test_search_fold_only_changes_case_and_normalization(self) -> None:
+        fold = lang_jp_web.search_fold
+
+        self.assertEqual(fold("ÁGUA"), "água")
+        self.assertEqual(fold("ПРИВЕТ"), "привет")
+        self.assertEqual(fold("Straße"), "strasse")
+        # Dakuten, matras, hangul and Arabic stay exactly as they are.
+        for value in ("ガギグ", "回復", "हिन्दी", "한국어", "ภาษาไทย", "مرحبا"):
+            self.assertEqual(fold(value), value)
+        self.assertEqual(fold("が"), "が")
+        self.assertEqual(fold(None), "")
+
+    def test_language_attributes_cover_scripts_and_right_to_left(self) -> None:
+        self.assertEqual(lang_jp_web.language_attrs("ar"), ' lang="ar" dir="auto"')
+        self.assertEqual(lang_jp_web.language_attrs("pt-br"), ' lang="pt-BR" dir="auto"')
+        self.assertEqual(lang_jp_web.language_attrs(None), ' dir="auto"')
+        self.assertEqual(lang_jp_web.language_attrs('"><script>'), ' dir="auto"')
+        self.assertEqual(lang_jp_web.reading_attrs("ja"), ' lang="ja" dir="auto"')
+        self.assertEqual(lang_jp_web.reading_attrs("ko"), ' lang="ko-Latn" dir="auto"')
+
+        self.assertEqual(lang_jp_web.current_language({"lang": ["<script>"]}), "all")
+        self.assertEqual(lang_jp_web.current_language({"lang": ["ES"]}), "es")
+        self.assertEqual(lang_jp_web.current_language({}), "all")
+
+        arabic_source = lang_jp_web.source_detail_page(self.db_path, self.ar_source, {})
+        self.assertIn('<pre lang="ar" dir="auto">مرحبا بالعالم</pre>', arabic_source)
+        self.assertIn('[lang|="ar"]', lang_jp_web.PAGE_STYLE)
+        self.assertIn('pre[dir="auto"] { unicode-bidi: plaintext; }', lang_jp_web.PAGE_STYLE)
+
+    def test_source_detail_shows_each_term_and_segment_language(self) -> None:
+        page = lang_jp_web.source_detail_page(self.db_path, self.mixed_source, {"lang": ["es"]})
+
+        self.assertIn(f'href="/terms/{self.es_term}?lang=es" lang="es" dir="auto">batalla</a></td><td>es</td>', page)
+        self.assertIn(f'href="/terms/{self.ja_term}?lang=es" lang="ja" dir="auto">回復</a></td><td>ja</td>', page)
+        self.assertIn('<td><span lang="es" dir="auto">Vamos a la batalla</span></td><td>es</td>', page)
+        self.assertIn('<td><span lang="ja" dir="auto">回復</span></td><td>ja</td>', page)
+        # Japanese is linked here, so readings and the kanji panel stay.
+        self.assertIn(">Leitura<", page)
+        self.assertIn("Kanji ligados a esta fonte", page)
+        # Candidate counts are per segment (3 candidates, 2 approved; 1 pending).
+        self.assertIn("<td>3</td><td>2</td>", page)
+        self.assertIn("<td>1</td><td>0</td>", page)
+        self.assertIn('<input type="hidden" name="lang" value="es">', page)
+
+        spanish_only = lang_jp_web.source_detail_page(self.db_path, self.es_source, {})
+        self.assertNotIn("Kanji ligados a esta fonte", spanish_only)
+        self.assertNotIn("Abrir kanji", spanish_only)
+        self.assertNotIn(">Leitura<", spanish_only)
+        self.assertIn("<td>4</td><td>4</td>", spanish_only)
+
+    def test_dashboard_for_a_language_without_characters(self) -> None:
+        page = lang_jp_web.dashboard_page(self.db_path, {"lang": ["es"]})
+
+        self.assertNotIn('href="/kanji', page)
+        self.assertNotIn("Kanji prioritarios", page)
+        self.assertNotIn("Buscar kanji", page)
+        self.assertNotIn("Japones", page)
+        self.assertNotIn(">Leitura<", page)
+        self.assertGreaterEqual(page.count('<input type="hidden" name="lang" value="es">'), 3)
+        self.assertIn('href="/flashcards?status=pending&amp;lang=es"', page)
+
+        everything = lang_jp_web.dashboard_page(self.db_path, {})
+        self.assertIn("Kanji prioritarios", everything)
+        self.assertIn('href="/kanji"', everything)
+        self.assertNotIn('name="lang"', everything)
+
+    def test_character_pages_name_the_script_per_language(self) -> None:
+        spanish = lang_jp_web.kanji_page(self.db_path, {"lang": ["es"]})
+        self.assertIn("nao usa caracteres", spanish)
+
+        chinese = lang_jp_web.kanji_page(self.db_path, {"lang": ["zh"]})
+        self.assertIn("<h2>Hanzi</h2>", chinese)
+        self.assertIn('href="/kanji?lang=zh">Hanzi</a>', chinese)
+
+        detail = lang_jp_web.kanji_detail_page(self.db_path, self.kanji_id, {"lang": ["ja"]})
+        self.assertIn("Idioma: Japanese (ja)", detail)
+        self.assertIn("On:", detail)
+        self.assertIn('href="/kanji?lang=ja">Voltar para kanji</a>', detail)
+
+    def test_capture_page_does_not_claim_every_language_is_captured(self) -> None:
+        page = lang_jp_web.capture_page(self.db_path, {})
+
+        self.assertNotIn("todos os idiomas entram", page)
+        self.assertIn("nos idiomas marcados", page)
+        self.assertIn("(idioma dos significados)", page)
+
+    def test_table_sort_is_locale_neutral(self) -> None:
+        self.assertNotIn('toLocaleLowerCase("pt-BR")', lang_jp_web.PAGE_SCRIPT)
+        self.assertIn("sortableText(value)", lang_jp_web.PAGE_SCRIPT)
+
+    def test_source_language_action_keeps_the_selected_language(self) -> None:
+        handler = type("TestHandler", (lang_jp_web.CatalogRequestHandler,), {"db_path": self.db_path})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+            body = urlencode({"language": "pt", "lang": "es"})
+            connection.request(
+                "POST",
+                f"/actions/sources/{self.es_source}/language",
+                body=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            location = response.getheader("Location") or ""
+            response.read()
+            connection.close()
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+            connection.request("GET", "/terms?lang=ru&q=%D0%9F%D0%A0%D0%98%D0%92%D0%95%D0%A2")
+            page = connection.getresponse().read().decode("utf-8")
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response.status, 303)
+        self.assertTrue(location.startswith(f"/sources/{self.es_source}?lang=es&notice="), location)
+        self.assertIn(">Привет</a>", page)
 
 
 class DisplayFormattingTest(unittest.TestCase):
