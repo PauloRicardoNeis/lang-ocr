@@ -1486,6 +1486,54 @@ def job_field(job, name: str) -> str | None:
     return str(value) if value not in (None, "") else None
 
 
+def blocks_with_text(blocks: list[OcrBlock]) -> tuple[list[OcrBlock], str]:
+    """Drop empty OCR blocks and join the rest into the source raw_text."""
+    normalized_blocks = [block for block in blocks if normalize_token(block.text)]
+    return normalized_blocks, "\n".join(block.text for block in normalized_blocks)
+
+
+def store_source_analysis(
+    connection,
+    *,
+    source_id: int,
+    analyzed_blocks: list[list[tuple[dict[str, Any], list[dict[str, Any]]]]],
+) -> tuple[int, int]:
+    """Store the language-tagged segments and candidates of a source's analyzed blocks."""
+    segment_count = 0
+    candidate_count = 0
+    for block_results in analyzed_blocks:
+        for segment_payload, candidates in block_results:
+            segment_id = create_source_analysis_segment(
+                connection,
+                source_id=source_id,
+                segment_index=segment_count,
+                raw_text=segment_payload["raw_text"],
+                normalized_text=segment_payload["normalized_text"],
+                reading=segment_payload["reading"],
+                confidence=segment_payload["confidence"],
+                bbox_json=segment_payload["bbox_json"],
+                language_code=segment_payload["language_code"],
+            )
+            segment_count += 1
+            candidate_count += store_segment_candidates(
+                connection,
+                segment_id=segment_id,
+                candidates=candidates,
+            )
+    return segment_count, candidate_count
+
+
+def auto_promote_source_terms(connection, source_id: int) -> tuple[int, int]:
+    """Promote a new source's candidates without marking it reviewed (LANG_JP_AUTO_PROMOTE_SOURCE_TERMS)."""
+    if not DEFAULT_AUTO_PROMOTE_SOURCE_TERMS:
+        return 0, 0
+    return approve_source_analysis_candidates(
+        connection,
+        source_id=source_id,
+        mark_reviewed=False,
+    )
+
+
 def process_job_once(
     db_path: Path,
     *,
@@ -1606,8 +1654,7 @@ def process_job_once(
             temp_image_path,
             progress_label=job_log_prefix(job_id, "ocr"),
         )
-        normalized_blocks = [block for block in blocks if normalize_token(block.text)]
-        raw_text = "\n".join(block.text for block in normalized_blocks)
+        normalized_blocks, raw_text = blocks_with_text(blocks)
         ocr_text_hash = stable_text_hash(raw_text)
         probe.mark(
             "ocr_result",
@@ -1688,29 +1735,16 @@ def process_job_once(
                 text_len=len(raw_text),
                 blocks=len(normalized_blocks),
             )
-            segment_count = 0
-            candidate_count = 0
-            segment_languages: set[str] = set()
-            for block_results in analyzed_blocks:
-                for segment_payload, candidates in block_results:
-                    segment_id = create_source_analysis_segment(
-                        connection,
-                        source_id=source_id,
-                        segment_index=segment_count,
-                        raw_text=segment_payload["raw_text"],
-                        normalized_text=segment_payload["normalized_text"],
-                        reading=segment_payload["reading"],
-                        confidence=segment_payload["confidence"],
-                        bbox_json=segment_payload["bbox_json"],
-                        language_code=segment_payload["language_code"],
-                    )
-                    segment_count += 1
-                    segment_languages.add(str(segment_payload["language_code"]))
-                    candidate_count += store_segment_candidates(
-                        connection,
-                        segment_id=segment_id,
-                        candidates=candidates,
-                    )
+            segment_count, candidate_count = store_source_analysis(
+                connection,
+                source_id=source_id,
+                analyzed_blocks=analyzed_blocks,
+            )
+            segment_languages = {
+                str(payload["language_code"])
+                for block_results in analyzed_blocks
+                for payload, _ in block_results
+            }
             probe.mark(
                 "analyze",
                 segments=segment_count,
@@ -1719,14 +1753,10 @@ def process_job_once(
                 languages=",".join(sorted(segment_languages)) or source_language,
                 profile=capture_profile_name,
             )
-            promoted_terms = 0
-            promoted_candidates = 0
-            if DEFAULT_AUTO_PROMOTE_SOURCE_TERMS:
-                promoted_terms, promoted_candidates = approve_source_analysis_candidates(
-                    connection,
-                    source_id=source_id,
-                    mark_reviewed=False,
-                )
+            promoted_terms, promoted_candidates = auto_promote_source_terms(
+                connection,
+                source_id,
+            )
             probe.mark(
                 "promote",
                 terms=promoted_terms,
@@ -1980,8 +2010,7 @@ def diagnose_image(
     finally:
         if cleanup_path is not None:
             delete_if_exists(cleanup_path)
-    normalized_blocks = [block for block in blocks if normalize_token(block.text)]
-    raw_text = "\n".join(block.text for block in normalized_blocks)
+    normalized_blocks, raw_text = blocks_with_text(blocks)
     target_detected = any(
         contains_target_language_text(block.text, enabled_languages=enabled_languages)
         for block in normalized_blocks
