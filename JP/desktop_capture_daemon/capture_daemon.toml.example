@@ -19,7 +19,8 @@ auto_process_jobs = true
 # visually similar frames, since small but important UI changes can be skipped.
 
 # Optional overrides. If omitted, the daemon uses the repository-local defaults
-# under JP/data and launches the Python 3.12 worker from JP/capture_worker.py.
+# under JP/data and launches JP/capture_worker.py with ../.venv-capture312 when
+# it exists (that venv has meikiocr), falling back to `py -3.12` otherwise.
 # Relative paths are resolved from the JP/ directory, so they keep working if
 # the Windows username or workspace root changes.
 #
@@ -29,3 +30,25 @@ auto_process_jobs = true
 # python_executable = "../.venv-capture312/Scripts/python.exe"
 # python_args = ["-3.12"]
 # worker_script = "capture_worker.py"
+
+# Catalog web server supervised by the daemon (lang_jp.py browse). It uses the
+# worker's Python unless web_python_executable/web_python_args are set.
+#
+# web_server_enabled = true
+# web_port = 8766
+# web_python_executable = "../.venv/Scripts/python.exe"
+# web_python_args = []
+# web_log_path = "data/catalog_web.log"
+
+# Capture languages are NOT configured here: they live in the database
+# (languages.capture_enabled) and are edited from the tray menu ("Capture
+# languages"), the web UI (/capture) or the CLI (set-capture-languages,
+# enable-language --capture/--no-capture). The worker reads them per job, so no
+# restart is needed. LANG_CAPTURE_LANGUAGES in the worker environment is only an
+# override for one-off runs.
+
+# Record the foreground window (title and process name) with every capture job.
+# Capture profiles (/capture in the web UI, add-capture-profile in the CLI) match
+# on these to pin a window to a fixed language set, and sources get the window
+# title. Set to false to store nothing about the active window.
+# record_foreground_window = true

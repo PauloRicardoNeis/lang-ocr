@@ -13,20 +13,32 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
+import lang_jp
+import languages
 from lang_jp import (
     ensure_runtime_schema,
     ensure_source_image_dimensions,
     format_source_resolution,
+    language_filter_clause,
+    list_language_rows,
     resolve_repo_local_path,
 )
+from languages import (
+    ALL_LANGUAGES_CODE,
+    AUTO_LANGUAGE_CODE,
+    get_language,
+    normalize_language_code,
+)
+from ocr_backends import plan_ocr_engines
 
 
 ROOT = Path(__file__).resolve().parent
@@ -304,6 +316,80 @@ PAGE_STYLE = """
     flex-wrap: wrap;
   }
 
+  .lang-bar {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-top: 14px;
+  }
+
+  .lang-bar .lang-label {
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted, #6b6b6b);
+    margin-right: 4px;
+  }
+
+  .lang-bar a {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 32px;
+    padding: 0 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(51, 92, 103, 0.18);
+    background: rgba(255, 253, 249, 0.85);
+    color: var(--ink);
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+
+  .lang-bar a .count {
+    font-weight: 400;
+    opacity: 0.7;
+    font-size: 0.8rem;
+  }
+
+  .lang-bar a.is-active {
+    background: var(--ink, #1f2a2e);
+    color: white;
+    border-color: transparent;
+  }
+
+  .lang-bar a.lang-settings {
+    margin-left: auto;
+    border-style: dashed;
+    font-weight: 500;
+  }
+
+  .stats-compact { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 12px; }
+  .stats-compact .stat { padding: 10px 12px; }
+  .stats-compact .stat .value { font-size: 1.3rem; }
+  .lang-card h2 { display: flex; align-items: center; gap: 8px; }
+  .lang-card h2 a { text-decoration: none; color: inherit; }
+
+  .capture-language-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 14px;
+    margin: 12px 0 14px;
+  }
+
+  .capture-language { display: flex; align-items: center; gap: 8px; }
+  .capture-language input { width: 16px; height: 16px; }
+  .source-language-form { margin-top: 14px; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .source-language-form label { display: inline-flex; align-items: center; gap: 6px; }
+  input[type="text"] {
+    min-height: 38px;
+    border-radius: var(--radius-md, 10px);
+    border: 1px solid rgba(51, 92, 103, 0.24);
+    padding: 0 12px;
+    font: inherit;
+    background: rgba(255, 253, 249, 0.9);
+  }
+
   .chip {
     display: inline-flex;
     align-items: center;
@@ -403,6 +489,16 @@ PAGE_STYLE = """
     color: var(--muted);
   }
 
+  /* Catalog text carries lang= (see language_attrs), so every script gets a
+     font that has it and Japanese kanji are not drawn with Chinese shapes. */
+  [lang|="ja"] { font-family: "Bahnschrift", "Trebuchet MS", "Yu Gothic UI", "Yu Gothic", "Meiryo", "Hiragino Sans", "Noto Sans CJK JP", sans-serif; }
+  [lang|="zh"] { font-family: "Bahnschrift", "Trebuchet MS", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+  [lang|="ko"] { font-family: "Bahnschrift", "Trebuchet MS", "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans CJK KR", sans-serif; }
+  [lang|="th"] { font-family: "Bahnschrift", "Trebuchet MS", "Leelawadee UI", "Leelawadee", "Tahoma", "Noto Sans Thai", sans-serif; }
+  [lang|="hi"] { font-family: "Bahnschrift", "Trebuchet MS", "Nirmala UI", "Mangal", "Noto Sans Devanagari", sans-serif; }
+  [lang|="ar"] { font-family: "Segoe UI", "Tahoma", "Noto Naskh Arabic", sans-serif; }
+  [lang|="he"] { font-family: "Segoe UI", "Arial", "Noto Sans Hebrew", sans-serif; }
+
   .muted { color: var(--muted); }
   .mono { font-family: "Consolas", "Courier New", monospace; word-break: break-word; }
   .stack { display: grid; gap: 14px; }
@@ -418,6 +514,10 @@ PAGE_STYLE = """
     color: #3d433e;
     font-family: "Consolas", "Courier New", monospace;
   }
+
+  pre[lang] { font-family: "Consolas", "Courier New", monospace; }
+  /* Each line of a mixed-language text picks its own direction (Arabic, Hebrew). */
+  pre[dir="auto"] { unicode-bidi: plaintext; }
 
   img.source-image {
     display: block;
@@ -608,6 +708,21 @@ PAGE_SCRIPT = """
       return "text";
     }
 
+    function sortableText(value) {
+      // Columns mix languages, so lower-case without a locale (a pt-BR or tr
+      // rule would be wrong for the others) and fold accents only on Latin
+      // letters, so "água" sorts next to "agua" instead of after "z". Kana,
+      // hangul, Devanagari and every other script keep their exact text.
+      const lowered = value.toLowerCase();
+      if (!/[\\u00c0-\\u024f\\u1e00-\\u1eff\\u0300-\\u036f]/.test(lowered)) {
+        return lowered;
+      }
+      return lowered
+        .normalize("NFD")
+        .replace(/([a-z])[\\u0300-\\u036f]+/g, "$1")
+        .normalize("NFC");
+    }
+
     function comparableValue(value, type) {
       if (!value || value === "-") {
         return type === "text" ? "" : Number.NEGATIVE_INFINITY;
@@ -618,7 +733,7 @@ PAGE_SCRIPT = """
       if (type === "date") {
         return Date.parse(value.replace(" ", "T")) || 0;
       }
-      return value.toLocaleLowerCase("pt-BR");
+      return sortableText(value);
     }
 
     function updateHeaderState(headers, activeIndex, direction) {
@@ -928,6 +1043,8 @@ def db_connect(db_path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA busy_timeout = 30000")
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.create_function("search_fold", 1, search_fold, deterministic=True)
+    connection.create_function("html_text", 1, html_fragment_text, deterministic=True)
     ensure_runtime_schema(connection)
     return connection
 
@@ -1437,6 +1554,29 @@ def sql_like(value: str) -> str:
     return f"%{value.strip()}%"
 
 
+def search_fold(value: object | None) -> str:
+    """Case-insensitive search key for text in any language.
+
+    SQLite's ``LIKE`` only ignores case for ASCII, so ``Água``, ``ПРИВЕТ`` or
+    ``Ελλάδα`` never matched their lower-case forms. ``casefold`` covers every
+    cased script and leaves kana, kanji, hangul, Arabic, Devanagari and Thai
+    untouched; NFC makes precomposed and decomposed input compare equal. No
+    accent folding: stripping combining marks would break dakuten, matras and
+    vowel points in the non-Latin scripts.
+    """
+    if value is None:
+        return ""
+    return unicodedata.normalize("NFC", str(value)).casefold()
+
+
+def folded_like_filter(columns: Iterable[str], q: str) -> tuple[str, list[object]]:
+    """``(sql, params)`` matching ``q`` as a substring of any column, case-insensitively."""
+    column_list = list(columns)
+    pattern = sql_like(search_fold(q))
+    sql = " OR ".join(f"search_fold({column}) LIKE ?" for column in column_list)
+    return f"({sql})", [pattern] * len(column_list)
+
+
 def text(value: object | None, fallback: str = "-") -> str:
     if value is None:
         return fallback
@@ -1647,19 +1787,191 @@ def kanji_gloss_candidates(rows: list[sqlite3.Row], *, limit: int = 6) -> list[s
     return [gloss for gloss, _ in ordered[:limit]]
 
 
-def nav_link(path: str, label: str, active_path: str) -> str:
+def current_language(params: dict[str, list[str]] | None) -> str:
+    """Language selected through ``?lang=``; ``all`` when none or invalid."""
+    raw = first_value(params or {}, "lang", ALL_LANGUAGES_CODE)
+    normalized = normalize_language_code(raw)
+    if (
+        not normalized
+        or normalized == ALL_LANGUAGES_CODE
+        or not languages.is_valid_language_code(normalized)
+    ):
+        return ALL_LANGUAGES_CODE
+    return normalized
+
+
+def language_href(path: str, lang: str, extra: dict[str, object | None] | None = None) -> str:
+    params: dict[str, object | None] = dict(extra or {})
+    params["lang"] = lang if lang != ALL_LANGUAGES_CODE else None
+    return build_query_path(path, params)
+
+
+def hidden_language_input(lang: str) -> str:
+    """Keeps the selected language when a search form is submitted."""
+    if lang == ALL_LANGUAGES_CODE:
+        return ""
+    return f'<input type="hidden" name="lang" value="{html.escape(lang, quote=True)}">'
+
+
+def language_attrs(code: object | None) -> str:
+    """``lang`` and ``dir`` attributes for text stored in a catalog language.
+
+    ``lang`` picks the right font (Japanese vs Chinese glyphs, Thai, Devanagari,
+    Hangul) and line breaking; ``dir="auto"`` lets Arabic and Hebrew render
+    right to left inside the pt-BR page.
+    """
+    normalized = normalize_language_code(str(code)) if code is not None else ""
+    if (
+        not normalized
+        or normalized in (ALL_LANGUAGES_CODE, AUTO_LANGUAGE_CODE)
+        or not languages.is_valid_language_code(normalized)
+    ):
+        return ' dir="auto"'
+    return f' lang="{html.escape(normalized, quote=True)}" dir="auto"'
+
+
+def reading_attrs(code: object | None) -> str:
+    """Attributes for a term reading.
+
+    Japanese readings are kana, so they keep ``lang="ja"``; every other
+    language stores a Latin romanization (Revised Romanization, pinyin,
+    Cyrillic transliteration), tagged ``xx-Latn``.
+    """
+    normalized = normalize_language_code(str(code)) if code is not None else ""
+    if not normalized or not languages.is_valid_language_code(normalized):
+        return ' dir="auto"'
+    if get_language(normalized).romanizer == "kana":
+        return language_attrs(normalized)
+    return language_attrs(f"{languages.base_language_code(normalized)}-Latn")
+
+
+def language_text(value: object | None, code: object | None, fallback: str = "-") -> str:
+    """Escaped catalog text wrapped in a span carrying its language."""
+    display = text(value, fallback)
+    if display == fallback:
+        return html.escape(display)
+    return f"<span{language_attrs(code)}>{html.escape(display)}</span>"
+
+
+def reading_text(value: object | None, code: object | None, fallback: str = "-") -> str:
+    display = text(value, fallback)
+    if display == fallback:
+        return html.escape(display)
+    return f"<span{reading_attrs(code)}>{html.escape(display)}</span>"
+
+
+def term_link(term_id: object, lemma: object | None, code: object | None, lang: str = ALL_LANGUAGES_CODE) -> str:
+    href = language_href(f"/terms/{term_id}", lang)
+    return f'<a href="{html.escape(href, quote=True)}"{language_attrs(code)}>{escape(lemma)}</a>'
+
+
+def kanji_link(kanji_id: object, literal: object | None, code: object | None, lang: str = ALL_LANGUAGES_CODE) -> str:
+    href = language_href(f"/kanji/{kanji_id}", lang)
+    return f'<a href="{html.escape(href, quote=True)}"{language_attrs(code)}>{escape(literal)}</a>'
+
+
+def source_link(source_id: object, lang: str = ALL_LANGUAGES_CODE) -> str:
+    href = language_href(f"/sources/{source_id}", lang)
+    return f'<a href="{html.escape(href, quote=True)}">#{html.escape(str(source_id))}</a>'
+
+
+def language_has_readings(lang: str) -> bool:
+    """Whether a reading column means anything for the selected language.
+
+    ``all`` keeps the column (Japanese kana, Korean and Russian romanization,
+    pinyin); a single Latin-script language has no readings at all.
+    """
+    return lang == ALL_LANGUAGES_CODE or get_language(lang).has_readings
+
+
+def any_language_has_readings(codes: Iterable[object | None]) -> bool:
+    return any(get_language(str(code)).has_readings for code in codes if code)
+
+
+def language_has_characters(lang: str) -> bool:
+    """Whether kanji/hanzi pages, stats and links apply to the selected language."""
+    return lang == ALL_LANGUAGES_CODE or get_language(lang).has_characters
+
+
+def characters_label(lang: str = ALL_LANGUAGES_CODE) -> str:
+    """Name of the character catalog: kanji for Japanese, hanzi for Chinese."""
+    if lang == ALL_LANGUAGES_CODE:
+        return "Kanji"
+    base = languages.base_language_code(lang)
+    if base == "ja":
+        return "Kanji"
+    if base == "zh":
+        return "Hanzi"
+    return "Caracteres"
+
+
+def language_label(code: object | None) -> str:
+    """``Spanish (es)``: the profile name plus the code, for chips and lists."""
+    normalized = normalize_language_code(str(code or "")) or "-"
+    return f"{get_language(normalized).name} ({normalized})"
+
+
+def language_bar_html(
+    db_path: Path,
+    *,
+    active_path: str,
+    lang: str,
+    extra_params: dict[str, object | None] | None = None,
+) -> str:
+    """Chips to switch the catalog language, keeping the current page's filters."""
+    with db_connect(db_path) as connection:
+        rows = list_language_rows(connection)
+    chips = [
+        (
+            f'<a class="{"is-active" if lang == ALL_LANGUAGES_CODE else ""}" '
+            f'href="{html.escape(language_href(active_path, ALL_LANGUAGES_CODE, extra_params), quote=True)}">Todas</a>'
+        )
+    ]
+    # Every built-in language is registered; the bar only lists the ones that
+    # already have data, plus the active one, so it stays readable. The capture
+    # page lists them all.
+    for row in rows:
+        code = str(row["code"])
+        has_data = (row["term_count"] or 0) > 0 or (row["source_count"] or 0) > 0
+        if lang != code and (not row["enabled"] or not has_data):
+            continue
+        profile = get_language(code)
+        active = "is-active" if lang == code else ""
+        chips.append(
+            f'<a class="{active}" href="{html.escape(language_href(active_path, code, extra_params), quote=True)}" '
+            f'title="{html.escape(profile.display_label)}">'
+            f"{html.escape(profile.name)}"
+            f'<span class="count">{escape(row["term_count"], "0")}</span></a>'
+        )
+    chips.append('<a class="lang-settings" href="/capture" title="Idiomas capturados e perfis">Captura</a>')
+    return f'<div class="lang-bar"><span class="lang-label">Idioma</span>{"".join(chips)}</div>'
+
+
+def nav_link(path: str, label: str, active_path: str, lang: str = ALL_LANGUAGES_CODE) -> str:
     active_class = "is-active" if path == active_path else ""
-    return f'<a class="{active_class}" href="{path}">{html.escape(label)}</a>'
+    path = language_href(path, lang)
+    return f'<a class="{active_class}" href="{html.escape(path, quote=True)}">{html.escape(label)}</a>'
 
 
-def layout(*, title: str, body: str, active_path: str, extra_scripts: str = "") -> str:
+def layout(
+    *,
+    title: str,
+    body: str,
+    active_path: str,
+    extra_scripts: str = "",
+    lang: str = ALL_LANGUAGES_CODE,
+    language_bar: str = "",
+) -> str:
+    # Character pages only make sense for languages that have characters.
+    show_kanji = language_has_characters(lang)
     nav = "".join(
         (
-            nav_link("/", "Visao geral", active_path),
-            nav_link("/terms", "Termos", active_path),
-            nav_link("/kanji", "Kanji", active_path),
-            nav_link("/sources", "Fontes", active_path),
-            nav_link("/flashcards", "Cards", active_path),
+            nav_link("/", "Visao geral", active_path, lang),
+            nav_link("/terms", "Termos", active_path, lang),
+            nav_link("/kanji", characters_label(lang), active_path, lang) if show_kanji else "",
+            nav_link("/sources", "Fontes", active_path, lang),
+            nav_link("/flashcards", "Cards", active_path, lang),
+            nav_link("/capture", "Captura", active_path),
         )
     )
     return f"""<!doctype html>
@@ -1673,9 +1985,10 @@ def layout(*, title: str, body: str, active_path: str, extra_scripts: str = "") 
   <body>
     <div class="shell">
       <section class="hero">
-        <h1>JP Catalog</h1>
-        <p>Interface local para navegar no banco de vocabulario sem depender de comandos longos no terminal.</p>
+        <h1>Lang Catalog</h1>
+        <p>Interface local para navegar no catalogo de vocabulario em todos os idiomas sem depender de comandos longos no terminal.</p>
         <nav class="nav">{nav}</nav>
+        {language_bar}
       </section>
       {body}
     </div>
@@ -1727,6 +2040,7 @@ def search_form(
     q: str = "",
     extras: str = "",
     reset_href: str | None = None,
+    lang: str = ALL_LANGUAGES_CODE,
 ) -> str:
     reset_link = (
         f'<a class="secondary-link" href="{html.escape(reset_href, quote=True)}">Limpar filtros</a>'
@@ -1737,8 +2051,8 @@ def search_form(
     <form class="search" action="{action}" method="get">
       <label>{html.escape(label)}</label>
       <div class="inputs">
-        <input type="search" name="q" value="{html.escape(q)}" placeholder="{html.escape(placeholder)}">
-        {extras}
+        <input type="search" name="q" value="{html.escape(q)}" placeholder="{html.escape(placeholder)}" dir="auto">
+        {extras}{hidden_language_input(lang)}
         <div class="search-actions">
           <button type="submit">Buscar</button>
           {reset_link}
@@ -1797,23 +2111,127 @@ def sync_anki_action(*, next_path: str = "/") -> str:
     """
 
 
-def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) -> str:
-    params = params or {}
-    with db_connect(db_path) as connection:
-        stats = connection.execute(
-            """
-            SELECT
-                (SELECT COUNT(*) FROM sources) AS source_count,
-                (SELECT COUNT(*) FROM terms) AS term_count,
-                (SELECT COUNT(*) FROM kanji) AS kanji_count,
-                (SELECT COUNT(*) FROM source_terms) AS link_count,
-                (SELECT COUNT(*) FROM flashcards WHERE export_status = 'pending') AS pending_flashcards
-            """
-        ).fetchone()
+LANGUAGE_CARD_TOP_TERMS = 6
+
+
+def language_cards(
+    connection: sqlite3.Connection,
+    language_rows: list[sqlite3.Row],
+    *,
+    lang: str = ALL_LANGUAGES_CODE,
+) -> str:
+    """One card per language with data: counts plus its top terms (plan item D5).
+
+    With ``lang=all`` every language that has terms or sources gets a card, side
+    by side; with one language selected only that card shows. Languages that are
+    registered but still empty are listed in one line so the page stays short.
+    """
+    cards: list[str] = []
+    empty: list[str] = []
+    for row in language_rows:
+        code = str(row["code"])
+        term_count = int(row["term_count"] or 0)
+        source_count = int(row["source_count"] or 0)
+        if lang != ALL_LANGUAGES_CODE and code != lang:
+            continue
+        if term_count == 0 and source_count == 0 and lang == ALL_LANGUAGES_CODE:
+            label = get_language(code).name
+            capture = "" if row["capture_enabled"] else " (captura off)"
+            empty.append(f"{html.escape(label)}{capture}")
+            continue
+        profile = get_language(code)
         top_terms = connection.execute(
             """
+            SELECT id, lemma, COALESCE(reading, '') AS reading, COALESCE(meaning_pt, '-') AS meaning_pt,
+                   total_occurrences, priority_score
+            FROM v_terms_overview
+            WHERE language_code = ?
+              AND NOT (LOWER(TRIM(COALESCE(meaning_pt, ''))) LIKE 'nome%proprio%')
+            ORDER BY
+            """ + TERM_PRIORITY_ORDER_SQL + """
+            LIMIT ?
+            """,
+            (code, LANGUAGE_CARD_TOP_TERMS),
+        ).fetchall()
+        term_rows = [
+            [
+                term_link(term["id"], term["lemma"], code, lang)
+                + (
+                    f' <span class="muted"{reading_attrs(code)}>{escape(term["reading"])}</span>'
+                    if profile.has_readings and term["reading"]
+                    else ""
+                ),
+                escape(truncate(str(term["meaning_pt"]), size=40)),
+                escape(term["total_occurrences"]),
+                escape(format_score(term["priority_score"])),
+            ]
+            for term in top_terms
+        ]
+        capture_state = "captura ligada" if row["capture_enabled"] else "captura desligada"
+        cards.append(
+            f"""
+      <section class="panel panel-side lang-card" data-language="{html.escape(code)}">
+        <h2><a href="{html.escape(language_href("/", code), quote=True)}">{html.escape(profile.name)}</a> <span class="chip">{html.escape(code)}</span></h2>
+        <div class="stats stats-compact">
+          <div class="stat"><span class="label">Termos</span><span class="value">{escape(term_count, "0")}</span></div>
+          <div class="stat"><span class="label">Fontes</span><span class="value">{escape(source_count, "0")}</span></div>
+          <div class="stat"><span class="label">Cards pendentes</span><span class="value">{escape(row["pending_flashcards"], "0")}</span></div>
+        </div>
+        {table_html(["Termo", "Significado", "Ocorr.", "Score"], term_rows)}
+        <p class="footer-note">Deck {html.escape(str(row["deck_name"]))} | {capture_state} |
+          <a href="{html.escape(language_href("/terms", code), quote=True)}">termos</a> |
+          <a href="{html.escape(language_href("/sources", code), quote=True)}">fontes</a></p>
+      </section>
+            """
+        )
+    if empty and lang == ALL_LANGUAGES_CODE:
+        cards.append(
+            f"""
+      <section class="panel">
+        <h2>Idiomas sem dados ainda</h2>
+        <p>{", ".join(empty)}.</p>
+        <p class="footer-note">Estes idiomas ja estao registrados; assim que a captura ou o <code>ingest-text</code> encontrar texto neles, o card aparece aqui. <a href="/capture">Ajustar a captura</a>.</p>
+      </section>
+            """
+        )
+    return "".join(cards)
+
+
+def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) -> str:
+    params = params or {}
+    lang = current_language(params)
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    lang_and = f"AND {lang_sql}" if lang_sql else ""
+    lang_where = f"WHERE {lang_sql}" if lang_sql else ""
+    term_lang_sql, _ = language_filter_clause("t.language_code", lang)
+    term_lang_and = f"AND {term_lang_sql}" if term_lang_sql else ""
+    with db_connect(db_path) as connection:
+        stats = connection.execute(
+            f"""
+            SELECT
+                (SELECT COUNT(*) FROM sources WHERE 1 = 1 {lang_and}) AS source_count,
+                (SELECT COUNT(*) FROM terms WHERE 1 = 1 {lang_and}) AS term_count,
+                (SELECT COUNT(*) FROM kanji WHERE 1 = 1 {lang_and}) AS kanji_count,
+                (
+                    SELECT COUNT(*)
+                    FROM source_terms AS st
+                    JOIN terms AS t ON t.id = st.term_id
+                    WHERE 1 = 1 {term_lang_and}
+                ) AS link_count,
+                (
+                    SELECT COUNT(*)
+                    FROM flashcards AS f
+                    JOIN terms AS t ON t.id = f.term_id
+                    WHERE f.export_status = 'pending' {term_lang_and}
+                ) AS pending_flashcards
+            """,
+            [*lang_params, *lang_params, *lang_params, *lang_params, *lang_params],
+        ).fetchone()
+        top_terms = connection.execute(
+            f"""
             SELECT
                 id,
+                language_code,
                 lemma,
                 COALESCE(reading, '-') AS reading,
                 COALESCE(meaning_pt, '-') AS meaning_pt,
@@ -1826,29 +2244,36 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 AND NOT (
                     LOWER(TRIM(COALESCE(meaning_pt, ''))) LIKE 'nome%proprio%'
                 )
+                {lang_and}
             ORDER BY
             """ + TERM_PRIORITY_ORDER_SQL + """
             LIMIT 8
-            """
+            """,
+            lang_params,
         ).fetchall()
+        show_characters = language_has_characters(lang)
         top_kanji = connection.execute(
-            """
+            f"""
             SELECT
                 id,
+                language_code,
                 literal,
                 total_occurrences,
                 distinct_sources,
                 distinct_terms,
                 priority_score
             FROM v_kanji_overview
+            {lang_where}
             ORDER BY priority_score DESC, id DESC
             LIMIT 8
-            """
-        ).fetchall()
+            """,
+            lang_params,
+        ).fetchall() if show_characters else []
         recent_sources = connection.execute(
-            """
+            f"""
             SELECT
                 id,
+                language_code,
                 COALESCE(title, '(sem titulo)') AS title,
                 COALESCE(scene, '-') AS scene,
                 source_path,
@@ -1856,14 +2281,17 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 image_height,
                 COALESCE(captured_at, created_at) AS seen_at
             FROM sources
+            {lang_where}
             ORDER BY julianday(seen_at) DESC, id DESC
             LIMIT 8
-            """
+            """,
+            lang_params,
         ).fetchall()
         recent_source_rows = [
             [
-                f'<a href="/sources/{row["id"]}">#{row["id"]}</a>',
-                escape(row["title"]),
+                source_link(row["id"], lang),
+                escape(row["language_code"]),
+                language_text(row["title"], None),
                 escape(source_resolution_label(connection, row)),
                 escape(row["scene"]),
                 datetime_cell(row["seen_at"]),
@@ -1871,10 +2299,11 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
             for row in recent_sources
         ]
         recent_cards = connection.execute(
-            """
+            f"""
             SELECT
                 f.id,
                 t.lemma,
+                t.language_code,
                 COALESCE(ts.priority_score, 0) AS priority_score,
                 f.template_name,
                 f.export_status,
@@ -1884,16 +2313,22 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
                 ON t.id = f.term_id
             LEFT JOIN term_stats AS ts
                 ON ts.term_id = f.term_id
+            WHERE 1 = 1 {term_lang_and}
             ORDER BY
             """ + FLASHCARD_PRIORITY_ORDER_SQL + """
             LIMIT 8
-            """
+            """,
+            lang_params,
         ).fetchall()
+        language_rows = list_language_rows(connection)
+        language_cards_html = language_cards(connection, language_rows, lang=lang)
 
+    show_readings = language_has_readings(lang)
     term_rows = [
         [
-            f'<a href="/terms/{row["id"]}">{escape(row["lemma"])}</a>',
-            escape(row["reading"]),
+            term_link(row["id"], row["lemma"], row["language_code"], lang),
+            escape(row["language_code"]),
+            *([reading_text(row["reading"], row["language_code"])] if show_readings else []),
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
@@ -1901,9 +2336,18 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
         ]
         for row in top_terms
     ]
+    term_headers = [
+        "Termo",
+        "Idioma",
+        *(["Leitura"] if show_readings else []),
+        "Significado",
+        "Ocorrencias",
+        "Fontes",
+        "Score",
+    ]
     kanji_rows = [
         [
-            f'<a href="/kanji/{row["id"]}">{escape(row["literal"])}</a>',
+            kanji_link(row["id"], row["literal"], row["language_code"], lang),
             escape(row["distinct_terms"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
@@ -1913,13 +2357,53 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
     ]
     card_rows = [
         [
-            f'<a href="/flashcards?q={quote(str(row["lemma"]))}">{escape(row["lemma"])}</a>',
+            (
+                f'<a href="{html.escape(language_href("/flashcards", lang, {"q": row["lemma"]}), quote=True)}"'
+                f'{language_attrs(row["language_code"])}>{escape(row["lemma"])}</a>'
+            ),
+            escape(row["language_code"]),
             escape(format_score(row["priority_score"])),
             escape(row["template_name"]),
             status_chip(text(row["export_status"])),
-            escape(truncate(html_fragment_text(row["front_text"]), size=44)),
+            language_text(truncate(html_fragment_text(row["front_text"]), size=44), row["language_code"]),
         ]
         for row in recent_cards
+    ]
+    characters = characters_label(lang)
+    kanji_stat = (
+        f'<div class="stat"><span class="label">{html.escape(characters)}</span><span class="value">{escape(stats["kanji_count"], "0")}</span></div>'
+        if show_characters
+        else ""
+    )
+    kanji_search = (
+        search_form(action="/kanji", label=f"Buscar {characters.lower()}", placeholder="Ex.: 魔, 学, river", lang=lang)
+        if show_characters
+        else ""
+    )
+    kanji_quick_link = (
+        f'<a class="button-link" href="{html.escape(language_href("/kanji", lang), quote=True)}">Abrir catalogo de {html.escape(characters.lower())}</a>'
+        if show_characters
+        else ""
+    )
+    kanji_panel = (
+        f"""
+      <section class="panel panel-side">
+        <h2>{html.escape(characters)} prioritarios</h2>
+        {table_html([characters, "Palavras", "Ocorrencias", "Fontes", "Score"], kanji_rows)}
+      </section>
+        """
+        if show_characters
+        else ""
+    )
+    language_table_rows = [
+        [
+            f'<a href="{html.escape(language_href("/", str(row["code"])), quote=True)}">{escape(get_language(str(row["code"])).name)}</a>',
+            escape(row["term_count"], "0"),
+            escape(row["source_count"], "0"),
+            escape(row["pending_flashcards"], "0"),
+            escape(row["deck_name"]),
+        ]
+        for row in language_rows
     ]
 
     body = f"""
@@ -1929,60 +2413,67 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
         <div class="stats">
           <div class="stat"><span class="label">Fontes</span><span class="value">{escape(stats["source_count"], "0")}</span></div>
           <div class="stat"><span class="label">Termos</span><span class="value">{escape(stats["term_count"], "0")}</span></div>
-          <div class="stat"><span class="label">Kanji</span><span class="value">{escape(stats["kanji_count"], "0")}</span></div>
+          {kanji_stat}
           <div class="stat"><span class="label">Ligacoes</span><span class="value">{escape(stats["link_count"], "0")}</span></div>
           <div class="stat"><span class="label">Cards pendentes</span><span class="value">{escape(stats["pending_flashcards"], "0")}</span></div>
         </div>
-        {sync_anki_action(next_path="/")}
+        {sync_anki_action(next_path=language_href("/", lang))}
       </section>
 
       <section class="panel">
         <h2>Busca rapida</h2>
         <div class="search-row">
-          {search_form(action="/terms", label="Buscar termos", placeholder="Japones, leitura ou significado")}
-          {search_form(action="/kanji", label="Buscar kanji", placeholder="Ex.: 魔, 学, river")}
-          {search_form(action="/sources", label="Buscar fontes", placeholder="Titulo, cena ou texto bruto")}
-          {search_form(action="/flashcards", label="Buscar cards", placeholder="Frente, termo ou significado")}
+          {search_form(action="/terms", label="Buscar termos", placeholder="Termo, leitura ou significado", lang=lang)}
+          {kanji_search}
+          {search_form(action="/sources", label="Buscar fontes", placeholder="Titulo, cena ou texto bruto", lang=lang)}
+          {search_form(action="/flashcards", label="Buscar cards", placeholder="Frente, termo ou significado", lang=lang)}
         </div>
       </section>
 
       <section class="panel panel-wide">
         <h2>Termos prioritarios</h2>
-        {table_html(["Termo", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], term_rows)}
+        {table_html(term_headers, term_rows)}
       </section>
+
+      <section class="panel panel-side">
+        <h2>Idiomas</h2>
+        {table_html(["Idioma", "Termos", "Fontes", "Cards pendentes", "Deck"], language_table_rows)}
+        <p class="footer-note"><a href="/capture">Escolher quais idiomas a captura guarda</a></p>
+      </section>
+
+      {language_cards_html}
 
       <section class="panel panel-side">
         <h2>Acesso rapido</h2>
         <div class="stack">
-          <a class="button-link" href="/terms">Abrir lista completa de termos</a>
-          <a class="button-link" href="/kanji">Abrir catalogo de kanji</a>
-          <a class="button-link" href="/sources">Abrir fontes recentes</a>
-          <a class="button-link" href="/flashcards?status=pending">Ver cards pendentes</a>
+          <a class="button-link" href="{html.escape(language_href("/terms", lang), quote=True)}">Abrir lista completa de termos</a>
+          {kanji_quick_link}
+          <a class="button-link" href="{html.escape(language_href("/sources", lang), quote=True)}">Abrir fontes recentes</a>
+          <a class="button-link" href="{html.escape(language_href("/flashcards", lang, {"status": "pending"}), quote=True)}">Ver cards pendentes</a>
         </div>
         <p class="footer-note">A interface navega no catalogo e tambem permite disparar a sincronizacao com o Anki. O banco continua sendo a fonte de verdade.</p>
       </section>
 
       <section class="panel panel-wide">
         <h2>Fontes recentes</h2>
-        {table_html(["ID", "Titulo", "Resolucao", "Cena", "Quando"], recent_source_rows)}
+        {table_html(["ID", "Idioma", "Titulo", "Resolucao", "Cena", "Quando"], recent_source_rows)}
       </section>
 
-      <section class="panel panel-side">
-        <h2>Kanji prioritarios</h2>
-        {table_html(["Kanji", "Palavras", "Ocorrencias", "Fontes", "Score"], kanji_rows)}
-      </section>
+      {kanji_panel}
 
       <section class="panel">
         <h2>Cards recentes</h2>
-        {table_html(["Termo", "Score", "Template", "Status", "Frente"], card_rows)}
+        {table_html(["Termo", "Idioma", "Score", "Template", "Status", "Frente"], card_rows)}
       </section>
     </div>
     """
     return layout(
-        title="JP Catalog",
+        title="Lang Catalog",
         body=body,
         active_path="/",
         extra_scripts=auto_reload_script(db_path),
+        lang=lang,
+        language_bar=language_bar_html(db_path, active_path="/", lang=lang),
     )
 
 
@@ -1991,6 +2482,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
     order_clause = {
         "priority": TERM_PRIORITY_ORDER_SQL.strip(),
         "recent": "julianday(last_seen_at) DESC, id DESC",
@@ -1999,12 +2491,14 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
 
     filters = []
     sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
     if q.strip():
-        filters.append(
-            "(lemma LIKE ? OR COALESCE(reading, '') LIKE ? OR COALESCE(meaning_pt, '') LIKE ?)"
-        )
-        like = sql_like(q)
-        sql_params.extend([like, like, like])
+        search_sql, search_params = folded_like_filter(("lemma", "reading", "meaning_pt"), q)
+        filters.append(search_sql)
+        sql_params.extend(search_params)
 
     where_clause = ""
     if filters:
@@ -2024,6 +2518,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
             f"""
             SELECT
                 id,
+                language_code,
                 lemma,
                 COALESCE(reading, '-') AS reading,
                 COALESCE(meaning_pt, '-') AS meaning_pt,
@@ -2043,13 +2538,19 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "q": q.strip() or None,
         "order": order if order != "priority" else None,
         "limit": limit if limit != 50 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
         path="/terms",
         base_params=base_params,
         pagination=pagination,
     )
-    reset_href = "/terms" if any(value is not None for value in base_params.values()) or pagination.page > 1 else None
+    # "Limpar filtros" clears the search but keeps the language from the bar.
+    reset_href = (
+        language_href("/terms", lang)
+        if any(value is not None for key, value in base_params.items() if key != "lang") or pagination.page > 1
+        else None
+    )
     extras = f"""
       <div class="filters">
         <select name="order">
@@ -2060,10 +2561,12 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         <input type="number" name="limit" value="{limit}" min="1" max="200">
       </div>
     """
+    show_readings = language_has_readings(lang)
     table_rows = [
         [
-            f'<a href="/terms/{row["id"]}">{escape(row["lemma"])}</a>',
-            escape(row["reading"]),
+            term_link(row["id"], row["lemma"], row["language_code"], lang),
+            escape(row["language_code"]),
+            *([reading_text(row["reading"], row["language_code"])] if show_readings else []),
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
@@ -2072,16 +2575,26 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         ]
         for row in rows
     ]
+    headers = [
+        "Termo",
+        "Idioma",
+        *(["Leitura"] if show_readings else []),
+        "Significado",
+        "Ocorrencias",
+        "Fontes",
+        "Score",
+        "Ultima vez",
+    ]
     body = f"""
     <div class="grid">
       <section class="panel">
         <h2>Termos</h2>
-        {search_form(action="/terms", label="Buscar no catalogo", placeholder="Ex.: 回復, かいふく, cura", q=q, extras=extras, reset_href=reset_href)}
+        {search_form(action="/terms", label="Buscar no catalogo", placeholder="Ex.: 回復, かいふく, cura, traicionar", q=q, extras=extras, reset_href=reset_href, lang=lang)}
         <div class="results-toolbar">
           <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
           {pagination_markup}
         </div>
-        {table_html(["Termo", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
+        {table_html(headers, table_rows)}
       </section>
     </div>
     """
@@ -2090,6 +2603,13 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         body=body,
         active_path="/terms",
         extra_scripts=auto_reload_script(db_path),
+        lang=lang,
+        language_bar=language_bar_html(
+            db_path,
+            active_path="/terms",
+            lang=lang,
+            extra_params={key: value for key, value in base_params.items() if key != "lang"},
+        ),
     )
 
 
@@ -2098,6 +2618,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
     order_clause = {
         "priority": "priority_score DESC, id DESC",
         "recent": "julianday(last_seen_at) DESC, id DESC",
@@ -2106,12 +2627,14 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
 
     filters = []
     sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
     if q.strip():
-        filters.append(
-            "(literal LIKE ? OR COALESCE(meaning_pt, '') LIKE ? OR COALESCE(canonical_meanings, '') LIKE ?)"
-        )
-        like = sql_like(q)
-        sql_params.extend([like, like, like])
+        search_sql, search_params = folded_like_filter(("literal", "meaning_pt", "canonical_meanings"), q)
+        filters.append(search_sql)
+        sql_params.extend(search_params)
 
     where_clause = ""
     if filters:
@@ -2131,6 +2654,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
             f"""
             SELECT
                 id,
+                language_code,
                 literal,
                 COALESCE(canonical_meanings, meaning_pt, '-') AS meaning,
                 total_occurrences,
@@ -2150,13 +2674,18 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "q": q.strip() or None,
         "order": order if order != "priority" else None,
         "limit": limit if limit != 50 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
         path="/kanji",
         base_params=base_params,
         pagination=pagination,
     )
-    reset_href = "/kanji" if any(value is not None for value in base_params.values()) or pagination.page > 1 else None
+    reset_href = (
+        language_href("/kanji", lang)
+        if any(value is not None for key, value in base_params.items() if key != "lang") or pagination.page > 1
+        else None
+    )
     extras = f"""
       <div class="filters">
         <select name="order">
@@ -2169,7 +2698,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
     """
     table_rows = [
         [
-            f'<a href="/kanji/{row["id"]}">{escape(row["literal"])}</a>',
+            kanji_link(row["id"], row["literal"], row["language_code"], lang),
             escape(row["meaning"]),
             escape(row["distinct_terms"]),
             escape(row["total_occurrences"]),
@@ -2179,35 +2708,58 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         ]
         for row in rows
     ]
+    characters = characters_label(lang)
+    no_characters_note = (
+        ""
+        if language_has_characters(lang)
+        else (
+            f'<div class="notice-banner">{html.escape(get_language(lang).name)} nao usa caracteres como kanji ou hanzi, '
+            "entao nao ha nada para listar aqui neste idioma.</div>"
+        )
+    )
     body = f"""
     <div class="grid">
       <section class="panel">
         {notice_banner(params)}
-        <h2>Kanji</h2>
-        {sync_anki_action(next_path="/kanji")}
-        {search_form(action="/kanji", label="Buscar no catalogo", placeholder="Ex.: 魔, 学, river", q=q, extras=extras, reset_href=reset_href)}
+        <h2>{html.escape(characters)}</h2>
+        {no_characters_note}
+        {sync_anki_action(next_path=language_href("/kanji", lang))}
+        {search_form(action="/kanji", label="Buscar no catalogo", placeholder="Ex.: 魔, 学, river", q=q, extras=extras, reset_href=reset_href, lang=lang)}
         <div class="results-toolbar">
           <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
           {pagination_markup}
         </div>
-        {table_html(["Kanji", "Significado", "Palavras", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
+        {table_html([characters, "Significado", "Palavras", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
       </section>
     </div>
     """
     return layout(
-        title="Kanji",
+        title=characters,
         body=body,
         active_path="/kanji",
+        lang=lang,
+        language_bar=language_bar_html(
+            db_path,
+            active_path="/kanji",
+            lang=lang,
+            extra_params={key: value for key, value in base_params.items() if key != "lang"},
+        ),
         extra_scripts=auto_reload_script(db_path),
     )
 
 
-def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
+def kanji_detail_page(
+    db_path: Path,
+    kanji_id: int,
+    params: dict[str, list[str]] | None = None,
+) -> str | None:
+    lang = current_language(params)
     with db_connect(db_path) as connection:
         kanji = connection.execute(
             """
             SELECT
                 id,
+                language_code,
                 literal,
                 COALESCE(canonical_meanings, meaning_pt, '-') AS meaning,
                 COALESCE(on_readings, '-') AS on_readings,
@@ -2232,6 +2784,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
             """
             SELECT
                 t.id AS term_id,
+                t.language_code,
                 t.lemma,
                 COALESCE(t.reading, '-') AS reading,
                 COALESCE(t.meaning_pt, '-') AS meaning_pt,
@@ -2253,6 +2806,7 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
                 )
             GROUP BY
                 t.id,
+                t.language_code,
                 t.lemma,
                 t.reading,
                 t.meaning_pt,
@@ -2289,10 +2843,14 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
             (kanji_id, DETAIL_TABLE_LIMIT),
         ).fetchall()
 
+    kanji_language = str(kanji["language_code"] or languages.DEFAULT_LANGUAGE_CODE)
+    characters = characters_label(kanji_language)
+    character_noun = "caractere" if characters == "Caracteres" else characters.lower()
     related_term_rows = [
         [
-            f'<a href="/terms/{row["term_id"]}">{escape(row["lemma"])}</a>',
-            escape(row["reading"]),
+            term_link(row["term_id"], row["lemma"], row["language_code"], lang),
+            escape(row["language_code"]),
+            reading_text(row["reading"], row["language_code"]),
             escape(row["meaning_pt"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
@@ -2302,23 +2860,33 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
     ]
     related_source_rows = [
         [
-            f'<a href="/sources/{row["source_id"]}">#{row["source_id"]}</a>',
+            source_link(row["source_id"], lang),
             escape(row["count_in_source"]),
-            escape(row["title"]),
+            language_text(row["title"], None),
             escape(row["game"]),
             escape(row["scene"]),
             datetime_cell(row["seen_at"]),
         ]
         for row in source_rows
     ]
+    # On/kun readings are Japanese; a hanzi entry has none, so the chips only
+    # show for Japanese or when the metadata actually exists.
+    reading_chips = (
+        f"""
+          <span class="chip">On: <span{language_attrs("ja")}>{escape(kanji["on_readings"], "-")}</span></span>
+          <span class="chip">Kun: <span{language_attrs("ja")}>{escape(kanji["kun_readings"], "-")}</span></span>"""
+        if languages.base_language_code(kanji_language) == "ja"
+        or text(kanji["on_readings"], "-") != "-"
+        or text(kanji["kun_readings"], "-") != "-"
+        else ""
+    )
     body = f"""
     <div class="grid">
       <section class="panel panel-wide">
-        <h2>{escape(kanji["literal"])}</h2>
+        <h2{language_attrs(kanji_language)}>{escape(kanji["literal"])}</h2>
         <div class="chips">
-          <span class="chip">Significado: {escape(kanji["meaning"], "-")}</span>
-          <span class="chip">On: {escape(kanji["on_readings"], "-")}</span>
-          <span class="chip">Kun: {escape(kanji["kun_readings"], "-")}</span>
+          <span class="chip">Idioma: {escape(language_label(kanji_language))}</span>
+          <span class="chip">Significado: {escape(kanji["meaning"], "-")}</span>{reading_chips}
           <span class="chip">Palavras: {escape(kanji["distinct_terms"], "0")}</span>
           <span class="chip">Ocorrencias: {escape(kanji["total_occurrences"], "0")}</span>
           <span class="chip">Fontes: {escape(kanji["distinct_sources"], "0")}</span>
@@ -2329,16 +2897,16 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
       <section class="panel panel-side">
         <h2>Atalhos</h2>
         <div class="stack">
-          <a class="button-link" href="/kanji">Voltar para kanji</a>
-          <a class="button-link" href="/terms">Abrir termos</a>
-          <a class="button-link" href="/sources">Abrir fontes</a>
+          <a class="button-link" href="{html.escape(language_href("/kanji", lang), quote=True)}">Voltar para {html.escape(characters.lower())}</a>
+          <a class="button-link" href="{html.escape(language_href("/terms", lang), quote=True)}">Abrir termos</a>
+          <a class="button-link" href="{html.escape(language_href("/sources", lang), quote=True)}">Abrir fontes</a>
         </div>
       </section>
 
       <section class="panel panel-wide">
         <h3>Termos relacionados</h3>
         {truncation_note(len(term_rows), related_terms_total)}
-        {table_html(["Termo", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], related_term_rows)}
+        {table_html(["Termo", "Idioma", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], related_term_rows)}
       </section>
 
       <section class="panel panel-side">
@@ -2352,21 +2920,27 @@ def kanji_detail_page(db_path: Path, kanji_id: int) -> str | None:
       </section>
 
       <section class="panel">
-        <h3>Fontes que contem este kanji</h3>
+        <h3>Fontes que contem este {html.escape(character_noun)}</h3>
         {truncation_note(len(source_rows), related_sources_total)}
         {table_html(["Fonte", "Count", "Titulo", "Game", "Cena", "Quando"], related_source_rows)}
       </section>
     </div>
     """
-    return layout(title=f"Kanji {kanji['literal']}", body=body, active_path="/kanji")
+    return layout(title=f"{characters} {kanji['literal']}", body=body, active_path="/kanji", lang=lang)
 
 
-def term_detail_page(db_path: Path, term_id: int) -> str | None:
+def term_detail_page(
+    db_path: Path,
+    term_id: int,
+    params: dict[str, list[str]] | None = None,
+) -> str | None:
+    lang = current_language(params)
     with db_connect(db_path) as connection:
         term = connection.execute(
             """
             SELECT
                 t.id,
+                t.language_code,
                 t.lemma,
                 t.reading,
                 t.meaning_pt,
@@ -2437,6 +3011,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             SELECT
                 ss.source_id,
                 ss.segment_text,
+                COALESCE(ss.language_code, s.language_code) AS segment_language,
                 COALESCE(ss.reading, '-') AS segment_reading,
                 sst.surface_form,
                 sst.count_in_segment,
@@ -2473,10 +3048,18 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
             """,
             (term_id,),
         ).fetchall()
-        kanji_literals = extract_kanji_sequence(
-            term["lemma"],
-            *(row["surface_form"] for row in forms),
-            *occurrence_surface_forms,
+        term_language = str(term["language_code"] or languages.DEFAULT_LANGUAGE_CODE)
+        profile = get_language(term_language)
+        # Only languages with characters (Japanese kanji, Chinese hanzi) derive
+        # them; a Spanish or Korean term gets no character panel at all.
+        kanji_literals = (
+            extract_kanji_sequence(
+                term["lemma"],
+                *(row["surface_form"] for row in forms),
+                *occurrence_surface_forms,
+            )
+            if profile.has_characters
+            else []
         )
         if kanji_literals:
             placeholders = ", ".join("?" for _ in kanji_literals)
@@ -2484,6 +3067,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
                 f"""
                 SELECT
                     id,
+                    language_code,
                     literal,
                     total_occurrences,
                     distinct_sources,
@@ -2497,17 +3081,25 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
         else:
             kanji_rows = []
 
-    form_chips = "".join(
-        f'<span class="chip">{escape(row["surface_form"])} / {escape(row["reading"])}</span>'
-        for row in forms
-    ) or '<span class="muted">Nenhuma forma registrada.</span>'
+    # A reading only means something when the profile has one (kana for
+    # Japanese, romanization for Korean, Chinese, Russian); a stray value on a
+    # Latin-script term still shows rather than being hidden.
+    show_readings = profile.has_readings or bool(text(term["reading"], ""))
+
+    def form_chip(row: sqlite3.Row) -> str:
+        surface = language_text(row["surface_form"], term_language)
+        if not show_readings and text(row["reading"], "-") == "-":
+            return f'<span class="chip">{surface}</span>'
+        return f'<span class="chip">{surface} / {reading_text(row["reading"], term_language)}</span>'
+
+    form_chips = "".join(form_chip(row) for row in forms) or '<span class="muted">Nenhuma forma registrada.</span>'
     occurrence_rows = [
         [
-            f'<a href="/sources/{row["source_id"]}">#{row["source_id"]}</a>',
-            escape(row["surface_form"]),
+            source_link(row["source_id"], lang),
+            language_text(row["surface_form"], term_language),
             escape(row["count_in_source"]),
             escape(row["confidence"]),
-            escape(row["title"]),
+            language_text(row["title"], None),
             escape(row["scene"]),
             datetime_cell(row["seen_at"]),
         ]
@@ -2515,25 +3107,39 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
     ]
     segment_occurrence_rows = [
         [
-            f'<a href="/sources/{row["source_id"]}">#{row["source_id"]}</a>',
-            escape(row["segment_text"]),
-            escape(row["segment_reading"]),
-            escape(row["surface_form"]),
+            source_link(row["source_id"], lang),
+            language_text(row["segment_text"], row["segment_language"]),
+            escape(row["segment_language"]),
+            *([reading_text(row["segment_reading"], row["segment_language"])] if show_readings else []),
+            language_text(row["surface_form"], term_language),
             escape(row["count_in_segment"]),
             escape(row["confidence"]),
-            escape(row["title"]),
+            language_text(row["title"], None),
             escape(row["scene"]),
             datetime_cell(row["seen_at"]),
         ]
         for row in segment_occurrences
     ]
+    segment_headers = [
+        "Fonte",
+        "Segmento bruto",
+        "Idioma do segmento",
+        *(["Leitura do segmento"] if show_readings else []),
+        "Forma ligada",
+        "Count",
+        "Confianca",
+        "Titulo",
+        "Cena",
+        "Quando",
+    ]
+    flashcards_href = language_href("/flashcards", lang, {"q": term["lemma"]})
     flashcard_rows = [
         [
-            f'<a href="/flashcards?q={quote(str(term["lemma"]))}">#{row["id"]}</a>',
+            f'<a href="{html.escape(flashcards_href, quote=True)}">#{row["id"]}</a>',
             escape(row["template_name"]),
             escape(row["deck_name"]),
             status_chip(text(row["export_status"])),
-            escape(truncate(html_fragment_text(row["front_text"]), size=52)),
+            language_text(truncate(html_fragment_text(row["front_text"]), size=52), term_language),
         ]
         for row in flashcards
     ]
@@ -2547,7 +3153,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
     )
     kanji_table_rows = [
         [
-            f'<a href="/kanji/{row["id"]}">{escape(row["literal"])}</a>',
+            kanji_link(row["id"], row["literal"], term_language, lang),
             escape(row["distinct_terms"]),
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
@@ -2555,12 +3161,29 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
         ]
         for row in ordered_kanji_rows
     ]
+    characters = characters_label(term_language)
+    kanji_panel = (
+        f"""
+      <section class="panel panel-side">
+        <h3>{html.escape(characters)} derivados</h3>
+        {table_html([characters, "Palavras", "Ocorrencias", "Fontes", "Score"], kanji_table_rows)}
+      </section>
+        """
+        if profile.has_characters
+        else ""
+    )
+    reading_chip = (
+        f'<span class="chip">Leitura: {reading_text(term["reading"], term_language)}</span>'
+        if show_readings
+        else ""
+    )
     body = f"""
     <div class="grid">
       <section class="panel panel-wide">
-        <h2>{escape(term["lemma"])}</h2>
+        <h2{language_attrs(term_language)}>{escape(term["lemma"])}</h2>
         <div class="chips">
-          <span class="chip">Leitura: {escape(term["reading"] or "-")}</span>
+          <span class="chip">Idioma: {escape(language_label(term_language))}</span>
+          {reading_chip}
           <span class="chip">Significado: {escape(term["meaning_pt"] or "-")}</span>
           <span class="chip">Classe: {escape(term["pos"] or "-")}</span>
         </div>
@@ -2585,7 +3208,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
       <section class="panel panel-wide">
         <h3>Segmentacao revisada</h3>
         {truncation_note(len(segment_occurrences), segment_occurrences_total)}
-        {table_html(["Fonte", "Segmento bruto", "Leitura do segmento", "Forma ligada", "Count", "Confianca", "Titulo", "Cena", "Quando"], segment_occurrence_rows)}
+        {table_html(segment_headers, segment_occurrence_rows)}
       </section>
 
       <section class="panel panel-side">
@@ -2600,10 +3223,7 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
         </ul>
       </section>
 
-      <section class="panel panel-side">
-        <h3>Kanji derivados</h3>
-        {table_html(["Kanji", "Palavras", "Ocorrencias", "Fontes", "Score"], kanji_table_rows)}
-      </section>
+      {kanji_panel}
 
       <section class="panel">
         <h3>Flashcards</h3>
@@ -2611,10 +3231,10 @@ def term_detail_page(db_path: Path, term_id: int) -> str | None:
       </section>
     </div>
     """
-    return layout(title=f"Termo {term['lemma']}", body=body, active_path="/terms")
+    return layout(title=f"Termo {term['lemma']}", body=body, active_path="/terms", lang=lang)
 
 
-SOURCES_TABLE_HEADERS = ["ID", "Tipo", "Titulo", "Resolucao", "Cena", "Termos", "Quando", "Texto"]
+SOURCES_TABLE_HEADERS = ["ID", "Idioma", "Tipo", "Titulo", "Resolucao", "Cena", "Termos", "Quando", "Texto"]
 
 
 def load_sources_rows(
@@ -2623,22 +3243,18 @@ def load_sources_rows(
     q = first_value(params, "q")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
 
     filters = []
     sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("s.language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
     if q.strip():
-        filters.append(
-            """
-            (
-                COALESCE(title, '') LIKE ?
-                OR COALESCE(game, '') LIKE ?
-                OR COALESCE(scene, '') LIKE ?
-                OR COALESCE(raw_text, '') LIKE ?
-            )
-            """
-        )
-        like = sql_like(q)
-        sql_params.extend([like, like, like, like])
+        search_sql, search_params = folded_like_filter(("title", "game", "scene", "raw_text"), q)
+        filters.append(search_sql)
+        sql_params.extend(search_params)
 
     where_clause = ""
     if filters:
@@ -2658,6 +3274,7 @@ def load_sources_rows(
             f"""
             SELECT
                 s.id,
+                s.language_code,
                 s.source_type,
                 COALESCE(s.title, '(sem titulo)') AS title,
                 COALESCE(s.scene, '-') AS scene,
@@ -2683,6 +3300,7 @@ def load_sources_rows(
             normalized_rows.append(
                 {
                     "id": row["id"],
+                    "language_code": row["language_code"],
                     "source_type": row["source_type"],
                     "title": row["title"],
                     "resolution": source_resolution_label(connection, row),
@@ -2695,24 +3313,28 @@ def load_sources_rows(
     return q, limit, pagination, normalized_rows
 
 
-def sources_table_rows(rows: list[dict[str, object]]) -> list[list[str]]:
+def sources_table_rows(
+    rows: list[dict[str, object]],
+    lang: str = ALL_LANGUAGES_CODE,
+) -> list[list[str]]:
     return [
         [
-            f'<a href="/sources/{row["id"]}">#{row["id"]}</a>',
+            source_link(row["id"], lang),
+            escape(row["language_code"]),
             escape(row["source_type"]),
-            escape(row["title"]),
+            language_text(row["title"], None),
             escape(row["resolution"]),
             escape(row["scene"]),
             escape(row["linked_terms"]),
             datetime_cell(row["seen_at"]),
-            escape(truncate(text(row["raw_text"], ""), size=72)),
+            language_text(truncate(text(row["raw_text"], ""), size=72), row["language_code"]),
         ]
         for row in rows
     ]
 
 
-def sources_table_markup(rows: list[dict[str, object]]) -> str:
-    return table_html(SOURCES_TABLE_HEADERS, sources_table_rows(rows))
+def sources_table_markup(rows: list[dict[str, object]], lang: str = ALL_LANGUAGES_CODE) -> str:
+    return table_html(SOURCES_TABLE_HEADERS, sources_table_rows(rows, lang))
 
 
 def build_sources_payload(
@@ -2722,10 +3344,12 @@ def build_sources_payload(
     limit: int,
     pagination: PaginationState,
     rows: list[dict[str, object]],
+    lang: str = ALL_LANGUAGES_CODE,
 ) -> dict[str, object]:
     base_params = {
         "q": q.strip() or None,
         "limit": limit if limit != 50 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     revision = (
         f"{database_revision_token(db_path)}:{pagination.page}:{pagination.total_count}:"
@@ -2739,7 +3363,7 @@ def build_sources_payload(
             base_params=base_params,
             pagination=pagination,
         ),
-        "table_html": sources_table_markup(rows),
+        "table_html": sources_table_markup(rows, lang),
     }
 
 
@@ -2751,6 +3375,7 @@ def sources_live_payload(db_path: Path, params: dict[str, list[str]]) -> dict[st
         limit=limit,
         pagination=pagination,
         rows=rows,
+        lang=current_language(params),
     )
 
 
@@ -2937,6 +3562,7 @@ def sources_live_script(endpoint: str) -> str:
 
 def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
     q, limit, pagination, rows = load_sources_rows(db_path, params)
+    lang = current_language(params)
 
     extras = f'<input type="number" name="limit" value="{limit}" min="1" max="200">'
     payload = build_sources_payload(
@@ -2945,12 +3571,14 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
         limit=limit,
         pagination=pagination,
         rows=rows,
+        lang=lang,
     )
-    reset_href = "/sources" if q.strip() or limit != 50 or pagination.page > 1 else None
+    reset_href = language_href("/sources", lang) if q.strip() or limit != 50 or pagination.page > 1 else None
     live_params = {
         "q": q.strip() or None,
         "limit": limit if limit != 50 else None,
         "page": pagination.page if pagination.page > 1 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     live_query = urlencode(
         [(key, str(value)) for key, value in live_params.items() if value is not None]
@@ -2960,7 +3588,7 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
     <div class="grid">
       <section class="panel" data-sources-live-root data-live-revision="{html.escape(str(payload["revision"]))}">
         <h2>Fontes</h2>
-        {search_form(action="/sources", label="Buscar em fontes", placeholder="Ex.: battle menu, config, texto OCR", q=q, extras=extras, reset_href=reset_href)}
+        {search_form(action="/sources", label="Buscar em fontes", placeholder="Ex.: battle menu, config, texto OCR", q=q, extras=extras, reset_href=reset_href, lang=lang)}
         <div class="results-toolbar">
           <p class="results-summary" data-sources-count>{html.escape(str(payload["count_label"]))}</p>
           <div data-sources-pagination>{payload["pagination_html"]}</div>
@@ -2974,10 +3602,57 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
         body=body,
         active_path="/sources",
         extra_scripts=sources_live_script(live_endpoint),
+        lang=lang,
+        language_bar=language_bar_html(
+            db_path,
+            active_path="/sources",
+            lang=lang,
+            extra_params={"q": q.strip() or None, "limit": limit if limit != 50 else None},
+        ),
     )
 
 
-def source_detail_page(db_path: Path, source_id: int) -> str | None:
+def source_language_form(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    current_language: str,
+    lang: str = ALL_LANGUAGES_CODE,
+) -> str:
+    """Change a source's language and re-run its analysis from the page (plan item D4)."""
+    options = [
+        f'<option value="{AUTO_LANGUAGE_CODE}">auto (detectar pelo texto)</option>'
+    ]
+    seen = set()
+    for row in list_language_rows(connection):
+        code = str(row["code"])
+        seen.add(code)
+        selected = " selected" if code == current_language else ""
+        options.append(
+            f'<option value="{html.escape(code)}"{selected}>{html.escape(get_language(code).name)} ({html.escape(code)})</option>'
+        )
+    if current_language not in seen:
+        options.append(f'<option value="{html.escape(current_language)}" selected>{html.escape(current_language)}</option>')
+    return f"""
+        <form class="inline-action source-language-form" action="/actions/sources/{source_id}/language" method="post">
+          <label>Idioma da fonte
+            <select name="language">{"".join(options)}</select>
+          </label>
+          <label><input type="checkbox" name="reanalyze" value="1" checked> Reanalisar segmentos e candidatos</label>
+          <label><input type="checkbox" name="promote" value="1"> Criar termos ja</label>
+          {hidden_language_input(lang)}
+          <button type="submit">Salvar idioma</button>
+        </form>
+    """
+
+
+def source_detail_page(
+    db_path: Path,
+    source_id: int,
+    params: dict[str, list[str]] | None = None,
+) -> str | None:
+    params = params or {}
+    lang = current_language(params)
     with db_connect(db_path) as connection:
         source = connection.execute(
             """
@@ -2985,6 +3660,7 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
                 id,
                 source_type,
                 language_code,
+                language_confidence,
                 title,
                 game,
                 scene,
@@ -3028,11 +3704,39 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
         if source is None:
             return None
         resolution_label = source_resolution_label(connection, source)
+        language_form = source_language_form(
+            connection,
+            source_id=source_id,
+            current_language=str(source["language_code"]),
+            lang=lang,
+        )
+        # One pass over the segment's candidates: a separate "approved" subquery
+        # let SQLite pick the approval_status index and scan every approved
+        # candidate in the catalog per segment (seconds on a long capture).
+        analysis_rows = connection.execute(
+            """
+            SELECT
+                sas.segment_index,
+                COALESCE(sas.language_code, '-') AS language_code,
+                sas.raw_text,
+                COUNT(sac.id) AS candidate_count,
+                COALESCE(SUM(sac.approval_status = 'approved'), 0) AS approved_count
+            FROM source_analysis_segments AS sas
+            LEFT JOIN source_analysis_candidates AS sac
+                ON sac.source_analysis_segment_id = sas.id
+            WHERE sas.source_id = ?
+            GROUP BY sas.id
+            ORDER BY sas.segment_index ASC
+            LIMIT ?
+            """,
+            (source_id, DETAIL_TABLE_LIMIT),
+        ).fetchall()
 
         term_rows = connection.execute(
             """
             SELECT
                 st.term_id,
+                t.language_code,
                 t.lemma,
                 COALESCE(t.reading, '-') AS reading,
                 COALESCE(t.meaning_pt, '-') AS meaning_pt,
@@ -3052,6 +3756,7 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
             SELECT
                 ss.id,
                 ss.segment_text,
+                COALESCE(ss.language_code, ?) AS segment_language,
                 COALESCE(ss.reading, '-') AS segment_reading,
                 COUNT(sst.id) AS linked_terms,
                 COALESCE(group_concat(DISTINCT t.lemma), '-') AS linked_lemmas
@@ -3061,17 +3766,19 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
             LEFT JOIN terms AS t
                 ON t.id = sst.term_id
             WHERE ss.source_id = ?
-            GROUP BY ss.id, ss.segment_text, ss.reading
+            GROUP BY ss.id, ss.segment_text, ss.language_code, ss.reading
             ORDER BY ss.id ASC
             """,
-            (source_id,),
+            (str(source["language_code"]), source_id),
         ).fetchall()
         segmented_term_rows = connection.execute(
             """
             SELECT
                 ss.segment_text,
+                COALESCE(ss.language_code, ?) AS segment_language,
                 COALESCE(ss.reading, '-') AS segment_reading,
                 t.id AS term_id,
+                t.language_code,
                 t.lemma,
                 COALESCE(t.reading, '-') AS term_reading,
                 COALESCE(t.meaning_pt, '-') AS meaning_pt,
@@ -3086,12 +3793,13 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
             WHERE ss.source_id = ?
             ORDER BY ss.id ASC, sst.id ASC
             """,
-            (source_id,),
+            (str(source["language_code"]), source_id),
         ).fetchall()
         kanji_rows = connection.execute(
             """
             SELECT
                 k.id,
+                k.language_code,
                 k.literal,
                 sk.count_in_source,
                 COALESCE(ks.priority_score, 0) AS priority_score
@@ -3116,16 +3824,31 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
         image_block = f"""
         <section class="panel">
           <h3>Imagem</h3>
-          <img class="source-image" src="/sources/{source_id}/image" alt="Source image {source_id}">
+          <img class="source-image" src="/sources/{source_id}/image" alt="Imagem da fonte {source_id}">
         </section>
         """
 
+    source_language = str(source["language_code"] or languages.DEFAULT_LANGUAGE_CODE)
+    language_profile = get_language(source_language)
+    # A capture mixes languages, so every term and segment shows its own; the
+    # reading columns stay only when one of those languages has readings.
+    show_readings = any_language_has_readings(
+        [source_language]
+        + [row["language_code"] for row in term_rows]
+        + [row["segment_language"] for row in segment_rows]
+        + [row["language_code"] for row in segmented_term_rows]
+    )
+
+    def reading_cell(value: object | None, code: object | None) -> list[str]:
+        return [reading_text(value, code)] if show_readings else []
+
     table_rows = [
         [
-            f'<a href="/terms/{row["term_id"]}">{escape(row["lemma"])}</a>',
-            escape(row["reading"]),
+            term_link(row["term_id"], row["lemma"], row["language_code"], lang),
+            escape(row["language_code"]),
+            *reading_cell(row["reading"], row["language_code"]),
             escape(row["meaning_pt"]),
-            escape(row["surface_form"]),
+            language_text(row["surface_form"], row["language_code"]),
             escape(row["count_in_source"]),
             escape(row["confidence"]),
         ]
@@ -3133,55 +3856,121 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
     ]
     segment_summary_rows = [
         [
-            escape(row["segment_text"]),
-            escape(row["segment_reading"]),
+            language_text(row["segment_text"], row["segment_language"]),
+            escape(row["segment_language"]),
+            *reading_cell(row["segment_reading"], row["segment_language"]),
             escape(row["linked_terms"]),
-            escape(row["linked_lemmas"]),
+            language_text(row["linked_lemmas"], row["segment_language"]),
         ]
         for row in segment_rows
     ]
     segmented_term_table_rows = [
         [
-            escape(row["segment_text"]),
-            escape(row["segment_reading"]),
-            f'<a href="/terms/{row["term_id"]}">{escape(row["lemma"])}</a>',
-            escape(row["term_reading"]),
+            language_text(row["segment_text"], row["segment_language"]),
+            *reading_cell(row["segment_reading"], row["segment_language"]),
+            term_link(row["term_id"], row["lemma"], row["language_code"], lang),
+            escape(row["language_code"]),
+            *reading_cell(row["term_reading"], row["language_code"]),
             escape(row["meaning_pt"]),
-            escape(row["surface_form"]),
+            language_text(row["surface_form"], row["language_code"]),
             escape(row["count_in_segment"]),
             escape(row["confidence"]),
         ]
         for row in segmented_term_rows
     ]
+    term_headers = [
+        "Termo",
+        "Idioma",
+        *(["Leitura"] if show_readings else []),
+        "Significado",
+        "Forma vista",
+        "Count",
+        "Confianca",
+    ]
+    segment_headers = [
+        "Segmento bruto",
+        "Idioma",
+        *(["Leitura"] if show_readings else []),
+        "Termos ligados",
+        "Lemmas",
+    ]
+    segmented_term_headers = [
+        "Segmento bruto",
+        *(["Leitura do segmento"] if show_readings else []),
+        "Termo",
+        "Idioma",
+        *(["Leitura"] if show_readings else []),
+        "Significado",
+        "Forma ligada",
+        "Count",
+        "Confianca",
+    ]
     kanji_table_rows = [
         [
-            f'<a href="/kanji/{row["id"]}">{escape(row["literal"])}</a>',
+            kanji_link(row["id"], row["literal"], row["language_code"], lang),
             escape(row["count_in_source"]),
             escape(format_score(row["priority_score"])),
         ]
         for row in kanji_rows
     ]
+    analysis_table_rows = [
+        [
+            escape(row["segment_index"]),
+            escape(row["language_code"]),
+            language_text(truncate(str(row["raw_text"]), size=80), row["language_code"]),
+            escape(row["candidate_count"]),
+            escape(row["approved_count"]),
+        ]
+        for row in analysis_rows
+    ]
+    # Characters only exist for languages that have them; a Latin source with
+    # no kanji rows gets no empty kanji panel or shortcut.
+    show_characters = bool(kanji_rows) or language_profile.has_characters
+    characters = characters_label(source_language if language_profile.has_characters else ALL_LANGUAGES_CODE)
+    kanji_panel = (
+        f"""
+      <section class="panel panel-side">
+        <h3>{html.escape(characters)} ligados a esta fonte</h3>
+        {table_html([characters, "Count", "Score"], kanji_table_rows)}
+      </section>
+        """
+        if show_characters
+        else ""
+    )
+    kanji_shortcut = (
+        f'<a class="button-link" href="{html.escape(language_href("/kanji", lang), quote=True)}">Abrir {html.escape(characters.lower())}</a>'
+        if show_characters
+        else ""
+    )
+    confidence_label = (
+        f" (confianca {float(source['language_confidence']):.2f})"
+        if source["language_confidence"] is not None
+        else ""
+    )
     body = f"""
     <div class="grid">
       <section class="panel panel-wide">
-        <h2>{escape(source["title"] or "(sem titulo)")}</h2>
+        {notice_banner(params)}
+        <h2 dir="auto">{escape(source["title"] or "(sem titulo)")}</h2>
         <ul class="meta-list">
           <li><strong>Tipo</strong>{escape(source["source_type"])}</li>
-          <li><strong>Idioma</strong>{escape(source["language_code"])}</li>
+          <li><strong>Idioma</strong>{escape(language_profile.name)} ({escape(source["language_code"])}){html.escape(confidence_label)}</li>
+          <li><strong>Jogo / perfil</strong>{escape(source["game"] or "-")}</li>
           <li><strong>Resolucao original</strong>{escape(resolution_label)}</li>
           <li><strong>Cena</strong>{escape(source["scene"] or "-")}</li>
           <li><strong>Capturado em</strong>{escape(format_datetime_display(source["captured_at"] or source["created_at"]))}</li>
           <li><strong>Arquivo</strong><span class="mono">{escape(source["source_path"] or "-")}</span></li>
         </ul>
+        {language_form}
       </section>
 
       <section class="panel panel-side">
         <h2>Atalhos</h2>
         <div class="stack">
-          <a class="button-link" href="/sources">Voltar para fontes</a>
-          <a class="button-link" href="/kanji">Abrir kanji</a>
-          <a class="button-link" href="/terms">Abrir termos</a>
-          <a class="button-link" href="/flashcards">Abrir cards</a>
+          <a class="button-link" href="{html.escape(language_href("/sources", lang), quote=True)}">Voltar para fontes</a>
+          {kanji_shortcut}
+          <a class="button-link" href="{html.escape(language_href("/terms", lang), quote=True)}">Abrir termos</a>
+          <a class="button-link" href="{html.escape(language_href("/flashcards", lang), quote=True)}">Abrir cards</a>
         </div>
       </section>
 
@@ -3189,7 +3978,7 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
 
       <section class="panel panel-wide">
         <h3>Texto bruto</h3>
-        <pre>{html.escape(text(source["raw_text"], "(sem texto bruto)"))}</pre>
+        <pre{language_attrs(source_language) if text(source["raw_text"], "") else ""}>{html.escape(text(source["raw_text"], "(sem texto bruto)"))}</pre>
       </section>
 
       <section class="panel panel-side">
@@ -3205,27 +3994,62 @@ def source_detail_page(db_path: Path, source_id: int) -> str | None:
       </section>
 
       <section class="panel panel-wide">
+        <h3>Segmentos analisados (rascunho por idioma)</h3>
+        {table_html(["#", "Idioma", "Texto", "Candidatos", "Aprovados"], analysis_table_rows)}
+        {truncation_note(len(analysis_rows), len(analysis_rows)) if len(analysis_rows) >= DETAIL_TABLE_LIMIT else ""}
+      </section>
+
+      <section class="panel panel-wide">
         <h3>Segmentos revisados desta fonte</h3>
-        {table_html(["Segmento bruto", "Leitura", "Termos ligados", "Lemmas"], segment_summary_rows)}
+        {table_html(segment_headers, segment_summary_rows)}
       </section>
 
       <section class="panel panel-wide">
         <h3>Termos ligados a esta fonte</h3>
-        {table_html(["Termo", "Leitura", "Significado", "Forma vista", "Count", "Confianca"], table_rows)}
+        {table_html(term_headers, table_rows)}
       </section>
 
       <section class="panel panel-wide">
         <h3>Decomposicao termo a termo</h3>
-        {table_html(["Segmento bruto", "Leitura do segmento", "Termo", "Leitura", "Significado", "Forma ligada", "Count", "Confianca"], segmented_term_table_rows)}
+        {table_html(segmented_term_headers, segmented_term_table_rows)}
       </section>
 
-      <section class="panel panel-side">
-        <h3>Kanji ligados a esta fonte</h3>
-        {table_html(["Kanji", "Count", "Score"], kanji_table_rows)}
-      </section>
+      {kanji_panel}
     </div>
     """
-    return layout(title=f"Fonte {source_id}", body=body, active_path="/sources")
+    return layout(title=f"Fonte {source_id}", body=body, active_path="/sources", lang=lang)
+
+
+FLASHCARD_SEARCH_COLUMNS = (
+    "html_text(f.front_text)",
+    "html_text(f.back_text)",
+    "t.lemma",
+    "t.reading",
+    "t.meaning_pt",
+)
+
+
+def flashcard_filters(
+    *,
+    lang: str,
+    status: str,
+    q: str,
+) -> tuple[list[str], list[object]]:
+    """WHERE parts shared by the cards page and ``/api/flashcards``."""
+    filters: list[str] = []
+    sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("t.language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
+    if status != "all":
+        filters.append("f.export_status = ?")
+        sql_params.append(status)
+    if q.strip():
+        search_sql, search_params = folded_like_filter(FLASHCARD_SEARCH_COLUMNS, q)
+        filters.append(search_sql)
+        sql_params.extend(search_params)
+    return filters, sql_params
 
 
 def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
@@ -3233,33 +4057,15 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
     status = first_value(params, "status", "all")
     limit = parse_limit(first_value(params, "limit", "50"))
     page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
 
-    filters = []
-    sql_params: list[object] = []
-    if status != "all":
-        filters.append("f.export_status = ?")
-        sql_params.append(status)
-    if q.strip():
-        filters.append(
-            """
-            (
-                html_text(f.front_text) LIKE ?
-                OR html_text(f.back_text) LIKE ?
-                OR t.lemma LIKE ?
-                OR COALESCE(t.reading, '') LIKE ?
-                OR COALESCE(t.meaning_pt, '') LIKE ?
-            )
-            """
-        )
-        like = sql_like(q)
-        sql_params.extend([like, like, like, like, like])
+    filters, sql_params = flashcard_filters(lang=lang, status=status, q=q)
 
     where_clause = ""
     if filters:
         where_clause = "WHERE " + " AND ".join(part.strip() for part in filters)
 
     with db_connect(db_path) as connection:
-        connection.create_function("html_text", 1, html_fragment_text, deterministic=True)
         total_count = connection.execute(
             f"""
             SELECT COUNT(*)
@@ -3277,6 +4083,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 f.id,
                 t.id AS term_id,
                 t.lemma,
+                t.language_code,
                 COALESCE(t.reading, '-') AS reading,
                 COALESCE(ts.priority_score, 0) AS priority_score,
                 f.template_name,
@@ -3301,13 +4108,18 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "q": q.strip() or None,
         "status": status if status != "all" else None,
         "limit": limit if limit != 50 else None,
+        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
         path="/flashcards",
         base_params=base_params,
         pagination=pagination,
     )
-    reset_href = "/flashcards" if any(value is not None for value in base_params.values()) or pagination.page > 1 else None
+    reset_href = (
+        language_href("/flashcards", lang)
+        if any(value is not None for key, value in base_params.items() if key != "lang") or pagination.page > 1
+        else None
+    )
     extras = f"""
       <div class="filters">
         <select name="status">
@@ -3318,31 +4130,44 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         <input type="number" name="limit" value="{limit}" min="1" max="200">
       </div>
     """
+    show_readings = language_has_readings(lang)
     table_rows = [
         [
-            f'<a href="/terms/{row["term_id"]}">{escape(row["lemma"])}</a>',
-            escape(row["reading"]),
+            term_link(row["term_id"], row["lemma"], row["language_code"], lang),
+            escape(row["language_code"]),
+            *([reading_text(row["reading"], row["language_code"])] if show_readings else []),
             escape(format_score(row["priority_score"])),
             escape(row["template_name"]),
             escape(row["deck_name"]),
             status_chip(text(row["export_status"])),
             escape(row["source_id"]),
-            escape(truncate(html_fragment_text(row["front_text"]), size=52)),
+            language_text(truncate(html_fragment_text(row["front_text"]), size=52), row["language_code"]),
         ]
         for row in rows
+    ]
+    headers = [
+        "Termo",
+        "Idioma",
+        *(["Leitura"] if show_readings else []),
+        "Score",
+        "Template",
+        "Deck",
+        "Status",
+        "Fonte",
+        "Frente",
     ]
     body = f"""
     <div class="grid">
       <section class="panel">
         {notice_banner(params)}
         <h2>Flashcards</h2>
-        {sync_anki_action(next_path="/flashcards")}
-        {search_form(action="/flashcards", label="Buscar cards", placeholder="Ex.: guardar, persona, progress", q=q, extras=extras, reset_href=reset_href)}
+        {sync_anki_action(next_path=language_href("/flashcards", lang))}
+        {search_form(action="/flashcards", label="Buscar cards", placeholder="Ex.: guardar, persona, progress", q=q, extras=extras, reset_href=reset_href, lang=lang)}
         <div class="results-toolbar">
           <p class="results-summary">{results_summary_text(pagination)}</p>
           {pagination_markup}
         </div>
-        {table_html(["Termo", "Leitura", "Score", "Template", "Deck", "Status", "Fonte", "Frente"], table_rows)}
+        {table_html(headers, table_rows)}
       </section>
     </div>
     """
@@ -3351,7 +4176,416 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         body=body,
         active_path="/flashcards",
         extra_scripts=auto_reload_script(db_path),
+        lang=lang,
+        language_bar=language_bar_html(
+            db_path,
+            active_path="/flashcards",
+            lang=lang,
+            extra_params={key: value for key, value in base_params.items() if key != "lang"},
+        ),
     )
+
+
+def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    """Capture settings: which languages the worker keeps, the OCR plan, window profiles."""
+    with db_connect(db_path) as connection:
+        language_rows = list_language_rows(connection)
+        capture_codes = lang_jp.capture_language_codes(connection)
+        profiles = lang_jp.list_capture_profiles(connection)
+        recent_jobs = connection.execute(
+            """
+            SELECT
+                cj.id, cj.status, cj.captured_at, cj.window_title, cj.process_name,
+                cj.capture_profile_id,
+                (SELECT name FROM capture_profiles AS cp WHERE cp.id = cj.capture_profile_id) AS profile_name,
+                (SELECT s.id FROM sources AS s WHERE s.capture_job_id = cj.id LIMIT 1) AS source_id,
+                (SELECT s.language_code FROM sources AS s WHERE s.capture_job_id = cj.id LIMIT 1) AS source_language
+            FROM capture_jobs AS cj
+            ORDER BY cj.id DESC
+            LIMIT 12
+            """
+        ).fetchall()
+    override = os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV, "").strip()
+    plan = plan_ocr_engines(capture_codes)
+
+    gloss_language = languages.base_language_code(lang_jp.DEFAULT_TERM_TRANSLATION_TARGET)
+    checkboxes = []
+    for row in language_rows:
+        code = str(row["code"])
+        profile = get_language(code)
+        checked = " checked" if code in capture_codes else ""
+        notes = []
+        if not row["enabled"]:
+            notes.append("idioma desativado")
+        if languages.base_language_code(code) == gloss_language:
+            notes.append("idioma dos significados")
+        notes_html = "".join(f' <span class="muted">({html.escape(note)})</span>' for note in notes)
+        checkboxes.append(
+            f'<label class="capture-language"><input type="checkbox" name="codes" value="{html.escape(code)}"{checked}> '
+            f"{html.escape(profile.name)} <span class=\"muted\">{html.escape(code)}</span>{notes_html}</label>"
+        )
+    override_note = (
+        f'<div class="notice-banner">A variavel {html.escape(lang_jp.CAPTURE_LANGUAGES_ENV)}={html.escape(override)} '
+        "esta definida no ambiente do worker e sobrepoe estas opcoes enquanto existir.</div>"
+        if override
+        else ""
+    )
+    engines_html = "".join(f"<li><span class=\"mono\">{html.escape(name)}</span></li>" for name in plan.engine_names) or "<li>-</li>"
+    unsupported_html = (
+        f'<p class="muted">Sem motor de OCR para: {html.escape(", ".join(plan.unsupported))}. '
+        "O texto nesses idiomas so entra por <code>ingest-text</code>.</p>"
+        if plan.unsupported
+        else ""
+    )
+
+    profile_rows = []
+    for row in profiles:
+        state = "ativo" if row["enabled"] else "inativo"
+        toggle_label = "Desativar" if row["enabled"] else "Ativar"
+        actions = f"""
+            <form class="inline-action" action="/actions/capture-profiles/toggle" method="post">
+              <input type="hidden" name="id" value="{row['id']}">
+              <input type="hidden" name="enabled" value="{0 if row['enabled'] else 1}">
+              <button type="submit">{toggle_label}</button>
+            </form>
+            <form class="inline-action" action="/actions/capture-profiles/delete" method="post" onsubmit="return confirm('Remover o perfil {html.escape(str(row['name']), quote=True)}?');">
+              <input type="hidden" name="id" value="{row['id']}">
+              <button type="submit">Remover</button>
+            </form>
+        """
+        profile_rows.append(
+            [
+                escape(row["name"]),
+                escape(row["window_title_pattern"] or "-"),
+                escape(row["process_name_pattern"] or "-"),
+                escape(row["language_codes"]),
+                escape(row["priority"]),
+                status_chip(state),
+                actions,
+            ]
+        )
+    job_rows = [
+        [
+            escape(row["id"]),
+            status_chip(text(row["status"])),
+            language_text(truncate(text(row["window_title"], "-"), size=60), None),
+            escape(row["process_name"] or "-"),
+            escape(row["profile_name"] or "-"),
+            (
+                f'<a href="/sources/{row["source_id"]}">#{row["source_id"]} ({escape(row["source_language"])})</a>'
+                if row["source_id"] is not None
+                else "-"
+            ),
+            datetime_cell(row["captured_at"]),
+        ]
+        for row in recent_jobs
+    ]
+    language_options = "".join(
+        f'<option value="{html.escape(str(row["code"]))}">{html.escape(get_language(str(row["code"])).name)} ({html.escape(str(row["code"]))})</option>'
+        for row in language_rows
+    )
+    body = f"""
+    <div class="grid">
+      <section class="panel panel-wide">
+        {notice_banner(params)}
+        <h2>Idiomas capturados</h2>
+        <p>O worker guarda o texto de tela nos idiomas marcados e descarta o resto. A escolha fica no banco (<code>languages.capture_enabled</code>) e vale para o tray, a CLI e esta pagina.</p>
+        {override_note}
+        <form class="capture-languages-form" action="/actions/capture-languages" method="post">
+          <div class="capture-language-grid">{"".join(checkboxes)}</div>
+          <div class="action-row">
+            <button type="submit">Salvar idiomas</button>
+            <button type="submit" name="preset" value="all">Todos os idiomas</button>
+            <button type="submit" name="preset" value="ja">Somente japones</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-side">
+        <h2>Motores de OCR</h2>
+        <p>Escolhidos automaticamente pelo conjunto acima: meikiocr para japones, um leitor EasyOCR por grupo de idiomas compativeis.</p>
+        <ul class="meta-list">{engines_html}</ul>
+        {unsupported_html}
+        <p class="footer-note">Captura atual: {html.escape(", ".join(capture_codes))}</p>
+      </section>
+
+      <section class="panel panel-wide">
+        <h2>Perfis de captura por janela</h2>
+        <p>Um perfil prende uma janela (titulo ou processo) a um conjunto fixo de idiomas: com um idioma a deteccao e pulada, com varios ela fica restrita a eles.</p>
+        {table_html(["Nome", "Titulo da janela", "Processo", "Idiomas", "Prioridade", "Estado", "Acoes"], profile_rows)}
+        <form class="search capture-profile-form" action="/actions/capture-profiles/save" method="post">
+          <label>Novo perfil (ou mesmo nome para substituir)</label>
+          <div class="inputs">
+            <input type="text" name="name" placeholder="Nome, ex.: Dragon Quest ES" required>
+            <input type="text" name="window_pattern" placeholder="Titulo da janela, ex.: *dragon quest*">
+            <input type="text" name="process_pattern" placeholder="Processo, ex.: dq11.exe">
+            <input type="text" name="languages" placeholder="Idiomas, ex.: es,en" required list="capture-language-codes">
+            <datalist id="capture-language-codes">{language_options}</datalist>
+            <input type="number" name="priority" value="100" min="0" max="9999" title="Prioridade (menor vence)">
+            <div class="search-actions"><button type="submit">Salvar perfil</button></div>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-wide">
+        <h2>Capturas recentes</h2>
+        <p>Titulo e processo da janela em primeiro plano em cada captura: use-os para criar perfis.</p>
+        {table_html(["Job", "Status", "Janela", "Processo", "Perfil", "Fonte", "Quando"], job_rows)}
+      </section>
+    </div>
+    """
+    return layout(
+        title="Captura",
+        body=body,
+        active_path="/capture",
+        language_bar=language_bar_html(db_path, active_path="/capture", lang=ALL_LANGUAGES_CODE),
+    )
+
+
+def api_capture_payload(db_path: Path) -> dict[str, object]:
+    with db_connect(db_path) as connection:
+        capture_codes = lang_jp.capture_language_codes(connection)
+        profiles = lang_jp.list_capture_profiles(connection)
+    plan = plan_ocr_engines(capture_codes)
+    return {
+        "capture_languages": list(capture_codes),
+        "override_env": os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV) or None,
+        "ocr_plan": {
+            "backend": plan.backend,
+            "engines": list(plan.engine_names),
+            "meikiocr": plan.use_meikiocr,
+            "easyocr_groups": [list(group) for group in plan.easyocr_groups],
+            "unsupported": list(plan.unsupported),
+        },
+        "profiles": [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "window_title_pattern": row["window_title_pattern"],
+                "process_name_pattern": row["process_name_pattern"],
+                "language_codes": lang_jp.parse_language_code_list(row["language_codes"]),
+                "enabled": bool(row["enabled"]),
+                "priority": row["priority"],
+                "notes": row["notes"],
+            }
+            for row in profiles
+        ],
+    }
+
+
+def api_language_entry(row: sqlite3.Row) -> dict[str, object]:
+    profile = get_language(str(row["code"]))
+    return {
+        "code": row["code"],
+        "name": row["name"],
+        "native_name": row["native_name"],
+        "script": row["script"],
+        "deck_name": row["deck_name"],
+        "enabled": bool(row["enabled"]),
+        "capture_enabled": bool(row["capture_enabled"]),
+        "word_delimited": profile.word_delimited,
+        "has_readings": profile.has_readings,
+        "has_characters": profile.has_characters,
+        "rtl": profile.rtl,
+        "term_count": row["term_count"],
+        "source_count": row["source_count"],
+        "pending_flashcards": row["pending_flashcards"],
+    }
+
+
+def api_languages_payload(db_path: Path) -> dict[str, object]:
+    with db_connect(db_path) as connection:
+        rows = list_language_rows(connection)
+    return {"languages": [api_language_entry(row) for row in rows]}
+
+
+def api_page_meta(pagination: PaginationState, lang: str, **extra: object) -> dict[str, object]:
+    return {
+        "lang": lang,
+        "page": pagination.page,
+        "limit": pagination.limit,
+        "total": pagination.total_count,
+        "pages": pagination.total_pages,
+        **extra,
+    }
+
+
+def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    """Terms as JSON: ``?lang=``, ``?q=``, ``?order=priority|recent|lemma``, ``?limit=``, ``?page=``."""
+    q = first_value(params, "q")
+    order = first_value(params, "order", "priority")
+    limit = parse_limit(first_value(params, "limit", "50"), maximum=500)
+    page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
+    order_clause = {
+        "priority": TERM_PRIORITY_ORDER_SQL.strip(),
+        "recent": "julianday(last_seen_at) DESC, id DESC",
+        "lemma": "lemma COLLATE NOCASE ASC, id ASC",
+    }.get(order, TERM_PRIORITY_ORDER_SQL.strip())
+    filters: list[str] = []
+    sql_params: list[object] = []
+    lang_sql, lang_params = language_filter_clause("language_code", lang)
+    if lang_sql:
+        filters.append(lang_sql)
+        sql_params.extend(lang_params)
+    if q.strip():
+        search_sql, search_params = folded_like_filter(("lemma", "reading", "meaning_pt"), q)
+        filters.append(search_sql)
+        sql_params.extend(search_params)
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"SELECT COUNT(*) FROM v_terms_overview {where_clause}",
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
+        rows = connection.execute(
+            f"""
+            SELECT
+                id, language_code, lemma, reading, meaning_pt, pos,
+                total_occurrences, distinct_sources, distinct_forms,
+                priority_score, first_seen_at, last_seen_at
+            FROM v_terms_overview
+            {where_clause}
+            ORDER BY {order_clause}
+            LIMIT ? OFFSET ?
+            """,
+            [*sql_params, pagination.limit, pagination.offset],
+        ).fetchall()
+    return {
+        "meta": api_page_meta(pagination, lang, q=q, order=order),
+        "terms": [dict(row) for row in rows],
+    }
+
+
+def api_term_detail_payload(db_path: Path, term_id: int) -> dict[str, object] | None:
+    with db_connect(db_path) as connection:
+        term = connection.execute(
+            """
+            SELECT
+                v.id, v.language_code, v.lemma, v.reading, v.meaning_pt, v.pos, t.notes,
+                v.total_occurrences, v.distinct_sources, v.distinct_forms,
+                v.priority_score, v.first_seen_at, v.last_seen_at
+            FROM v_terms_overview AS v
+            JOIN terms AS t ON t.id = v.id
+            WHERE v.id = ?
+            """,
+            (term_id,),
+        ).fetchone()
+        if term is None:
+            return None
+        forms = connection.execute(
+            "SELECT surface_form, reading FROM term_forms WHERE term_id = ? ORDER BY surface_form",
+            (term_id,),
+        ).fetchall()
+        occurrences = connection.execute(
+            """
+            SELECT
+                st.source_id, st.surface_form, st.count_in_source, st.confidence,
+                s.title, s.game, s.scene, s.language_code AS source_language_code,
+                COALESCE(s.captured_at, s.created_at) AS seen_at
+            FROM source_terms AS st
+            JOIN sources AS s ON s.id = st.source_id
+            WHERE st.term_id = ?
+            ORDER BY st.count_in_source DESC, julianday(seen_at) DESC, st.id DESC
+            LIMIT 200
+            """,
+            (term_id,),
+        ).fetchall()
+        cards = connection.execute(
+            """
+            SELECT id, template_name, deck_name, export_status, anki_note_id
+            FROM flashcards
+            WHERE term_id = ?
+            ORDER BY id
+            """,
+            (term_id,),
+        ).fetchall()
+    payload = dict(term)
+    payload["language"] = api_language_entry_from_profile(str(term["language_code"]))
+    payload["forms"] = [dict(row) for row in forms]
+    payload["occurrences"] = [dict(row) for row in occurrences]
+    payload["flashcards"] = [dict(row) for row in cards]
+    return payload
+
+
+def api_language_entry_from_profile(code: str) -> dict[str, object]:
+    profile = get_language(code)
+    return {
+        "code": profile.code,
+        "name": profile.name,
+        "native_name": profile.native_name,
+        "script": profile.script,
+        "word_delimited": profile.word_delimited,
+        "has_readings": profile.has_readings,
+        "has_characters": profile.has_characters,
+        "rtl": profile.rtl,
+    }
+
+
+def api_sources_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    q, limit, pagination, rows = load_sources_rows(db_path, params)
+    lang = current_language(params)
+    return {
+        "meta": api_page_meta(pagination, lang, q=q),
+        "sources": [
+            {
+                "id": row["id"],
+                "language_code": row["language_code"],
+                "source_type": row["source_type"],
+                "title": row["title"],
+                "scene": row["scene"],
+                "linked_terms": row["linked_terms"],
+                "seen_at": row["seen_at"],
+                "raw_text": row["raw_text"],
+                "image_url": f"/sources/{row['id']}/image",
+            }
+            for row in rows
+        ],
+    }
+
+
+def api_flashcards_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    """Cards as JSON: ``?lang=``, ``?status=``, ``?q=``, ``?limit=``, ``?page=``."""
+    q = first_value(params, "q")
+    status = first_value(params, "status", "all")
+    limit = parse_limit(first_value(params, "limit", "50"), maximum=500)
+    page = parse_page(first_value(params, "page", "1"))
+    lang = current_language(params)
+    filters, sql_params = flashcard_filters(lang=lang, status=status, q=q)
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+    with db_connect(db_path) as connection:
+        total_count = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM flashcards AS f
+            JOIN terms AS t ON t.id = f.term_id
+            {where_clause}
+            """,
+            sql_params,
+        ).fetchone()[0]
+        pagination = build_pagination(total_count=total_count, limit=limit, page=page)
+        rows = connection.execute(
+            f"""
+            SELECT
+                f.id, f.term_id, t.language_code, t.lemma, t.reading, t.meaning_pt,
+                f.template_name, f.deck_name, f.note_type, f.front_text, f.back_text,
+                f.tags, f.export_status, f.anki_note_id, f.source_id,
+                COALESCE(ts.priority_score, 0) AS priority_score
+            FROM flashcards AS f
+            JOIN terms AS t ON t.id = f.term_id
+            LEFT JOIN term_stats AS ts ON ts.term_id = f.term_id
+            {where_clause}
+            ORDER BY
+            """ + FLASHCARD_PRIORITY_ORDER_SQL + """
+            LIMIT ? OFFSET ?
+            """,
+            [*sql_params, pagination.limit, pagination.offset],
+        ).fetchall()
+    return {
+        "meta": api_page_meta(pagination, lang, status=status, q=q),
+        "flashcards": [dict(row) for row in rows],
+    }
 
 
 class CatalogRequestHandler(BaseHTTPRequestHandler):
@@ -3368,6 +4602,32 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/live/revision":
             self.respond_json(live_revision_payload(self.db_path))
             return
+        if path == "/api/languages":
+            self.respond_json(api_languages_payload(self.db_path))
+            return
+        if path == "/api/capture":
+            self.respond_json(api_capture_payload(self.db_path))
+            return
+        if path == "/capture":
+            self.respond_html(capture_page(self.db_path, params))
+            return
+        if path == "/api/terms":
+            self.respond_json(api_terms_payload(self.db_path, params))
+            return
+        if path.startswith("/api/terms/"):
+            term_id = self.parse_int_tail(path, "/api/terms/")
+            payload = api_term_detail_payload(self.db_path, term_id) if term_id is not None else None
+            if payload is None:
+                self.respond_json({"error": "term_not_found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self.respond_json(payload)
+            return
+        if path == "/api/sources":
+            self.respond_json(api_sources_payload(self.db_path, params))
+            return
+        if path == "/api/flashcards":
+            self.respond_json(api_flashcards_payload(self.db_path, params))
+            return
         if path == "/actions/sync-anki/status":
             self.respond_sync_anki_job_status(params)
             return
@@ -3379,7 +4639,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             if term_id is None:
                 self.respond_not_found("Termo invalido.")
                 return
-            page = term_detail_page(self.db_path, term_id)
+            page = term_detail_page(self.db_path, term_id, params)
             if page is None:
                 self.respond_not_found("Termo nao encontrado.")
                 return
@@ -3393,7 +4653,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             if kanji_id is None:
                 self.respond_not_found("Kanji invalido.")
                 return
-            page = kanji_detail_page(self.db_path, kanji_id)
+            page = kanji_detail_page(self.db_path, kanji_id, params)
             if page is None:
                 self.respond_not_found("Kanji nao encontrado.")
                 return
@@ -3417,7 +4677,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             if source_id is None:
                 self.respond_not_found("Fonte invalida.")
                 return
-            page = source_detail_page(self.db_path, source_id)
+            page = source_detail_page(self.db_path, source_id, params)
             if page is None:
                 self.respond_not_found("Fonte nao encontrada.")
                 return
@@ -3439,8 +4699,130 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/actions/sync-kanji-anki":
             self.run_sync_anki_action()
             return
+        if path == "/actions/capture-languages":
+            self.run_capture_languages_action()
+            return
+        if path == "/actions/capture-profiles/save":
+            self.run_capture_profile_action("save")
+            return
+        if path == "/actions/capture-profiles/toggle":
+            self.run_capture_profile_action("toggle")
+            return
+        if path == "/actions/capture-profiles/delete":
+            self.run_capture_profile_action("delete")
+            return
+        if path.startswith("/actions/sources/") and path.endswith("/language"):
+            source_id = self.parse_int_tail(path[: -len("/language")], "/actions/sources/")
+            if source_id is None:
+                self.respond_not_found("Fonte invalida.")
+                return
+            self.run_source_language_action(source_id)
+            return
 
         self.respond_not_found("Acao nao encontrada.")
+
+    def run_capture_languages_action(self) -> None:
+        form_data = self.read_form_data()
+        preset = first_value(form_data, "preset", "").strip()
+        try:
+            with db_connect(self.db_path) as connection:
+                if preset == "all":
+                    for code in languages.BUILTIN_LANGUAGES:
+                        lang_jp.ensure_language_row(connection, code, capture_enabled=True)
+                    connection.execute(
+                        "UPDATE languages SET capture_enabled = 1, updated_at = CURRENT_TIMESTAMP"
+                    )
+                elif preset:
+                    lang_jp.set_capture_languages(connection, preset.split(","))
+                else:
+                    lang_jp.set_capture_languages(connection, form_data.get("codes", []))
+                codes = lang_jp.capture_language_codes(connection, override="")
+                connection.commit()
+        except SystemExit as exc:
+            self.redirect(self.append_notice("/capture", message=str(exc), level="error"))
+            return
+        message = f"Captura: {', '.join(codes)}."
+        if self.prefers_json_response():
+            self.respond_json({"capture_languages": list(codes), "message": message})
+            return
+        self.redirect(self.append_notice("/capture", message=message, level="info"))
+
+    def run_capture_profile_action(self, action: str) -> None:
+        form_data = self.read_form_data()
+        try:
+            with db_connect(self.db_path) as connection:
+                if action == "save":
+                    priority_raw = first_value(form_data, "priority", "100").strip() or "100"
+                    try:
+                        priority = int(priority_raw)
+                    except ValueError:
+                        priority = 100
+                    profile_id = lang_jp.upsert_capture_profile(
+                        connection,
+                        name=first_value(form_data, "name"),
+                        language_codes=first_value(form_data, "languages"),
+                        window_title_pattern=first_value(form_data, "window_pattern") or None,
+                        process_name_pattern=first_value(form_data, "process_pattern") or None,
+                        enabled=first_value(form_data, "enabled", "1") != "0",
+                        priority=priority,
+                        notes=first_value(form_data, "notes") or None,
+                    )
+                    message = f"Perfil #{profile_id} salvo."
+                else:
+                    try:
+                        profile_id = int(first_value(form_data, "id", ""))
+                    except ValueError:
+                        raise SystemExit("Perfil invalido.")
+                    if action == "toggle":
+                        enabled = first_value(form_data, "enabled", "1") != "0"
+                        if not lang_jp.set_capture_profile_enabled(connection, profile_id, enabled):
+                            raise SystemExit("Perfil nao encontrado.")
+                        message = f"Perfil #{profile_id} {'ativado' if enabled else 'desativado'}."
+                    else:
+                        if not lang_jp.delete_capture_profile(connection, profile_id=profile_id):
+                            raise SystemExit("Perfil nao encontrado.")
+                        message = f"Perfil #{profile_id} removido."
+                connection.commit()
+        except SystemExit as exc:
+            self.redirect(self.append_notice("/capture", message=str(exc), level="error"))
+            return
+        if self.prefers_json_response():
+            self.respond_json({"message": message})
+            return
+        self.redirect(self.append_notice("/capture", message=message, level="info"))
+
+    def run_source_language_action(self, source_id: int) -> None:
+        form_data = self.read_form_data()
+        language = first_value(form_data, "language", AUTO_LANGUAGE_CODE) or AUTO_LANGUAGE_CODE
+        reanalyze = first_value(form_data, "reanalyze", "") == "1"
+        promote = first_value(form_data, "promote", "") == "1"
+        next_path = language_href(f"/sources/{source_id}", current_language(form_data))
+        try:
+            with db_connect(self.db_path) as connection:
+                result = lang_jp.change_source_language(
+                    connection,
+                    source_id=source_id,
+                    language=language,
+                    reanalyze=reanalyze,
+                    promote=promote,
+                )
+                connection.commit()
+        except SystemExit as exc:
+            self.redirect(self.append_notice(next_path, message=str(exc), level="error"))
+            return
+        message = f"Idioma da fonte: {result['previous_language']} -> {result['language_code']}."
+        reanalyzed = result["reanalyzed"]
+        if isinstance(reanalyzed, dict):
+            message += (
+                f" Reanalisada: {reanalyzed['segments']} segmentos, {reanalyzed['candidates']} candidatos"
+                f" ({', '.join(sorted(reanalyzed['languages'])) or result['language_code']})."
+            )
+        if promote:
+            message += f" Termos criados: {result['promoted_terms']}."
+        if self.prefers_json_response():
+            self.respond_json({"message": message, **{k: v for k, v in result.items() if k != "reanalyzed"}})
+            return
+        self.redirect(self.append_notice(next_path, message=message, level="info"))
 
     def log_message(self, format: str, *args: object) -> None:
         return

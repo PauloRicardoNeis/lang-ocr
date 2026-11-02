@@ -1,11 +1,13 @@
 # JP catalog
 
-Minimal local foundation for cataloging Japanese vocabulary from game screenshots.
+Local foundation for cataloging vocabulary from game screenshots and text, in any language. The folder keeps its historical `JP` name; the catalog itself is polyglot (see "Multiple languages" below and `../polyglot-plan.md`).
 
 ## Files
 - `schema.sql`: SQLite schema.
 - `lang_jp.py`: CLI for sources, terms, and recurrence.
-- `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs.
+- `languages.py`: language registry, offline language detection, mixed-text splitting and per-language analyzers (Sudachi for Japanese, a generic tokenizer for word-delimited languages, jieba/pythainlp when installed).
+- `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs. Picks the OCR engines from the capture language set, merges their output and sorts every block per language.
+- `ocr_backends.py`: OCR engines (meikiocr, EasyOCR, manga-ocr), engine routing by language set, language-aware line filters and cross-engine block merging.
 - `requirements-capture.txt`: Python worker dependencies for the dedicated 3.12 environment.
 - `requirements-main.txt`: small helper dependencies for the main catalog environment.
 - `desktop_capture_daemon/`: Rust tray daemon for passive full-screen capture and job enqueueing.
@@ -46,31 +48,115 @@ python .\lang_jp.py sync-anki
 python .\lang_jp.py sync-anki-words
 python .\lang_jp.py generate-kanji-flashcards
 python .\lang_jp.py sync-anki-kanji
-python .\lang_jp.py export-anki-tsv --include-header
+python .\lang_jp.py export-anki-tsv
 python .\lang_jp.py rebuild-stats
 ```
 
-For a shorter Windows entry point, run `..\open_jp_catalog.cmd` from the repository root.
-For the passive-capture tray, run `..\open_jp_capture_tray.cmd` from the repository root. The launcher reuses an existing compiled daemon when available and otherwise builds `desktop_capture_daemon.exe` once before starting it.
-To follow the capture log live in a console window, run `..\open_jp_capture_logs.cmd` from the repository root.
+## Multiple languages
+Every source, segment, term, character and flashcard carries a `language_code`. Terms are keyed per language (`es::no::` and `en::no::` are different terms), each language gets its own Anki deck (`Lang::Japanese`, `Lang::Spanish`, ...), and the web UI and JSON API filter by language.
+
+```powershell
+# What languages are in the catalog
+python .\lang_jp.py list-languages
+
+# Detect and split text without saving anything
+python .\lang_jp.py detect-language --text "¡No puede ser! ¿Nos ha traicionado?" --runs
+python .\lang_jp.py analyze-text --text "안녕하세요 Press START" --candidates ko,en
+
+# Create a text source, split it into words per language and catalog the terms
+python .\lang_jp.py ingest-text --language auto --candidates es,en --title "Spanish RPG" --text "¡No puede ser! ¿Nos ha traicionado?"
+
+# Everything else accepts --language (auto, a code, or all for listings)
+python .\lang_jp.py add-source --source-type text --language-code auto --raw-text "Eu não sei o que fazer"
+python .\lang_jp.py link-term --source-id 12 --lemma traicionar --meaning-pt "trair" --language es
+python .\lang_jp.py list-terms --language es
+python .\lang_jp.py generate-flashcards --language es
+python .\lang_jp.py sync-anki --language es
+python .\lang_jp.py set-source-language --source-id 12 --language pt --reanalyze
+python .\lang_jp.py enable-language --code de --deck-name "Lang::Deutsch"
+```
+
+Detection is offline: script ranges decide CJK, Hangul, Cyrillic, Arabic, Hebrew, Greek, Thai and Devanagari; stop words and diacritics tell Latin-script languages apart. Mixed lines are split into script runs, so a Korean line with an English button label produces one Korean and one English segment. Pass `--candidates` to restrict detection to the languages you actually study.
+
+Japanese keeps JMdict meanings, Sudachi analysis, kanji and romaji. Other languages get lemmas from `simplemma` (installed by both requirement files; lower-cased surface as fallback), meanings from machine translation of the lemma into `LANG_JP_TERM_TRANSLATION_TARGET` (default `pt`), and, when the profile has readings, a Latin reading through the romanizer hook: pinyin for Chinese (`pypinyin`, optional), Revised Romanization for Korean and a transliteration table for Russian and Ukrainian (both built in). Chinese uses `jieba` when installed and falls back to character runs.
+
+### Passive capture in every language
+
+The passive capture catalogs every language that appears on screen; nothing is dropped only because of its language. Which languages are kept lives in the database (`languages.enabled` plus `languages.capture_enabled`), defaults to every built-in profile except the gloss language (`LANG_JP_TERM_TRANSLATION_TARGET`, `pt` by default: meanings are written in it, so its screens are not study material), and is edited from three places that all write the same flags:
+
+- the tray menu `Capture languages` (checkbox per language, `Capture every language`, `Capture Japanese only`);
+- the web page `/capture` (also lists the OCR plan, the capture profiles and the recent captures with their window titles);
+- the CLI: `set-capture-languages --codes ja,en,es,ko`, `set-capture-languages --all`, `enable-language --code de --capture` / `--no-capture`.
+
+The worker reads the set per job, so changes apply to the next capture without a restart. `LANG_CAPTURE_LANGUAGES` is no longer required; when set in the worker environment it overrides the database for that run.
+
+Latin-script lines are detected against every language, not only the captured ones, and the screen's Latin text as a whole sets a prior that decides short strings with no stop word ("Seguir", "Mostrar mais"). A Portuguese screen with Portuguese off is therefore rejected instead of being filed as Spanish or English. Non-Japanese lines read with OCR confidence below `LANG_JP_MIN_TERM_CONFIDENCE` (default 0.5) are kept as segments without candidates. The word tokenizer skips links, e-mail addresses, @handles, #hashtags, letters stuck to numbers (`21k`) and oddly cased tokens (`kStrear`, `YouTube`), and folds all-caps lines and all-caps words longer than five letters to lower case. Single letters that are not words in their language and Latin lemmas without a vowel (unless written in capitals) are blacklisted.
+
+OCR engines follow the set automatically (`LANG_JP_OCR_BACKEND=auto`, the default): `meikiocr` alone when only `ja` is enabled, otherwise `meikiocr` for the Japanese pass plus one EasyOCR reader per compatible language group (all Latin-script languages share one reader; `ko`, `zh`, `th`, Cyrillic, Arabic and Devanagari each get their own, paired with English when English is enabled). Readers are cached for the life of the worker, EasyOCR detection runs once per capture and later readers only re-read boxes nobody read confidently, and the blocks of every engine are merged by bounding-box overlap and text similarity. Greek and Hebrew have no EasyOCR model, so their text only enters through `ingest-text`. `LANG_JP_OCR_BACKEND=meikiocr` or `easyocr` still force the old single-engine flows.
+
+Capture profiles pin a window to a fixed language set: the daemon records the foreground window title and process name with every job (`capture_jobs.window_title`, `capture_jobs.process_name`, off with `record_foreground_window = false`), and a matching profile fixes the languages for that capture, skipping detection when it has a single language. Sources from the capture get the window title as title and the profile name as game.
+
+```powershell
+python .\lang_jp.py list-languages                       # includes capture_enabled and the effective capture set
+python .\lang_jp.py set-capture-languages --codes ja,en,es,ko
+python .\lang_jp.py add-capture-profile --name "Dragon Quest ES" --languages es,en --window-pattern "*dragon quest*"
+python .\lang_jp.py add-capture-profile --name "Korean VN" --languages ko --process-pattern "vn.exe"
+python .\lang_jp.py list-capture-profiles
+python .\lang_jp.py match-capture-profile --window-title "DRAGON QUEST XI - Steam"
+python .\lang_jp.py remove-capture-profile --name "Korean VN"
+python .\lang_jp.py list-sources --language all
+python .\lang_jp.py set-source-language --source-id 12 --language es --reanalyze --promote
+python .\lang_jp.py sync-anki --language all                # one Anki deck per language, lang_xx tags
+python .\lang_jp.py export-anki-tsv --language all
+```
+
+The web UI has a language bar on every page (`?lang=es`, `lang=all`), and other front ends can read:
+
+- `GET /api/languages` (with `capture_enabled` per language)
+- `GET /api/capture` (effective capture set, OCR plan, capture profiles)
+- `GET /api/terms?lang=es&q=&order=priority|recent|lemma&limit=&page=`
+- `GET /api/terms/{id}`
+- `GET /api/sources?lang=es&q=&limit=&page=`
+- `GET /api/flashcards?lang=es&status=pending&q=&limit=&page=`
+
+Searches (`q`) ignore case in every script (`água` finds `ÁGUA`, `привет` finds `ПРИВЕТ`) without folding accents, so kana, hangul and Devanagari match exactly.
+
+`lang=all` (or no `lang`) works on every page and every endpoint. The dashboard shows one card per language with counts and top terms; a source page lets you change the source language and re-run its analysis.
+
+### Anki across languages
+
+- **Decks.** Each card goes to its language's deck (`languages.deck_name`, default `Lang::<Name>`); characters share the word deck of their language (kanji in `Lang::Japanese`, hanzi in `Lang::Chinese`). `--deck-name` still forces one deck for everything.
+- **What `--language all` generates.** Every enabled language except the gloss language (`LANG_JP_TERM_TRANSLATION_TARGET`, `pt` by default), whose cards would show the same word on both sides. `generate-flashcards --language pt` still creates them on request. Existing cards are exported and synced whatever their language.
+- **Fields.** Readings appear only for languages that have them: kana plus romaji for Japanese, then `Pinyin` (zh), `Romanization` (ko) or `Transliteration` (ru, uk). Character cards exist only for languages with characters, and on/kun readings are Japanese-only. Term meanings are in the gloss language, kanji meanings stay in English. Non-Japanese fields carry `lang="xx" dir="auto"`, so Arabic and Hebrew render right to left and Han text picks the right font. Japanese fields are byte-identical to before.
+- **Tags.** Every note gets `lang_xx` (Japanese notes also keep `jp`). Older cards that only have `jp` get `lang_ja` on export and sync.
+- **Identity.** AnkiConnect notes are found by their stored note id, then by the `term_N` tag, then by front text in the deck. A front match never links a note tagged for another language. Japanese keeps Anki's collection-wide duplicate check; other languages check duplicates per deck, so `ser` (es) and `ser` (it) both get a note.
+- **TSV.** `export-anki-tsv` writes Anki 2.1.54+ file headers and the columns `Front, Back, Tags, Deck, Notetype, GUID`, so one import fills every language deck. Non-Japanese rows carry a deterministic GUID built from the language-scoped canonical key, so re-imports update them and same-spelling words never overwrite each other. Japanese rows leave the GUID empty and are matched on the first field, as before. `--format basic` writes the old `Front, Back, Tags` file. Use one path per language: a TSV import cannot match a non-Japanese note that `sync-anki` created (Anki gave it its own GUID), so the import would add a second copy.
+- **Sync state.** `export_status`, `exported_at` and `anki_note_id` live on each card, so `--mark-exported` and `sync-anki --language es` only advance that language. A single-language sync only reorders the new cards of that language's decks.
+
+Databases created before this change are upgraded in place on the next command: existing rows become `ja` and canonical keys gain the `ja::` prefix once.
+
+On Windows, the single entry point is `..\open_lang.cmd` from the repository root. It builds `desktop_capture_daemon.exe` when Cargo is available (otherwise it reuses an existing build), starts the tray daemon, and opens the catalog in the browser. If the daemon is already running, it only opens the catalog.
+
+The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-open-browser` on `web_port` (default 8766), restarts it with backoff if it exits, and stops it on Quit. If something else is already serving that port (for example a manual `browse`), the daemon reuses it instead of starting a second server. Web server output goes to `data/catalog_web.log`. Use `Open Lang` in the tray menu, or double-click the tray icon, to open the catalog. Only one daemon runs at a time; launching it again just opens the catalog. To follow the capture log live, use `Tail logs` in the tray menu.
 
 ## Passive capture workflow
 1. Prepare a dedicated Python 3.12 environment for the capture worker and install `requirements-capture.txt`.
-2. Start the Rust tray daemon with `..\open_jp_capture_tray.cmd` from the repository root, or run `cargo run` inside `desktop_capture_daemon` if you want to launch it manually from a shell.
+2. Start the Rust tray daemon with `..\open_lang.cmd` from the repository root, or run `cargo run` inside `desktop_capture_daemon` if you want to launch it manually from a shell.
 3. The daemon captures the primary monitor either on a fixed interval or in an `after source ready` cadence, dedupes recent frames, writes spool PNGs, and enqueues `capture_jobs`.
-4. The Python worker consumes those jobs, runs `EasyOCR` with horizontal-box filtering + Japanese draft analysis, and creates pending `sources`.
+4. The Python worker consumes those jobs, runs the OCR engines for the capture language set (meikiocr for Japanese, EasyOCR readers for the other languages), splits the text per language and creates pending `sources` whose segments and candidates carry their language.
 5. Review drafts with:
    - `python .\lang_jp.py review-sources`
    - `python .\lang_jp.py review-source --source-id N`
    - `python .\lang_jp.py approve-analysis --source-id N`
    - `python .\lang_jp.py ignore-source --source-id N`
 
-The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example`.
+The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example` (including `record_foreground_window`).
 
 The tray menu now exposes both capture cadences:
 - `Cadence: Fixed interval`: uses the selected capture interval as before.
 - `Cadence: After source ready`: waits until the current capture job finishes turning into a source before taking the next screenshot. This mode works best with `auto_start_worker = false` and `auto_process_jobs = true`.
 - `manual_capture_hotkey` in `desktop_capture_daemon\capture_daemon.toml`: binds a global shortcut to the same `Capture now` action in the tray. Example: `Ctrl+Shift+F8`.
+- `Capture languages`: a checkbox per registered language plus `Capture every language` and `Capture Japanese only`. The choice is stored in the database and shared with the web UI and the CLI.
 
 At the moment, the automatic worker is optimized for normal horizontal text in screenshots. It is not tuned for manga-style vertical text.
 
@@ -153,9 +239,9 @@ py -3.12 .\single_image_ocr.py `
 - `sync-anki` also repositions existing Anki new cards by the current score when AnkiConnect exposes the custom `repositionNewCards` action.
 - `sync-anki` creates decks on demand and keeps track of the linked Anki note id.
 - `sync-anki-words` regenerates vocabulary flashcards before syncing, so missing term cards are created and existing ones are refreshed in one step.
-- `generate-kanji-flashcards` and `sync-anki-kanji` now use the main `Lang::Japanese` deck so kanji and vocabulary share the same new-card queue.
+- `generate-kanji-flashcards` and `sync-anki-kanji` use the word deck of the character's language (`Lang::Japanese` for kanji), so kanji and vocabulary share the same new-card queue. Both accept `--language`.
 - `refresh-kanji-metadata` fetches canonical kanji meanings plus `on/kun` readings from `kanjiapi.dev`.
 - `sync-anki-kanji` regenerates kanji payloads before syncing, so the current score/order is what gets pushed to Anki.
 - The `/kanji` page includes a button that runs the same kanji sync flow without using the terminal.
-- `export-anki-tsv` writes UTF-8 with BOM for better Windows compatibility.
+- `export-anki-tsv` writes UTF-8 with BOM for better Windows compatibility (Anki skips the BOM before its file headers).
 - `browse` now defaults to port `8766` so it does not conflict with AnkiConnect on `8765`.

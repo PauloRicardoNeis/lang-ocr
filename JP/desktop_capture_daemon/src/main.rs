@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local};
@@ -22,6 +24,13 @@ use tokio::runtime::Runtime;
 use trayicon::{Icon, MenuBuilder, TrayIcon, TrayIconBuilder};
 use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
 use windows_capture::monitor::Monitor;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_BACK, VK_DELETE,
     VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
@@ -51,6 +60,11 @@ enum UserEvent {
     OpenLogs,
     TailLogs,
     ToggleDebug,
+    OpenCatalog,
+    OpenCaptureSettings,
+    ToggleCaptureLanguage(String),
+    CaptureAllLanguages,
+    CaptureJapaneseOnly,
     Quit,
     WorkerExited(WorkerLaunchMode),
 }
@@ -99,6 +113,13 @@ struct DaemonConfig {
     python_executable: String,
     python_args: Vec<String>,
     worker_script: PathBuf,
+    web_server_enabled: bool,
+    web_port: u16,
+    web_python_executable: Option<String>,
+    web_python_args: Option<Vec<String>>,
+    web_log_path: PathBuf,
+    #[serde(default = "default_true")]
+    record_foreground_window: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,6 +139,12 @@ struct DaemonConfigPatch {
     python_executable: Option<String>,
     python_args: Option<Vec<String>>,
     worker_script: Option<PathBuf>,
+    web_server_enabled: Option<bool>,
+    web_port: Option<u16>,
+    web_python_executable: Option<String>,
+    web_python_args: Option<Vec<String>>,
+    web_log_path: Option<PathBuf>,
+    record_foreground_window: Option<bool>,
 }
 
 fn jp_root() -> PathBuf {
@@ -155,6 +182,18 @@ fn repo_local_storage_path(path: &Path) -> String {
 impl Default for DaemonConfig {
     fn default() -> Self {
         let jp_root = jp_root();
+        // The OCR deps (meikiocr etc.) live in the repo's capture venv; the bare
+        // `py -3.12` interpreter usually lacks them, so prefer the venv when present.
+        let capture_venv_python = jp_root
+            .join("..")
+            .join(".venv-capture312")
+            .join("Scripts")
+            .join("python.exe");
+        let (python_executable, python_args) = if capture_venv_python.is_file() {
+            (capture_venv_python.to_string_lossy().into_owned(), Vec::new())
+        } else {
+            ("py".to_string(), vec!["-3.12".to_string()])
+        };
         Self {
             interval_seconds: 60,
             capture_after_source_ready: false,
@@ -168,9 +207,15 @@ impl Default for DaemonConfig {
             db_path: jp_root.join("data").join("lang_jp.sqlite3"),
             spool_dir: jp_root.join("data").join("capture_spool"),
             log_path: jp_root.join("data").join("capture_daemon.log"),
-            python_executable: "py".to_string(),
-            python_args: vec!["-3.12".to_string()],
+            python_executable,
+            python_args,
             worker_script: jp_root.join("capture_worker.py"),
+            web_server_enabled: true,
+            web_port: DEFAULT_WEB_PORT,
+            web_python_executable: None,
+            web_python_args: None,
+            web_log_path: jp_root.join("data").join("catalog_web.log"),
+            record_foreground_window: true,
         }
     }
 }
@@ -182,6 +227,13 @@ fn default_true() -> bool {
 fn default_ocr_max_side() -> u64 {
     1600
 }
+
+const DEFAULT_WEB_PORT: u16 = 8766;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const WEB_SERVER_HEALTHY_RUN: Duration = Duration::from_secs(30);
+const CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const INSTANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\LangJpDesktopCaptureDaemon";
 
 impl DaemonConfig {
     fn from_toml(raw: &str) -> Result<Self> {
@@ -235,7 +287,33 @@ impl DaemonConfig {
         if let Some(value) = patch.worker_script {
             self.worker_script = resolve_jp_config_path(value);
         }
+        if let Some(value) = patch.web_server_enabled {
+            self.web_server_enabled = value;
+        }
+        if let Some(value) = patch.web_port {
+            self.web_port = value;
+        }
+        if let Some(value) = patch.web_python_executable {
+            self.web_python_executable = Some(resolve_jp_command_path(value));
+        }
+        if let Some(value) = patch.web_python_args {
+            self.web_python_args = Some(value);
+        }
+        if let Some(value) = patch.web_log_path {
+            self.web_log_path = resolve_jp_config_path(value);
+        }
+        if let Some(value) = patch.record_foreground_window {
+            self.record_foreground_window = value;
+        }
         self
+    }
+
+    fn capture_settings_url(&self) -> String {
+        format!("{}capture", self.catalog_url())
+    }
+
+    fn catalog_url(&self) -> String {
+        format!("http://127.0.0.1:{}/", self.web_port)
     }
 
     fn load() -> Self {
@@ -442,6 +520,8 @@ struct Controller {
     stop_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
     debug_flag: Arc<AtomicBool>,
+    web_child: Arc<Mutex<Option<Child>>>,
+    web_stop_flag: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -469,6 +549,8 @@ impl Controller {
             stop_flag: Arc::new(AtomicBool::new(false)),
             pause_flag: Arc::new(AtomicBool::new(false)),
             debug_flag: Arc::new(AtomicBool::new(false)),
+            web_child: Arc::new(Mutex::new(None)),
+            web_stop_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -747,6 +829,153 @@ impl Controller {
         self.append_log("capture service stopped");
     }
 
+    fn shutdown(&self) {
+        self.stop();
+        self.stop_web_server();
+    }
+
+    fn open_catalog(&self) {
+        let config = self.config.clone();
+        std::thread::spawn(move || open_catalog_when_ready(&config));
+    }
+
+    fn open_capture_settings(&self) {
+        let config = self.config.clone();
+        std::thread::spawn(move || open_url_when_ready(&config, &config.capture_settings_url()));
+    }
+
+    /// Flips one language's capture flag in the database (the worker reads it per job).
+    fn toggle_capture_language(&self, code: &str) {
+        let current = load_capture_languages(&self.config.db_path)
+            .into_iter()
+            .find(|language| language.code == code)
+            .map(|language| language.capture_enabled)
+            .unwrap_or(false);
+        match set_capture_language(&self.config.db_path, code, !current) {
+            Ok(()) => self.append_log(&format!(
+                "capture language {code} {}",
+                if current { "disabled" } else { "enabled" }
+            )),
+            Err(error) => self.append_log(&format!("failed to update capture language {code}: {error:#}")),
+        }
+    }
+
+    fn set_capture_preset(&self, japanese_only: bool) {
+        match set_capture_languages_preset(&self.config.db_path, japanese_only) {
+            Ok(()) => self.append_log(if japanese_only {
+                "capture languages set to Japanese only"
+            } else {
+                "capture languages set to every registered language"
+            }),
+            Err(error) => self.append_log(&format!("failed to update capture languages: {error:#}")),
+        }
+    }
+
+    fn spawn_web_server_supervisor(&self) {
+        if !self.config.web_server_enabled {
+            self.append_log("catalog web server supervision disabled by config");
+            return;
+        }
+        let config = self.config.clone();
+        let child_slot = Arc::clone(&self.web_child);
+        let stop_flag = Arc::clone(&self.web_stop_flag);
+        std::thread::spawn(move || {
+            let mut consecutive_failures: u32 = 0;
+            let mut started_at: Option<Instant> = None;
+            let mut next_attempt_at = Instant::now();
+            let mut port_busy_logged = false;
+            loop {
+                {
+                    // Checked under the lock so shutdown can never race a respawn.
+                    let mut guard = child_slot.lock().unwrap();
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(child) = guard.as_mut() {
+                        let exit_status = match child.try_wait() {
+                            Ok(None) => None,
+                            Ok(Some(status)) => Some(status.to_string()),
+                            Err(error) => Some(format!("unknown ({error})")),
+                        };
+                        if let Some(status) = exit_status {
+                            *guard = None;
+                            let ran_for = started_at.take().map(|at| at.elapsed()).unwrap_or_default();
+                            if ran_for >= WEB_SERVER_HEALTHY_RUN {
+                                consecutive_failures = 0;
+                            }
+                            consecutive_failures += 1;
+                            let delay = web_server_restart_delay(consecutive_failures);
+                            next_attempt_at = Instant::now() + delay;
+                            append_log_file(
+                                &config.log_path,
+                                &format!(
+                                    "catalog web server exited status={status} after {}s; restarting in {}s",
+                                    ran_for.as_secs(),
+                                    delay.as_secs()
+                                ),
+                            );
+                        }
+                    }
+                    if guard.is_none() && Instant::now() >= next_attempt_at {
+                        if local_port_accepts_connections(config.web_port) {
+                            if !port_busy_logged {
+                                append_log_file(
+                                    &config.log_path,
+                                    &format!(
+                                        "catalog web server not started because port {} is already in use; reusing whatever serves it",
+                                        config.web_port
+                                    ),
+                                );
+                                port_busy_logged = true;
+                            }
+                        } else {
+                            port_busy_logged = false;
+                            match spawn_web_server_process(&config) {
+                                Ok(child) => {
+                                    append_log_file(
+                                        &config.log_path,
+                                        &format!(
+                                            "spawned catalog web server pid={} url={}",
+                                            child.id(),
+                                            config.catalog_url()
+                                        ),
+                                    );
+                                    *guard = Some(child);
+                                    started_at = Some(Instant::now());
+                                }
+                                Err(error) => {
+                                    consecutive_failures += 1;
+                                    let delay = web_server_restart_delay(consecutive_failures);
+                                    next_attempt_at = Instant::now() + delay;
+                                    append_log_file(
+                                        &config.log_path,
+                                        &format!(
+                                            "failed to spawn catalog web server: {error:#}; retrying in {}s",
+                                            delay.as_secs()
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    fn stop_web_server(&self) {
+        let child = {
+            let mut guard = self.web_child.lock().unwrap();
+            self.web_stop_flag.store(true, Ordering::Relaxed);
+            guard.take()
+        };
+        if let Some(mut child) = child {
+            kill_process_tree(&mut child);
+            self.append_log("catalog web server stopped");
+        }
+    }
+
     fn open_logs(&self) {
         let log_path = self.config.log_path.clone();
         let _ = Command::new("cmd")
@@ -797,6 +1026,16 @@ impl Controller {
         });
         if self.debug_enabled() {
             command.env("LANG_JP_CAPTURE_DEBUG", "1");
+        }
+        // Send worker tracebacks to the daemon log; otherwise a crash only shows up
+        // as "exited ... exit code: 1" with no reason.
+        command.env("PYTHONIOENCODING", "utf-8");
+        if let Ok(log_file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.config.log_path)
+        {
+            command.stderr(log_file);
         }
 
         match command.spawn() {
@@ -886,6 +1125,7 @@ impl Controller {
     fn restart_app(&self) -> Result<()> {
         let current_exe = std::env::current_exe().context("failed to locate current executable")?;
         Command::new(&current_exe)
+            .arg("--wait-for-instance")
             .spawn()
             .with_context(|| format!("failed to relaunch {}", current_exe.display()))?;
         self.append_log(&format!(
@@ -1062,19 +1302,34 @@ impl Controller {
                             );
                         }
 
+                        // The foreground window at capture time: capture profiles
+                        // match on it, and the source gets the title.
+                        let foreground = if config.record_foreground_window {
+                            foreground_window_info()
+                        } else {
+                            ForegroundWindowInfo::default()
+                        };
+
                         match enqueue_capture_job(
                             &config.db_path,
                             &temp_path,
                             &sha256,
                             &phash,
+                            &foreground,
                         ) {
                             Ok(job_id) => {
                                 append_log_file(
                                     &log_path,
                                     &format!(
-                                        "queue job={job_id} image={} sha={}",
+                                        "queue job={job_id} image={} sha={} window={} process={}",
                                         short_path(&temp_path),
                                         short_hash(&sha256),
+                                        foreground
+                                            .title
+                                            .as_deref()
+                                            .map(|value| format!("{value:?}"))
+                                            .unwrap_or_else(|| "-".to_string()),
+                                        foreground.process_name.as_deref().unwrap_or("-"),
                                     ),
                                 );
                                 recent.push_back(CaptureFingerprint { sha256, phash });
@@ -1210,6 +1465,155 @@ struct App {
     tray_icon: TrayIcon<UserEvent>,
     controller: Arc<Controller>,
     proxy: EventLoopProxy<UserEvent>,
+    menu_languages: Vec<CaptureLanguage>,
+    tick_count: u64,
+}
+
+const MENU_REFRESH_TICKS: u64 = 5;
+
+/// One row of the `languages` table as the tray needs it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CaptureLanguage {
+    code: String,
+    name: String,
+    enabled: bool,
+    capture_enabled: bool,
+}
+
+/// Title and process of the window that had focus when a frame was captured.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ForegroundWindowInfo {
+    title: Option<String>,
+    process_name: Option<String>,
+}
+
+fn foreground_window_info() -> ForegroundWindowInfo {
+    // SAFETY: plain Win32 queries on the current foreground window; buffers are
+    // sized up front and every handle we open is closed before returning.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return ForegroundWindowInfo::default();
+        }
+        let mut title_buffer = [0u16; 512];
+        let length = GetWindowTextW(hwnd, title_buffer.as_mut_ptr(), title_buffer.len() as i32);
+        let title = if length > 0 {
+            Some(String::from_utf16_lossy(&title_buffer[..length as usize]))
+        } else {
+            None
+        };
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let mut process_name = None;
+        if pid != 0 {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !handle.is_null() {
+                let mut path_buffer = [0u16; 1024];
+                let mut size: u32 = path_buffer.len() as u32;
+                if QueryFullProcessImageNameW(handle, 0, path_buffer.as_mut_ptr(), &mut size) != 0
+                    && size > 0
+                {
+                    let full_path = String::from_utf16_lossy(&path_buffer[..size as usize]);
+                    process_name = process_name_from_path(&full_path);
+                }
+                CloseHandle(handle);
+            }
+        }
+        ForegroundWindowInfo {
+            title: title.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()),
+            process_name,
+        }
+    }
+}
+
+fn process_name_from_path(full_path: &str) -> Option<String> {
+    let name = full_path
+        .rsplit(['\\', '/'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(name.to_string())
+}
+
+fn load_capture_languages(db_path: &Path) -> Vec<CaptureLanguage> {
+    let Ok(connection) = open_db(db_path) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) = connection.prepare(
+        "SELECT code, name, enabled, capture_enabled
+         FROM languages
+         ORDER BY sort_order ASC, name COLLATE NOCASE ASC",
+    ) else {
+        // The column appears once the Python side upgrades the schema; until then
+        // the menu simply has no languages to show.
+        return Vec::new();
+    };
+    let rows = statement.query_map([], |row| {
+        Ok(CaptureLanguage {
+            code: row.get::<_, String>(0)?,
+            name: row.get::<_, String>(1)?,
+            enabled: row.get::<_, i64>(2)? != 0,
+            capture_enabled: row.get::<_, i64>(3)? != 0,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn set_capture_language(db_path: &Path, code: &str, enabled: bool) -> Result<()> {
+    let connection = open_db(db_path)?;
+    let changed = connection.execute(
+        "UPDATE languages
+         SET capture_enabled = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE code = ?2",
+        params![if enabled { 1 } else { 0 }, code],
+    )?;
+    if changed == 0 {
+        return Err(anyhow!("language {code} is not registered"));
+    }
+    Ok(())
+}
+
+fn set_capture_languages_preset(db_path: &Path, japanese_only: bool) -> Result<()> {
+    let connection = open_db(db_path)?;
+    if japanese_only {
+        connection.execute(
+            "UPDATE languages
+             SET capture_enabled = CASE WHEN code = 'ja' THEN 1 ELSE 0 END,
+                 updated_at = CURRENT_TIMESTAMP",
+            [],
+        )?;
+    } else {
+        connection.execute(
+            "UPDATE languages SET capture_enabled = 1, updated_at = CURRENT_TIMESTAMP",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn capture_languages_menu(languages: &[CaptureLanguage]) -> MenuBuilder<UserEvent> {
+    let mut menu = MenuBuilder::new()
+        .item("Open capture settings (web)", UserEvent::OpenCaptureSettings)
+        .item("Capture every language", UserEvent::CaptureAllLanguages)
+        .item("Capture Japanese only", UserEvent::CaptureJapaneseOnly)
+        .separator();
+    if languages.is_empty() {
+        menu = menu.item("(no languages registered yet)", UserEvent::OpenCaptureSettings);
+    }
+    for language in languages {
+        if !language.enabled {
+            continue;
+        }
+        menu = menu.checkable(
+            &format!("{} ({})", language.name, language.code),
+            language.capture_enabled,
+            UserEvent::ToggleCaptureLanguage(language.code.clone()),
+        );
+    }
+    menu
 }
 
 fn capture_now_menu_label(config: &DaemonConfig) -> String {
@@ -1225,8 +1629,32 @@ fn capture_now_menu_label(config: &DaemonConfig) -> String {
 }
 
 impl App {
+    /// Rebuilds the tray menu when the capture languages in the database changed
+    /// (or always, right after a toggle from the menu itself).
+    fn refresh_menu(&mut self, force: bool) {
+        let languages = load_capture_languages(&self.controller.config.db_path);
+        if !force && languages == self.menu_languages {
+            return;
+        }
+        self.menu_languages = languages;
+        let menu = build_tray_menu(&self.controller.config, &self.menu_languages);
+        if let Err(error) = self.tray_icon.set_menu(&menu) {
+            self.controller
+                .append_log(&format!("failed to refresh tray menu: {error:?}"));
+        }
+    }
+
     fn refresh_tooltip(&mut self) {
-        let tooltip = format!("Lang JP Capture: {}", self.controller.tooltip_details());
+        let captured = self
+            .menu_languages
+            .iter()
+            .filter(|language| language.enabled && language.capture_enabled)
+            .count();
+        let tooltip = format!(
+            "Lang Capture: {} | languages {}",
+            self.controller.tooltip_details(),
+            if captured == 0 { "none".to_string() } else { captured.to_string() }
+        );
         let decorated = if self.controller.debug_enabled() {
             format!("{tooltip} [debug]")
         } else {
@@ -1265,19 +1693,39 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::AutoProcessNextJob => self.controller.auto_process_next_job(),
             UserEvent::RestartApp => match self.controller.restart_app() {
                 Ok(()) => {
-                    self.controller.stop();
+                    self.controller.shutdown();
                     event_loop.exit();
                 }
                 Err(error) => self
                     .controller
                     .append_log(&format!("failed to restart app: {error}")),
             },
-            UserEvent::TooltipTick => {}
+            UserEvent::TooltipTick => {
+                // The web UI and the CLI change the capture set too; pick those up.
+                self.tick_count = self.tick_count.wrapping_add(1);
+                if self.tick_count % MENU_REFRESH_TICKS == 0 {
+                    self.refresh_menu(false);
+                }
+            }
             UserEvent::OpenLogs => self.controller.open_logs(),
             UserEvent::TailLogs => self.controller.tail_logs(),
             UserEvent::ToggleDebug => self.controller.toggle_debug(),
+            UserEvent::OpenCatalog => self.controller.open_catalog(),
+            UserEvent::OpenCaptureSettings => self.controller.open_capture_settings(),
+            UserEvent::ToggleCaptureLanguage(code) => {
+                self.controller.toggle_capture_language(&code);
+                self.refresh_menu(true);
+            }
+            UserEvent::CaptureAllLanguages => {
+                self.controller.set_capture_preset(false);
+                self.refresh_menu(true);
+            }
+            UserEvent::CaptureJapaneseOnly => {
+                self.controller.set_capture_preset(true);
+                self.refresh_menu(true);
+            }
             UserEvent::Quit => {
-                self.controller.stop();
+                self.controller.shutdown();
                 event_loop.exit();
             }
             UserEvent::WorkerExited(mode) => match mode {
@@ -1296,15 +1744,60 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         if let WindowEvent::CloseRequested = event {
-            self.controller.stop();
+            self.controller.shutdown();
             event_loop.exit();
         }
     }
 }
 
+fn build_tray_menu(config: &DaemonConfig, languages: &[CaptureLanguage]) -> MenuBuilder<UserEvent> {
+    MenuBuilder::new()
+        .item("Open Lang", UserEvent::OpenCatalog)
+        .submenu("Capture languages", capture_languages_menu(languages))
+        .separator()
+        .item("Start", UserEvent::Start)
+        .item("Pause", UserEvent::Pause)
+        .item("Resume", UserEvent::Resume)
+        .item(&capture_now_menu_label(config), UserEvent::CaptureNow)
+        .separator()
+        .item(
+            "Cadence: Fixed interval",
+            UserEvent::SetCadenceFixedInterval,
+        )
+        .item(
+            "Cadence: After source ready",
+            UserEvent::SetCadenceAfterSourceReady,
+        )
+        .separator()
+        .item("Capture interval: 5s", UserEvent::SetInterval(5))
+        .item("Capture interval: 15s", UserEvent::SetInterval(15))
+        .item("Capture interval: 30s", UserEvent::SetInterval(30))
+        .item("Capture interval: 60s", UserEvent::SetInterval(60))
+        .item("Capture interval: 120s", UserEvent::SetInterval(120))
+        .separator()
+        .item("OCR size: Original (4K)", UserEvent::SetOcrMaxSide(0))
+        .item("OCR size: 1600px", UserEvent::SetOcrMaxSide(1600))
+        .item("OCR size: 1920px", UserEvent::SetOcrMaxSide(1920))
+        .item("OCR size: 2560px", UserEvent::SetOcrMaxSide(2560))
+        .separator()
+        .item("Process next OCR job", UserEvent::ProcessNextJob)
+        .item(
+            "Process all pending OCR jobs",
+            UserEvent::ProcessPendingQueue,
+        )
+        .item("Restart app", UserEvent::RestartApp)
+        .separator()
+        .item("Open logs", UserEvent::OpenLogs)
+        .item("Tail logs", UserEvent::TailLogs)
+        .item("Toggle debug mode", UserEvent::ToggleDebug)
+        .separator()
+        .item("Quit", UserEvent::Quit)
+}
+
 fn build_tray_icon(
     proxy: EventLoopProxy<UserEvent>,
     config: &DaemonConfig,
+    languages: &[CaptureLanguage],
 ) -> Result<TrayIcon<UserEvent>> {
     let icon = Icon::from_buffer(build_tray_icon_ico(), Some(16), Some(16))
         .map_err(|error| anyhow!("failed to create tray icon: {error}"))?;
@@ -1313,47 +1806,9 @@ fn build_tray_icon(
             let _ = proxy.send_event(event.clone());
         })
         .icon(icon)
-        .tooltip("Lang JP Capture")
-        .menu(
-            MenuBuilder::new()
-                .item("Start", UserEvent::Start)
-                .item("Pause", UserEvent::Pause)
-                .item("Resume", UserEvent::Resume)
-                .item(&capture_now_menu_label(config), UserEvent::CaptureNow)
-                .separator()
-                .item(
-                    "Cadence: Fixed interval",
-                    UserEvent::SetCadenceFixedInterval,
-                )
-                .item(
-                    "Cadence: After source ready",
-                    UserEvent::SetCadenceAfterSourceReady,
-                )
-                .separator()
-                .item("Capture interval: 5s", UserEvent::SetInterval(5))
-                .item("Capture interval: 15s", UserEvent::SetInterval(15))
-                .item("Capture interval: 30s", UserEvent::SetInterval(30))
-                .item("Capture interval: 60s", UserEvent::SetInterval(60))
-                .item("Capture interval: 120s", UserEvent::SetInterval(120))
-                .separator()
-                .item("OCR size: Original (4K)", UserEvent::SetOcrMaxSide(0))
-                .item("OCR size: 1600px", UserEvent::SetOcrMaxSide(1600))
-                .item("OCR size: 1920px", UserEvent::SetOcrMaxSide(1920))
-                .item("OCR size: 2560px", UserEvent::SetOcrMaxSide(2560))
-                .separator()
-                .item("Process next OCR job", UserEvent::ProcessNextJob)
-                .item(
-                    "Process all pending OCR jobs",
-                    UserEvent::ProcessPendingQueue,
-                )
-                .item("Restart app", UserEvent::RestartApp)
-                .separator()
-                .item("Open logs", UserEvent::OpenLogs)
-                .item("Tail logs", UserEvent::TailLogs)
-                .item("Toggle debug mode", UserEvent::ToggleDebug)
-                .separator()
-                .item("Quit", UserEvent::Quit),
-        )
+        .tooltip("Lang Capture")
+        .on_double_click(UserEvent::OpenCatalog)
+        .menu(build_tray_menu(config, languages))
         .build()
         .map_err(|error| anyhow!("failed to build tray icon: {error}"))?;
     Ok(tray_icon)
@@ -1426,13 +1881,37 @@ fn open_db(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+/// Adds the window metadata columns on databases the Python side has not upgraded yet.
+fn ensure_capture_job_window_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(capture_jobs)")?;
+    let columns: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .collect();
+    for (name, column_type) in [
+        ("window_title", "TEXT"),
+        ("process_name", "TEXT"),
+        ("capture_profile_id", "INTEGER"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            connection.execute(
+                &format!("ALTER TABLE capture_jobs ADD COLUMN {name} {column_type}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn enqueue_capture_job(
     db_path: &Path,
     temp_path: &Path,
     sha256: &str,
     phash: &ImageHash,
+    foreground: &ForegroundWindowInfo,
 ) -> Result<i64> {
     let connection = open_db(db_path)?;
+    ensure_capture_job_window_columns(&connection)?;
     let now: DateTime<Local> = Local::now();
     let temp_image_path = repo_local_storage_path(temp_path);
     connection.execute(
@@ -1442,15 +1921,19 @@ fn enqueue_capture_job(
             status,
             temp_image_path,
             image_sha256,
-            image_phash
+            image_phash,
+            window_title,
+            process_name
         )
-        VALUES (?1, 'pending', ?2, ?3, ?4)
+        VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6)
         ",
         params![
             now.to_rfc3339(),
             temp_image_path,
             sha256,
             phash.to_base64(),
+            foreground.title.as_deref(),
+            foreground.process_name.as_deref(),
         ],
     )?;
     Ok(connection.last_insert_rowid())
@@ -1705,10 +2188,169 @@ fn append_log_file(path: &Path, message: &str) {
     }
 }
 
+fn web_server_restart_delay(consecutive_failures: u32) -> Duration {
+    Duration::from_secs((1u64 << consecutive_failures.min(6)).min(60))
+}
+
+fn local_port_accepts_connections(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+fn spawn_web_server_process(config: &DaemonConfig) -> Result<Child> {
+    let python_executable = config
+        .web_python_executable
+        .as_ref()
+        .unwrap_or(&config.python_executable);
+    let python_args = config.web_python_args.as_ref().unwrap_or(&config.python_args);
+    if let Some(parent) = config.web_log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.web_log_path)
+        .with_context(|| format!("failed to open {}", config.web_log_path.display()))?;
+    let stderr_file = log_file.try_clone()?;
+    let mut command = Command::new(python_executable);
+    command
+        .args(python_args)
+        .arg(jp_root().join("lang_jp.py"))
+        .arg("--db")
+        .arg(&config.db_path)
+        .args(["browse", "--host", "127.0.0.1", "--port"])
+        .arg(config.web_port.to_string())
+        .arg("--no-open-browser")
+        .current_dir(jp_root())
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(Stdio::null())
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .creation_flags(CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .with_context(|| format!("failed to launch {python_executable}"))
+}
+
+/// Kills the whole tree: the `py` and venv launchers run the real interpreter as a child.
+fn kill_process_tree(child: &mut Child) {
+    let killed = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !killed {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn open_catalog_when_ready(config: &DaemonConfig) {
+    open_url_when_ready(config, &config.catalog_url());
+}
+
+fn open_url_when_ready(config: &DaemonConfig, url: &str) {
+    let deadline = Instant::now() + CATALOG_READY_TIMEOUT;
+    while !local_port_accepts_connections(config.web_port) {
+        if Instant::now() >= deadline {
+            append_log_file(
+                &config.log_path,
+                &format!("catalog web server did not answer on {url} in time; opening it anyway"),
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+struct SingleInstanceGuard(HANDLE);
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+fn try_acquire_single_instance() -> Option<SingleInstanceGuard> {
+    let name: Vec<u16> = SINGLE_INSTANCE_MUTEX_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        // A null handle means we cannot tell; prefer running over silently doing nothing.
+        if !handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(handle);
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+}
+
+fn acquire_single_instance(wait: bool) -> Option<SingleInstanceGuard> {
+    let deadline = Instant::now() + INSTANCE_WAIT_TIMEOUT;
+    loop {
+        if let Some(guard) = try_acquire_single_instance() {
+            return Some(guard);
+        }
+        if !wait || Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct LaunchOptions {
+    open_catalog: bool,
+    wait_for_instance: bool,
+}
+
+impl LaunchOptions {
+    fn from_args(args: impl IntoIterator<Item = String>) -> Self {
+        let mut options = Self::default();
+        for arg in args {
+            match arg.as_str() {
+                "--open-catalog" => options.open_catalog = true,
+                "--wait-for-instance" => options.wait_for_instance = true,
+                _ => {}
+            }
+        }
+        options
+    }
+}
+
 fn main() -> Result<()> {
+    let options = LaunchOptions::from_args(std::env::args().skip(1));
     let config = DaemonConfig::load();
+    let Some(_instance) = acquire_single_instance(options.wait_for_instance) else {
+        // Another daemon already owns the tray and the web server; just forward the request.
+        if options.open_catalog {
+            open_catalog_when_ready(&config);
+        }
+        return Ok(());
+    };
     let tray_config = config.clone();
     let controller = Arc::new(Controller::new(config)?);
+    controller.spawn_web_server_supervisor();
+    if options.open_catalog {
+        controller.open_catalog();
+    }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     spawn_manual_capture_hotkey_listener(&tray_config, proxy.clone());
@@ -1721,12 +2363,15 @@ fn main() -> Result<()> {
             }
         });
     }
-    let tray_icon = build_tray_icon(proxy.clone(), &tray_config)?;
+    let menu_languages = load_capture_languages(&tray_config.db_path);
+    let tray_icon = build_tray_icon(proxy.clone(), &tray_config, &menu_languages)?;
     let mut app = App {
         window: None,
         tray_icon,
         controller,
         proxy,
+        menu_languages,
+        tick_count: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -1801,5 +2446,152 @@ interval_seconds = 15
         assert_eq!(config.interval_seconds, 15);
         assert_eq!(config.ocr_max_side, default_ocr_max_side());
         assert_eq!(config.dedupe_window, 12);
+        assert!(config.web_server_enabled);
+        assert_eq!(config.web_port, DEFAULT_WEB_PORT);
+        assert_eq!(config.web_python_executable, None);
+    }
+
+    #[test]
+    fn daemon_config_from_toml_reads_web_server_overrides() {
+        let config = DaemonConfig::from_toml(
+            r#"
+web_server_enabled = false
+web_port = 9000
+web_python_executable = "../.venv/Scripts/python.exe"
+web_python_args = []
+web_log_path = "data/web.log"
+"#,
+        )
+        .expect("web server config should parse");
+
+        assert!(!config.web_server_enabled);
+        assert_eq!(config.web_port, 9000);
+        assert_eq!(config.catalog_url(), "http://127.0.0.1:9000/");
+        assert_eq!(
+            config.web_python_executable,
+            Some(
+                jp_root()
+                    .join("../.venv/Scripts/python.exe")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert_eq!(config.web_python_args, Some(Vec::new()));
+        assert_eq!(config.web_log_path, jp_root().join("data/web.log"));
+    }
+
+    #[test]
+    fn daemon_config_reads_foreground_window_flag() {
+        let config = DaemonConfig::from_toml("record_foreground_window = false")
+            .expect("flag should parse");
+        assert!(!config.record_foreground_window);
+        assert!(DaemonConfig::default().record_foreground_window);
+        assert_eq!(config.capture_settings_url(), "http://127.0.0.1:8766/capture");
+    }
+
+    #[test]
+    fn process_name_is_the_last_path_component() {
+        assert_eq!(
+            process_name_from_path(r"C:\Games\DQ11\DQXI.exe"),
+            Some("DQXI.exe".to_string())
+        );
+        assert_eq!(process_name_from_path("game/bin/vn.exe"), Some("vn.exe".to_string()));
+        assert_eq!(process_name_from_path(""), None);
+    }
+
+    #[test]
+    fn capture_languages_menu_lists_enabled_languages_as_checkboxes() {
+        let languages = vec![
+            CaptureLanguage {
+                code: "ja".into(),
+                name: "Japanese".into(),
+                enabled: true,
+                capture_enabled: true,
+            },
+            CaptureLanguage {
+                code: "es".into(),
+                name: "Spanish".into(),
+                enabled: false,
+                capture_enabled: true,
+            },
+        ];
+        let menu = capture_languages_menu(&languages);
+        let rendered = format!("{menu:?}");
+        assert!(rendered.contains("Japanese (ja)"));
+        assert!(!rendered.contains("Spanish (es)"));
+    }
+
+    #[test]
+    fn enqueue_adds_window_columns_and_stores_foreground_metadata() {
+        let dir = std::env::temp_dir().join(format!("lang-daemon-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let db_path = dir.join("jobs.sqlite3");
+        let _ = fs::remove_file(&db_path);
+        {
+            let connection = open_db(&db_path).expect("open db");
+            connection
+                .execute_batch(
+                    "CREATE TABLE capture_jobs (
+                        id INTEGER PRIMARY KEY,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        captured_at TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        temp_image_path TEXT,
+                        image_sha256 TEXT,
+                        image_phash TEXT
+                    );",
+                )
+                .expect("legacy table");
+        }
+        let foreground = ForegroundWindowInfo {
+            title: Some("DRAGON QUEST XI".to_string()),
+            process_name: Some("DQXI.exe".to_string()),
+        };
+        let job_id = enqueue_capture_job(
+            &db_path,
+            &dir.join("frame.png"),
+            "abc",
+            &sample_hash(1),
+            &foreground,
+        )
+        .expect("enqueue");
+        let connection = open_db(&db_path).expect("open db");
+        let (title, process): (String, String) = connection
+            .query_row(
+                "SELECT window_title, process_name FROM capture_jobs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(title, "DRAGON QUEST XI");
+        assert_eq!(process, "DQXI.exe");
+        drop(connection);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_server_restart_delay_backs_off_and_caps() {
+        assert_eq!(web_server_restart_delay(1), Duration::from_secs(2));
+        assert_eq!(web_server_restart_delay(2), Duration::from_secs(4));
+        assert_eq!(web_server_restart_delay(5), Duration::from_secs(32));
+        assert_eq!(web_server_restart_delay(6), Duration::from_secs(60));
+        assert_eq!(web_server_restart_delay(40), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn launch_options_parse_known_flags_and_ignore_others() {
+        let options = LaunchOptions::from_args(
+            ["--open-catalog", "--unknown", "--wait-for-instance"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(
+            options,
+            LaunchOptions {
+                open_catalog: true,
+                wait_for_instance: true,
+            }
+        );
+        assert_eq!(LaunchOptions::from_args(Vec::new()), LaunchOptions::default());
     }
 }

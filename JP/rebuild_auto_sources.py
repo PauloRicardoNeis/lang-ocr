@@ -331,8 +331,7 @@ def rebuild_source(
         segments, _ = store_source_analysis(
             connection,
             source_id=source_id,
-            blocks=blocks,
-            analyzer=analyzer,
+            analyzed_blocks=[analyzer.analyze_block(connection, block) for block in blocks],
         )
         promoted_terms, _ = auto_promote_source_terms(connection, source_id)
         if promoted_terms == 0:
@@ -586,7 +585,7 @@ def main() -> None:
         outcomes: list[SourceOutcome] = []
         if rows:
             ocr = MeikiOcrAdapter()
-            analyzer = SudachiAnalyzer()
+            analyzer = SudachiAnalyzer(("ja",))
             run_started_at = time.perf_counter()
             for index, row in enumerate(rows, start=1):
                 try:

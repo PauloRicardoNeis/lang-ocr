@@ -1,26 +1,30 @@
 # Lang
 
-Projeto local para capturar, catalogar e estudar vocabulario japones a partir de screenshots, texto e revisao manual, com foco atual no modulo `JP/`.
+Projeto local para capturar, catalogar e estudar vocabulario em qualquer idioma a partir de screenshots, texto e revisao manual. O modulo `JP/` mantem o nome historico, mas o catalogo e poliglota: cada fonte, segmento, termo e card sabe a que idioma pertence, e o mesmo banco guarda japones, espanhol, ingles ou qualquer outro idioma ao mesmo tempo.
 
 ## O que o projeto faz
 
-Hoje este repositorio e, na pratica, uma base de estudo de japones orientada por fontes reais de uso. O fluxo principal e:
+Este repositorio e uma base de estudo de idiomas orientada por fontes reais de uso. O fluxo principal e:
 
-1. Registrar uma fonte bruta, normalmente um screenshot de jogo ou interface.
+1. Registrar uma fonte bruta, normalmente um screenshot de jogo ou interface, ou um texto.
 2. Preservar essa fonte no SQLite como verdade primaria, com imagem, texto bruto e contexto.
-3. Extrair ou revisar segmentos de texto japones.
-4. Ligar termos canonicos e kanji a essa fonte revisada.
+3. Detectar o idioma, separar texto misto por idioma e extrair ou revisar segmentos.
+4. Ligar termos canonicos (e kanji, quando o idioma tem caracteres) a essa fonte revisada.
 5. Calcular recorrencia e prioridade de estudo com base no que reaparece em fontes diferentes.
-6. Gerar e sincronizar flashcards com Anki.
+6. Gerar e sincronizar flashcards com Anki, um deck por idioma.
+
+O plano, os requisitos e a lista de pendencias da versao poliglota estao em `polyglot-plan.md`; os comandos estao em `JP/README.md` (secao "Multiple languages").
 
 O projeto nao e apenas um OCR nem apenas um gerador de flashcards. Ele funciona como um catalogo local de aprendizado, onde a imagem e a fonte bruta, o OCR gera rascunhos, e a canonizacao continua assistida por revisao humana.
 
 ## Componentes principais
 
 - `JP/lang_jp.py`: CLI principal para inicializar banco, registrar fontes, ligar termos, revisar analises, recalcular estatisticas e gerar/sincronizar flashcards.
-- `JP/lang_jp_web.py`: interface web local para navegar por termos, kanji, fontes e cards.
-- `JP/capture_worker.py`: worker Python que consome jobs de captura, roda OCR local e gera rascunhos de analise para revisao.
-- `JP/desktop_capture_daemon/`: daemon em Rust para captura passiva de tela, deduplicacao basica e enqueue de jobs.
+- `JP/languages.py`: registro de idiomas, deteccao offline de idioma, divisao de texto misto, analisadores por idioma (Sudachi para japones, tokenizador generico com `simplemma` para idiomas com espacos, jieba para chines quando instalado) e romanizadores (pinyin, hangul, cirilico) para leituras.
+- `JP/lang_jp_web.py`: interface web local para navegar por termos, kanji, fontes e cards, com filtro de idioma em todas as paginas (`lang=all` mostra tudo), cards por idioma no painel, pagina `/capture` para escolher os idiomas capturados e os perfis por janela, e uma API JSON (`/api/languages`, `/api/capture`, `/api/terms`, `/api/sources`, `/api/flashcards`).
+- `JP/capture_worker.py`: worker Python que consome jobs de captura, escolhe os motores de OCR pelo conjunto de idiomas capturados (meikiocr para japones, leitores EasyOCR para os demais), separa o texto por idioma e gera rascunhos de analise para revisao.
+- `JP/ocr_backends.py`: motores de OCR, roteamento por idioma, filtros de linha por idioma e fusao dos blocos de varios motores.
+- `JP/desktop_capture_daemon/`: daemon em Rust para captura passiva de tela, deduplicacao basica e enqueue de jobs; registra a janela em primeiro plano de cada captura e expoe no tray o menu de idiomas capturados.
 - `JP/schema.sql`: schema SQLite que sustenta fontes, termos, segmentos, analise OCR, estatisticas e flashcards.
 - `JP/data/lang_jp.sqlite3`: banco local do catalogo.
 
@@ -52,9 +56,7 @@ O projeto nao e apenas um OCR nem apenas um gerador de flashcards. Ele funciona 
 - `README.md`: visao geral do projeto.
 - `AGENTS.md`: convencoes operacionais para agentes.
 - `setup_windows.ps1`: bootstrap para recriar os ambientes Python no Windows e rodar smoke tests.
-- `open_jp_catalog.cmd`: atalho Windows para abrir a interface web local.
-- `open_jp_capture_tray.cmd`: atalho Windows para abrir o tray de captura passiva.
-- `open_jp_capture_logs.cmd`: atalho Windows para acompanhar o log de captura em tempo real.
+- `open_lang.cmd`: ponto de entrada unico no Windows. Sobe o tray (que supervisiona a interface web e o worker de OCR) e abre o catalogo no navegador. Se o tray ja estiver rodando, so abre o catalogo.
 - `JP/README.md`: detalhes do catalogo JP, comandos e fluxo de uso.
 - `JP/ocr_capture_spec.md`: especificacao do pipeline de captura automatizada.
 - `JP/ocr_capture_review.md`: anotacoes de revisao do fluxo de OCR/captura.
@@ -96,4 +98,4 @@ Notas:
 
 ## Estado atual
 
-O repositorio parece estar centrado quase totalmente no catalogo japones em `JP/`. Nao ha, neste momento, evidencias de outros modulos equivalentes para outros idiomas dentro da raiz.
+O catalogo e poliglota de ponta a ponta: a captura passiva guarda, por padrao, todo idioma que aparece na tela (o conjunto fica no banco e pode ser ajustado pelo tray, pela interface web ou pela CLI), cada termo sabe seu idioma, e os cards vao para um deck do Anki por idioma. O japones continua com JMdict, Sudachi, kanji e romaji; os outros idiomas ganham lema (`simplemma`), significado por traducao automatica e leitura quando o perfil tem (pinyin, romanizacao do hangul, transliteracao do cirilico). O modulo `JP/` mantem o nome historico.

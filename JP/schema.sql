@@ -15,7 +15,10 @@ CREATE TABLE IF NOT EXISTS capture_jobs (
     image_sha256 TEXT,
     image_phash TEXT,
     raw_text TEXT,
-    ocr_text_hash TEXT
+    ocr_text_hash TEXT,
+    window_title TEXT,
+    process_name TEXT,
+    capture_profile_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_created_at
@@ -27,10 +30,39 @@ CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_updated_at
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_image_sha256
     ON capture_jobs(image_sha256);
 
+CREATE TABLE IF NOT EXISTS languages (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    native_name TEXT,
+    script TEXT NOT NULL DEFAULT 'latin',
+    deck_name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    capture_enabled INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- A window title or process name pinned to a fixed language set: captures from
+-- that window skip language detection (one language) or restrict it (several).
+CREATE TABLE IF NOT EXISTS capture_profiles (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    window_title_pattern TEXT,
+    process_name_pattern TEXT,
+    language_codes TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 100,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY,
     source_type TEXT NOT NULL CHECK (source_type IN ('image', 'text', 'manual')),
     language_code TEXT NOT NULL DEFAULT 'ja',
+    language_confidence REAL,
     ingest_mode TEXT NOT NULL DEFAULT 'manual' CHECK (
         ingest_mode IN ('manual', 'auto_capture', 'image_import')
     ),
@@ -61,9 +93,13 @@ CREATE INDEX IF NOT EXISTS idx_sources_review_status_created_at
 CREATE INDEX IF NOT EXISTS idx_sources_image_sha256
     ON sources(image_sha256);
 
+CREATE INDEX IF NOT EXISTS idx_sources_language_code
+    ON sources(language_code, created_at);
+
 CREATE TABLE IF NOT EXISTS terms (
     id INTEGER PRIMARY KEY,
     canonical_key TEXT NOT NULL UNIQUE,
+    language_code TEXT NOT NULL DEFAULT 'ja',
     lemma TEXT NOT NULL,
     reading TEXT,
     meaning_pt TEXT,
@@ -75,6 +111,9 @@ CREATE TABLE IF NOT EXISTS terms (
 
 CREATE INDEX IF NOT EXISTS idx_terms_lemma
     ON terms(lemma);
+
+CREATE INDEX IF NOT EXISTS idx_terms_language_code
+    ON terms(language_code, lemma);
 
 CREATE TABLE IF NOT EXISTS term_forms (
     id INTEGER PRIMARY KEY,
@@ -117,6 +156,7 @@ CREATE TABLE IF NOT EXISTS source_segments (
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     segment_key TEXT NOT NULL,
     segment_text TEXT NOT NULL,
+    language_code TEXT,
     reading TEXT,
     notes TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -155,6 +195,7 @@ CREATE TABLE IF NOT EXISTS source_analysis_segments (
     segment_index INTEGER NOT NULL,
     raw_text TEXT NOT NULL,
     normalized_text TEXT NOT NULL,
+    language_code TEXT,
     reading TEXT,
     confidence REAL CHECK (
         confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
@@ -237,6 +278,7 @@ CREATE TABLE IF NOT EXISTS term_stats (
 CREATE TABLE IF NOT EXISTS kanji (
     id INTEGER PRIMARY KEY,
     literal TEXT NOT NULL UNIQUE,
+    language_code TEXT NOT NULL DEFAULT 'ja',
     meaning_pt TEXT,
     canonical_meanings TEXT,
     on_readings TEXT,
@@ -329,6 +371,7 @@ CREATE INDEX IF NOT EXISTS idx_kanji_flashcards_anki_note_id
 CREATE VIEW IF NOT EXISTS v_terms_overview AS
 SELECT
     t.id,
+    t.language_code,
     t.lemma,
     t.reading,
     t.meaning_pt,
@@ -347,6 +390,7 @@ CREATE VIEW IF NOT EXISTS v_kanji_overview AS
 SELECT
     k.id,
     k.literal,
+    k.language_code,
     k.meaning_pt,
     k.canonical_meanings,
     k.on_readings,
@@ -378,6 +422,7 @@ SELECT
     f.export_status,
     f.exported_at,
     f.created_at,
+    t.language_code,
     t.lemma,
     t.reading,
     t.meaning_pt,

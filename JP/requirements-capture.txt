@@ -1,6 +1,8 @@
 Pillow
 SudachiPy
 sudachidict_core
+simplemma
+pypinyin
 meikiocr
 onnxruntime
 manga-ocr
