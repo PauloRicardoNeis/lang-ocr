@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -230,6 +231,39 @@ class ProcessJobTest(unittest.TestCase):
         self.assertEqual(source["game"], "Spanish RPG")
         self.assertEqual([row["language_code"] for row in segments], ["es"])
         self.assertEqual([(row["language_code"], row["lemma"]) for row in terms], [("es", "no"), ("es", "poder"), ("es", "ser")])
+
+    def test_term_meanings_are_translated_without_holding_the_write_lock(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            self.enqueue(connection, "menu", window_title="Menu", process_name="game.exe")
+            connection.commit()
+        finally:
+            connection.close()
+
+        def translate(lemma, **_kwargs):
+            # The daemon must still be able to enqueue while a meaning is looked up.
+            other = sqlite3.connect(self.db_path, timeout=0)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.rollback()
+            finally:
+                other.close()
+            return f"pt:{lemma}"
+
+        stub = StubEngine("stub", [block("No puede ser", 10, 10, 200, 40, conf=0.9)])
+        with (
+            patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub),
+            patch.object(lang_jp, "auto_translate_term_meaning_pt", side_effect=AssertionError("called inside the transaction")),
+            patch.object(capture_worker, "auto_translate_term_meaning_pt", side_effect=translate),
+        ):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        connection = db_connect(self.db_path)
+        try:
+            meanings = [row["meaning_pt"] for row in connection.execute("SELECT meaning_pt FROM terms ORDER BY lemma")]
+        finally:
+            connection.close()
+        self.assertEqual(meanings, ["pt:no", "pt:poder", "pt:ser"])
 
     def test_capture_set_from_database_sorts_blocks_per_language(self) -> None:
         connection = db_connect(self.db_path)

@@ -2290,6 +2290,7 @@ def approve_source_analysis_candidates(
     source_id: int,
     candidate_ids: list[int] | None = None,
     mark_reviewed: bool = True,
+    translate_meanings: bool = True,
 ) -> tuple[int, int]:
     source_row = connection.execute(
         "SELECT id FROM sources WHERE id = ?",
@@ -2360,6 +2361,7 @@ def approve_source_analysis_candidates(
                 pos=row["pos"],
                 notes=AUTO_PROMOTION_NOTES,
                 language_code=segment_language_code,
+                translate_meaning=translate_meanings,
             )
         else:
             term_id = int(term_id)
@@ -2683,7 +2685,10 @@ def upsert_term_record(
     pos: str | None,
     notes: str | None,
     language_code: str | None = DEFAULT_LANGUAGE_CODE,
+    translate_meaning: bool = True,
 ) -> int:
+    """Create or update a term; ``translate_meaning=False`` skips the network lookup
+    for a missing meaning (callers holding a write transaction fill it later)."""
     lemma = normalize_token(lemma)
     reading = normalize_token(reading)
     meaning_pt = normalize_token(meaning_pt) or None
@@ -2696,7 +2701,7 @@ def upsert_term_record(
     )
     key = canonical_key(lemma, reading, language_code)
     existing = get_term_by_key(connection, key)
-    if meaning_pt is None and (
+    if translate_meaning and meaning_pt is None and (
         existing is None or not normalize_token(existing["meaning_pt"])
     ):
         meaning_pt = auto_translate_term_meaning_pt(

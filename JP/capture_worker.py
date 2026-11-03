@@ -25,6 +25,7 @@ from lang_jp import (
     DEFAULT_LANGUAGE_CODE,
     ROOT,
     approve_source_analysis_candidates,
+    auto_translate_term_meaning_pt,
     build_segment_candidates,
     capture_language_codes,
     capture_profile_languages,
@@ -38,6 +39,7 @@ from lang_jp import (
     normalize_token,
     read_existing_kanji_match,
     read_existing_term_match,
+    recalculate_term_stats,
     recover_stale_capture_jobs,
     resolve_repo_local_path,
     stable_text_hash,
@@ -1553,11 +1555,58 @@ def auto_promote_source_terms(connection, source_id: int) -> tuple[int, int]:
     """Promote a new source's candidates without marking it reviewed (LANG_JP_AUTO_PROMOTE_SOURCE_TERMS)."""
     if not DEFAULT_AUTO_PROMOTE_SOURCE_TERMS:
         return 0, 0
+    # Meanings are filled after the commit (fill_source_term_meanings): a network
+    # call per new term inside this write transaction locked the database for
+    # minutes and the daemon could not enqueue captures.
     return approve_source_analysis_candidates(
         connection,
         source_id=source_id,
         mark_reviewed=False,
+        translate_meanings=False,
     )
+
+
+def fill_source_term_meanings(db_path: Path, source_id: int) -> int:
+    """Fill the empty meanings of a source's terms, one short write per term."""
+    connection = db_connect(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT t.id, t.lemma, t.reading, t.pos, t.language_code
+            FROM terms t
+            JOIN source_terms st ON st.term_id = t.id
+            WHERE st.source_id = ? AND COALESCE(TRIM(t.meaning_pt), '') = ''
+            ORDER BY t.id
+            """,
+            (source_id,),
+        ).fetchall()
+        filled = 0
+        for row in rows:
+            # No transaction is open while the translator is called.
+            meaning_pt = normalize_token(
+                auto_translate_term_meaning_pt(
+                    row["lemma"],
+                    reading=row["reading"],
+                    pos=row["pos"],
+                    language_code=row["language_code"],
+                )
+            )
+            if not meaning_pt:
+                continue
+            connection.execute(
+                """
+                UPDATE terms
+                SET meaning_pt = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND COALESCE(TRIM(meaning_pt), '') = ''
+                """,
+                (meaning_pt, row["id"]),
+            )
+            recalculate_term_stats(connection, int(row["id"]))
+            connection.commit()
+            filled += 1
+        return filled
+    finally:
+        connection.close()
 
 
 def process_job_once(
@@ -1816,6 +1865,8 @@ def process_job_once(
             connection.commit()
         finally:
             connection.close()
+        if promoted_terms:
+            probe.mark("meanings", filled=fill_source_term_meanings(db_path, source_id))
         if translator is not None and raw_text:
             connection = db_connect(db_path)
             try:
