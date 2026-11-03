@@ -536,8 +536,9 @@ def detect_language(
     if script == SCRIPT_OTHER:
         return LanguageGuess(code=fallback, confidence=0.1, script=script)
 
-    # Latin script: score stop words and diacritics.
-    words = [word.lower() for word in _words(text)]
+    # Latin script: score stop words and diacritics. Hyphenated words are scored
+    # by their parts, so "Voulez-vous" still counts the French "vous".
+    words = [part.lower() for word in _words(text) for part in re.split(r"[\-‐‑]", word) if part]
     scores: dict[str, float] = {}
     for code, stopwords in LATIN_STOPWORDS.items():
         if not allowed(code):

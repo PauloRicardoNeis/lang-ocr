@@ -63,6 +63,14 @@ class LanguageDetectionTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(languages.detect_language(text).code, expected)
 
+    def test_hyphenated_words_count_their_parts(self) -> None:
+        # "la" and "de" tie French with Spanish; "vous" inside "Voulez-vous" breaks it.
+        self.assertEqual(
+            languages.detect_language("Voulez-vous sauvegarder la partie avant de quitter ?").code,
+            "fr",
+        )
+        self.assertEqual(languages.detect_language("Est-ce que tu viens ?").code, "fr")
+
     def test_candidates_restrict_the_answer(self) -> None:
         self.assertEqual(languages.detect_language("我是中国人", candidates=["ja", "en"]).code, "ja")
         self.assertEqual(languages.detect_language("我是中国人", candidates=["zh", "ja"]).code, "zh")
