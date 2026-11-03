@@ -14,7 +14,7 @@ if str(TESTS_ROOT) not in sys.path:
 import capture_worker
 import lang_jp
 from lang_jp import SCHEMA_PATH, db_connect
-from ocr_backends import OcrBlock, OcrEnginePlan, recognize_with_shared_detection
+from ocr_backends import OcrBlock, OcrEnginePlan, plausible_reading, recognize_with_shared_detection
 
 _LOG_DIR = tempfile.TemporaryDirectory()
 _LOG_PATCH = patch.object(capture_worker, "DEFAULT_LOG_PATH", Path(_LOG_DIR.name) / "worker.log")
@@ -74,6 +74,26 @@ class SharedDetectionTest(unittest.TestCase):
         second = StubReader(("en",), {0: ("Privet", 0.5)}, BOXES[:1])
         blocks = recognize_with_shared_detection([first, second], None, None, confident=0.7)
         self.assertEqual([(block.text, block.confidence) for block in blocks], [("Privet", 0.5)])
+
+    def test_lookalike_readings_from_other_scripts_do_not_replace_latin(self) -> None:
+        # Real misreadings of an English screen by the Cyrillic and Devanagari readers.
+        latin = StubReader(
+            ("en",), {0: ("x 1189", 0.67), 1: ("Resets at 2.00 PM", 0.62), 2: ("Привет мир", 0.3)}, BOXES
+        )
+        cyrillic = StubReader(
+            ("ru", "en"), {0: ("х 1189", 0.82), 1: ("Resets at 2.00 РM", 0.7), 2: ("Привет мир", 0.9)}, BOXES
+        )
+        devanagari = StubReader(("hi", "en"), {1: ("Resets at २:०० PM", 0.72)}, BOXES)
+        blocks = recognize_with_shared_detection([latin, cyrillic, devanagari], None, None, confident=0.7)
+        self.assertEqual([block.text for block in blocks], ["x 1189", "Resets at 2.00 PM", "Привет мир"])
+
+    def test_plausible_reading(self) -> None:
+        for text in ("Press START", "Привет мир", "안녕하세요 Press START", "是", "PS5版", "Ελληνικά"):
+            with self.subTest(text=text):
+                self.assertTrue(plausible_reading(text))
+        for text in ("х 1189", "2.00 РM", "२:०० PM", "٥٥٥", "Сс"[:1]):
+            with self.subTest(text=text):
+                self.assertFalse(plausible_reading(text))
 
 
 class StubEngine:
@@ -264,6 +284,61 @@ class ProcessJobTest(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(meanings, ["pt:no", "pt:poder", "pt:ser"])
+
+    def test_ocr_misreadings_stay_pending_instead_of_becoming_terms(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["en"])
+            self.enqueue(connection, "ui", window_title="Editor", process_name="editor.exe")
+            connection.commit()
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("The fetch is stuck Frobably", 10, 10, 400, 40, conf=0.9)])
+        with patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        connection = db_connect(self.db_path)
+        try:
+            lemmas = sorted(row["lemma"] for row in connection.execute("SELECT lemma FROM terms"))
+            pending = [
+                row["surface_form"]
+                for row in connection.execute(
+                    "SELECT surface_form FROM source_analysis_candidates WHERE approval_status = 'pending'"
+                )
+            ]
+        finally:
+            connection.close()
+        self.assertNotIn("frobably", lemmas)
+        self.assertIn("fetch", lemmas)
+        self.assertIn("stick", lemmas)
+        self.assertEqual(pending, ["Frobably"])
+
+    def test_captures_of_the_tooling_are_skipped_before_ocr(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["en"])
+            claude = self.enqueue(connection, "claude", window_title="Claude", process_name="Claude.exe")
+            catalog = self.enqueue(connection, "catalog", window_title="Lang Catalog - Brave", process_name="brave.exe")
+            connection.commit()
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("Press START", 10, 10, 200, 40)])
+        with patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub):
+            while capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline()):
+                pass
+        connection = db_connect(self.db_path)
+        try:
+            statuses = [
+                row["status"]
+                for row in connection.execute(
+                    "SELECT status FROM capture_jobs WHERE id IN (?, ?) ORDER BY id", (claude, catalog)
+                )
+            ]
+            sources = connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(statuses, ["rejected", "rejected"])
+        self.assertEqual(sources, 0)
+        self.assertEqual(stub.calls, 0)
 
     def test_capture_set_from_database_sorts_blocks_per_language(self) -> None:
         connection = db_connect(self.db_path)

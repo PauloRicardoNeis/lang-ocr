@@ -925,6 +925,23 @@ def _simplemma_module():
     return simplemma
 
 
+def dictionary_knows(word: str | None, code: str | None) -> bool | None:
+    """Whether ``simplemma``'s dictionary for the language has ``word``.
+
+    ``None`` when there is no dictionary to ask (simplemma missing, or a language
+    it does not cover such as Japanese, Korean, Chinese, Thai or Vietnamese).
+    """
+    simplemma = _simplemma_module()
+    word = (word or "").strip()
+    base = base_language_code(code)
+    if simplemma is None or not word or not base:
+        return None
+    try:
+        return bool(simplemma.is_known(word, lang=base))
+    except ValueError:
+        return None
+
+
 class GenericAnalyzer:
     """Tokenizer for word-delimited languages.
 

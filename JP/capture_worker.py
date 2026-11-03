@@ -37,6 +37,7 @@ from lang_jp import (
     find_source_by_image_sha256,
     match_capture_profile,
     normalize_token,
+    pending_analysis_candidates,
     read_existing_kanji_match,
     read_existing_term_match,
     recalculate_term_stats,
@@ -84,6 +85,11 @@ DEBUG_ENABLED = os.environ.get("LANG_JP_CAPTURE_DEBUG") == "1"
 # LANG_JP_OCR_BACKEND picks the engine (meikiocr by default, easyocr for comparison).
 # The downscale, confidence, orientation and region settings below apply to EasyOCR only.
 DEFAULT_OCR_MAX_SIDE = int(os.environ.get("LANG_JP_OCR_MAX_SIDE", "1600"))
+# The multi-reader flow (EasyOCR readers sharing one detection pass) reads at up
+# to this size instead: desktop UI text shrunk to 1600px comes out as garbage
+# ("Ethossunor" for EthosSurvivor) and low confidence sends every box to every
+# reader. On a 4K capture full size was faster overall (40s vs 245s for 7 readers).
+DEFAULT_MULTI_OCR_MAX_SIDE = int(os.environ.get("LANG_JP_MULTI_OCR_MAX_SIDE", "3840"))
 DEFAULT_OCR_PROGRESS_INTERVAL = float(os.environ.get("LANG_JP_OCR_PROGRESS_INTERVAL", "5"))
 DEFAULT_OCR_MIN_CONFIDENCE = float(os.environ.get("LANG_JP_OCR_MIN_CONFIDENCE", "0.30"))
 # A box read with at least this confidence by one EasyOCR reader is not sent to the next ones.
@@ -95,6 +101,20 @@ DEFAULT_OCR_MAX_REGIONS = int(os.environ.get("LANG_JP_OCR_MAX_REGIONS", "3"))
 # Non-Japanese OCR lines read below this confidence keep their segment but give
 # no candidates: on real screens they are mostly garbage ("Lcqallc", "Googic").
 DEFAULT_MIN_TERM_CONFIDENCE = float(os.environ.get("LANG_JP_MIN_TERM_CONFIDENCE", "0.5"))
+# Captures of the tooling itself (this assistant, the tray daemon, the catalog in
+# a browser tab) are rejected before OCR. Comma-separated, case-insensitive.
+SKIP_CAPTURE_PROCESSES = frozenset(
+    name.strip().lower()
+    for name in os.environ.get(
+        "LANG_CAPTURE_SKIP_PROCESSES", "claude.exe,desktop_capture_daemon.exe"
+    ).split(",")
+    if name.strip()
+)
+SKIP_CAPTURE_WINDOW_TITLES = tuple(
+    title.strip().lower()
+    for title in os.environ.get("LANG_CAPTURE_SKIP_WINDOW_TITLES", "Lang Catalog").split(",")
+    if title.strip()
+)
 DEFAULT_AUTO_PROMOTE_SOURCE_TERMS = (
     os.environ.get("LANG_JP_AUTO_PROMOTE_SOURCE_TERMS", "1") != "0"
 )
@@ -1185,7 +1205,7 @@ class MultiEngineOcrAdapter:
         def do_read() -> tuple[list[OcrBlock], float]:
             with Image.open(image_path) as image_file:
                 rgb = image_file.convert("RGB")
-            target, factor = downscale_for_easyocr(rgb)
+            target, factor = downscale_for_easyocr(rgb, max_side=DEFAULT_MULTI_OCR_MAX_SIDE)
             color, grey = EasyOcrBackend.prepare_arrays(target)
 
             def on_pass(backend, sent: int, improved: int) -> None:
@@ -1551,9 +1571,32 @@ def store_source_analysis(
     return segment_count, candidate_count
 
 
+def skipped_capture_window(window_title: str | None, process_name: str | None) -> str | None:
+    """Why a capture of this window is not study material, or ``None``."""
+    if process_name and process_name.strip().lower() in SKIP_CAPTURE_PROCESSES:
+        return f"process {process_name}"
+    title = (window_title or "").lower()
+    for pattern in SKIP_CAPTURE_WINDOW_TITLES:
+        if pattern in title:
+            return f"window title contains {pattern!r}"
+    return None
+
+
 def auto_promote_source_terms(connection, source_id: int) -> tuple[int, int]:
     """Promote a new source's candidates without marking it reviewed (LANG_JP_AUTO_PROMOTE_SOURCE_TERMS)."""
     if not DEFAULT_AUTO_PROMOTE_SOURCE_TERMS:
+        return 0, 0
+    # Only words the language's dictionary knows are promoted automatically; OCR
+    # misreadings ("Frobably", "Ethossunor") stay pending for review. Languages
+    # without a dictionary (Japanese has its own analyzer checks) promote as before.
+    candidate_ids = [
+        int(row["id"])
+        for row in pending_analysis_candidates(connection, source_id=source_id)
+        if row["candidate_type"] == "kanji"
+        or languages.dictionary_knows(row["surface_form"], row["segment_language_code"]) is not False
+        or languages.dictionary_knows(row["dictionary_form"], row["segment_language_code"]) is not False
+    ]
+    if not candidate_ids:
         return 0, 0
     # Meanings are filled after the commit (fill_source_term_meanings): a network
     # call per new term inside this write transaction locked the database for
@@ -1561,6 +1604,7 @@ def auto_promote_source_terms(connection, source_id: int) -> tuple[int, int]:
     return approve_source_analysis_candidates(
         connection,
         source_id=source_id,
+        candidate_ids=candidate_ids,
         mark_reviewed=False,
         translate_meanings=False,
     )
@@ -1699,6 +1743,23 @@ def process_job_once(
             reason="temp_image_missing",
             image=temp_image_path,
         )
+        return True
+
+    skip_reason = skipped_capture_window(window_title, process_name)
+    if skip_reason is not None:
+        connection = db_connect(db_path)
+        try:
+            update_capture_job_status(
+                connection,
+                job_id=job_id,
+                status="rejected",
+                last_error=f"Skipped capture of {skip_reason}.",
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        delete_if_exists(temp_image_path)
+        probe.mark("done", include_memory=True, status="rejected", reason="skipped_window")
         return True
 
     try:

@@ -863,6 +863,48 @@ def easyocr_box_to_bbox(box) -> list[list[float]] | None:
     return None
 
 
+# Scripts with letters that look like Latin ones (х/x, Р/P, ο/o): a reader for
+# them "improves" Latin boxes by swapping single letters.
+HOMOGLYPH_SCRIPTS = frozenset({languages.SCRIPT_CYRILLIC, languages.SCRIPT_GREEK})
+
+
+def plausible_reading(text: str) -> bool:
+    """Whether a reading is real text rather than another script's model misreading Latin.
+
+    Rejects lone Cyrillic/Greek letters (``х 1189``), words mixing them with Latin
+    letters (``2.00 РM``) and non-ASCII digits next to Latin text or alone
+    (``२:०० PM``, ``٥٥٥``). CJK, Hangul or Thai letters are never rejected here:
+    single-character labels are normal in those scripts.
+    """
+    latin_letters = 0
+    homoglyph_letters = 0
+    other_letters = 0
+    foreign_digits = False
+    for char in text:
+        # char_script puts Devanagari and Arabic digits in their script's range.
+        if char.isdigit():
+            if not ("0" <= char <= "9" or "０" <= char <= "９"):
+                foreign_digits = True
+            continue
+        script = languages.char_script(char)
+        if script == languages.SCRIPT_LATIN:
+            latin_letters += 1
+        elif script in HOMOGLYPH_SCRIPTS:
+            homoglyph_letters += 1
+        elif script is not None:
+            other_letters += 1
+    if foreign_digits and (latin_letters or not (homoglyph_letters or other_letters)):
+        return False
+    if homoglyph_letters:
+        if homoglyph_letters < 2:
+            return False
+        for word in text.split():
+            scripts = {languages.char_script(char) for char in word}
+            if languages.SCRIPT_LATIN in scripts and scripts & HOMOGLYPH_SCRIPTS:
+                return False
+    return True
+
+
 def recognize_with_shared_detection(
     backends: list,
     color_image,
@@ -877,6 +919,7 @@ def recognize_with_shared_detection(
     confidence ``confident`` or better yet, so a Latin-heavy screen costs one
     detection plus one cheap recognition pass for the exotic readers, and each
     box ends up with the reading its best-matching script model produced.
+    Readings that fail ``plausible_reading`` never replace another one.
     """
     if not backends:
         return []
@@ -901,7 +944,7 @@ def recognize_with_shared_detection(
             # bbox (polygon); keep the detector's rectangle for stable keys.
             block = OcrBlock(text=block.text, confidence=block.confidence, bbox=block.bbox or easyocr_box_to_bbox(box))
             current = best.get(key)
-            if current is None or confidence > current[0]:
+            if current is None or (confidence > current[0] and plausible_reading(block.text)):
                 best[key] = (confidence, block)
                 improved += 1
         if on_pass is not None:
