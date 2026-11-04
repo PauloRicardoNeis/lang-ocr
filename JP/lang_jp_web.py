@@ -1953,6 +1953,21 @@ def nav_link(path: str, label: str, active_path: str, lang: str = ALL_LANGUAGES_
     return f'<a class="{active_class}" href="{html.escape(path, quote=True)}">{html.escape(label)}</a>'
 
 
+CATALOG_TITLE = "Lang Catalog"
+
+
+def page_title(title: str) -> str:
+    """Browser tab title; every page ends in ``Lang Catalog``.
+
+    The capture worker skips windows whose title contains ``Lang Catalog``, so
+    the catalog's own pages (whose source lists show old Japanese text) are
+    never captured back into the catalog as new sources.
+    """
+    if not title or title == CATALOG_TITLE:
+        return CATALOG_TITLE
+    return f"{title} - {CATALOG_TITLE}"
+
+
 def layout(
     *,
     title: str,
@@ -1979,7 +1994,7 @@ def layout(
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{html.escape(title)}</title>
+    <title>{html.escape(page_title(title))}</title>
     {PAGE_STYLE}
   </head>
   <body>

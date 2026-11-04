@@ -682,6 +682,25 @@ class MultilingualPagesTest(unittest.TestCase):
         self.assertIn("nos idiomas marcados", page)
         self.assertIn("(idioma dos significados)", page)
 
+    def test_every_page_title_names_the_catalog(self) -> None:
+        # The capture worker skips windows titled "Lang Catalog"; a page whose
+        # tab title lacks it (e.g. plain "Fontes") was captured back as a source.
+        pages = {
+            "dashboard": lang_jp_web.dashboard_page(self.db_path, {}),
+            "terms": lang_jp_web.terms_page(self.db_path, {}),
+            "kanji": lang_jp_web.kanji_page(self.db_path, {}),
+            "sources": lang_jp_web.sources_page(self.db_path, {"lang": ["ja"]}),
+            "flashcards": lang_jp_web.flashcards_page(self.db_path, {}),
+            "capture": lang_jp_web.capture_page(self.db_path, {}),
+            "kanji_detail": lang_jp_web.kanji_detail_page(self.db_path, self.kanji_id, {}),
+        }
+        for name, page in pages.items():
+            with self.subTest(page=name):
+                title = page.split("<title>", 1)[1].split("</title>", 1)[0]
+                self.assertTrue(title.endswith("Lang Catalog"), title)
+        self.assertEqual(lang_jp_web.page_title("Lang Catalog"), "Lang Catalog")
+        self.assertEqual(lang_jp_web.page_title("Fontes"), "Fontes - Lang Catalog")
+
     def test_table_sort_is_locale_neutral(self) -> None:
         self.assertNotIn('toLocaleLowerCase("pt-BR")', lang_jp_web.PAGE_SCRIPT)
         self.assertIn("sortableText(value)", lang_jp_web.PAGE_SCRIPT)

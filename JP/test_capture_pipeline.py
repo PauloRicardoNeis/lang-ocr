@@ -318,6 +318,10 @@ class ProcessJobTest(unittest.TestCase):
             lang_jp.set_capture_languages(connection, ["en"])
             claude = self.enqueue(connection, "claude", window_title="Claude", process_name="Claude.exe")
             catalog = self.enqueue(connection, "catalog", window_title="Lang Catalog - Brave", process_name="brave.exe")
+            # Inner catalog pages, titled through lang_jp_web.page_title().
+            sources_page = self.enqueue(
+                connection, "sources-page", window_title="Fontes - Lang Catalog - Brave", process_name="brave.exe"
+            )
             connection.commit()
         finally:
             connection.close()
@@ -330,13 +334,14 @@ class ProcessJobTest(unittest.TestCase):
             statuses = [
                 row["status"]
                 for row in connection.execute(
-                    "SELECT status FROM capture_jobs WHERE id IN (?, ?) ORDER BY id", (claude, catalog)
+                    "SELECT status FROM capture_jobs WHERE id IN (?, ?, ?) ORDER BY id",
+                    (claude, catalog, sources_page),
                 )
             ]
             sources = connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
         finally:
             connection.close()
-        self.assertEqual(statuses, ["rejected", "rejected"])
+        self.assertEqual(statuses, ["rejected", "rejected", "rejected"])
         self.assertEqual(sources, 0)
         self.assertEqual(stub.calls, 0)
 
