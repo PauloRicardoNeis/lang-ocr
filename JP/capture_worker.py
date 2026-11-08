@@ -29,6 +29,8 @@ from lang_jp import (
     build_segment_candidates,
     capture_language_codes,
     capture_profile_languages,
+    capture_skip_patterns,
+    capture_skip_reason,
     claim_next_source_translation,
     claim_next_capture_job,
     create_source_analysis_segment,
@@ -101,25 +103,17 @@ DEFAULT_OCR_MAX_REGIONS = int(os.environ.get("LANG_JP_OCR_MAX_REGIONS", "3"))
 # Non-Japanese OCR lines read below this confidence keep their segment but give
 # no candidates: on real screens they are mostly garbage ("Lcqallc", "Googic").
 DEFAULT_MIN_TERM_CONFIDENCE = float(os.environ.get("LANG_JP_MIN_TERM_CONFIDENCE", "0.5"))
-# Captures of the tooling itself (this assistant, the tray daemon, the catalog in
-# a browser tab) are rejected before OCR. Comma-separated, case-insensitive.
-SKIP_CAPTURE_PROCESSES = frozenset(
-    name.strip().lower()
-    for name in os.environ.get(
-        "LANG_CAPTURE_SKIP_PROCESSES", "claude.exe,desktop_capture_daemon.exe"
-    ).split(",")
-    if name.strip()
-)
-SKIP_CAPTURE_WINDOW_TITLES = tuple(
-    title.strip().lower()
-    for title in os.environ.get("LANG_CAPTURE_SKIP_WINDOW_TITLES", "Lang Catalog").split(",")
-    if title.strip()
-)
+# Windows whose captures are rejected before OCR live in the database
+# (``capture_skip_rules``, empty by default); see the "Capture blacklist"
+# section of lang_jp.py for every rule that skips or rejects a capture.
 DEFAULT_AUTO_PROMOTE_SOURCE_TERMS = (
     os.environ.get("LANG_JP_AUTO_PROMOTE_SOURCE_TERMS", "1") != "0"
 )
+# Source translations are made on demand from the web UI (the "Traduzir" button
+# on a source page). Set LANG_JP_ENABLE_SOURCE_TRANSLATION=1 to go back to
+# queueing one for every capture.
 DEFAULT_ENABLE_SOURCE_TRANSLATION = (
-    os.environ.get("LANG_JP_ENABLE_SOURCE_TRANSLATION", "1") != "0"
+    os.environ.get("LANG_JP_ENABLE_SOURCE_TRANSLATION", "0") == "1"
 )
 DEFAULT_SOURCE_TRANSLATION_TARGET = os.environ.get(
     "LANG_JP_SOURCE_TRANSLATION_TARGET", "en"
@@ -1036,7 +1030,7 @@ class MeikiOcrAdapter:
         line_boxes = run_with_progress_logs(label, do_read, echo_stdout=echo_stdout)
         kept_boxes, stats = filter_ocr_line_boxes(line_boxes, language_codes=("ja",))
         blocks = [
-            OcrBlock(text=normalize_token(block.text), confidence=block.confidence, bbox=block.bbox)
+            block.with_text(normalize_token(block.text))
             for block in ocr_line_boxes_to_blocks(kept_boxes)
         ]
         append_worker_log(
@@ -1571,15 +1565,22 @@ def store_source_analysis(
     return segment_count, candidate_count
 
 
-def skipped_capture_window(window_title: str | None, process_name: str | None) -> str | None:
-    """Why a capture of this window is not study material, or ``None``."""
-    if process_name and process_name.strip().lower() in SKIP_CAPTURE_PROCESSES:
-        return f"process {process_name}"
-    title = (window_title or "").lower()
-    for pattern in SKIP_CAPTURE_WINDOW_TITLES:
-        if pattern in title:
-            return f"window title contains {pattern!r}"
-    return None
+def skipped_capture_window(
+    db_path: Path,
+    window_title: str | None,
+    process_name: str | None,
+) -> str | None:
+    """Why a capture of this window is skipped (a capture skip rule), or ``None``.
+
+    Rules are read for every job so a rule added from the tray or the web UI
+    applies to the very next capture without restarting the worker.
+    """
+    connection = db_connect(db_path)
+    try:
+        patterns = capture_skip_patterns(connection)
+    finally:
+        connection.close()
+    return capture_skip_reason(patterns, window_title=window_title, process_name=process_name)
 
 
 def auto_promote_source_terms(connection, source_id: int) -> tuple[int, int]:
@@ -1745,7 +1746,7 @@ def process_job_once(
         )
         return True
 
-    skip_reason = skipped_capture_window(window_title, process_name)
+    skip_reason = skipped_capture_window(db_path, window_title, process_name)
     if skip_reason is not None:
         connection = db_connect(db_path)
         try:
@@ -1984,12 +1985,53 @@ def process_job_once(
     return True
 
 
+TRANSLATION_RETRY_BASE_SECONDS = 60.0
+TRANSLATION_RETRY_MAX_SECONDS = 15 * 60.0
+
+
+@dataclass
+class TranslationBackoff:
+    """Pause the translation backlog after a failure.
+
+    Failed rows are claimed again (``claim_next_source_translation`` takes
+    ``failed`` too), so without a pause the loop retried the same source back
+    to back and kept the free endpoint answering HTTP 429 for every client on
+    this machine, the translation overlay included.
+    """
+
+    failures: int = 0
+    retry_at: float = 0.0
+
+    def ready(self, now: float | None = None) -> bool:
+        return (time.monotonic() if now is None else now) >= self.retry_at
+
+    def failed(self, now: float | None = None) -> float:
+        self.failures += 1
+        delay = min(
+            TRANSLATION_RETRY_MAX_SECONDS,
+            TRANSLATION_RETRY_BASE_SECONDS * (2 ** (self.failures - 1)),
+        )
+        self.retry_at = (time.monotonic() if now is None else now) + delay
+        return delay
+
+    def succeeded(self) -> None:
+        self.failures = 0
+        self.retry_at = 0.0
+
+
+TRANSLATION_BACKOFF = TranslationBackoff()
+
+
 def process_pending_translation_once(
     db_path: Path,
     *,
     translator: GoogleGtxSourceTranslator | None,
+    backoff: TranslationBackoff | None = None,
 ) -> bool:
     if translator is None:
+        return False
+    backoff = TRANSLATION_BACKOFF if backoff is None else backoff
+    if not backoff.ready():
         return False
 
     connection = db_connect(db_path)
@@ -2083,7 +2125,9 @@ def process_pending_translation_once(
                 text_len=len(translated_text),
             )
         )
+        backoff.succeeded()
     except Exception as exc:
+        retry_in = backoff.failed()
         connection = db_connect(db_path)
         try:
             upsert_source_translation(
@@ -2107,6 +2151,7 @@ def process_pending_translation_once(
                 provider=translator.provider_name,
                 lang=translator.target_language,
                 error=exc,
+                retry_in=f"{int(retry_in)}s",
             )
         )
     return True

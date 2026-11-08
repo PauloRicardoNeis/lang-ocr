@@ -1959,9 +1959,10 @@ CATALOG_TITLE = "Lang Catalog"
 def page_title(title: str) -> str:
     """Browser tab title; every page ends in ``Lang Catalog``.
 
-    The capture worker skips windows whose title contains ``Lang Catalog``, so
-    the catalog's own pages (whose source lists show old Japanese text) are
-    never captured back into the catalog as new sources.
+    Capture does not skip it by default; a ``title`` skip rule for
+    ``Lang Catalog`` (tray "Skip windows", /capture, or
+    ``lang_jp.py skip-window title "Lang Catalog"``) keeps the catalog's own
+    pages from being captured back as new sources.
     """
     if not title or title == CATALOG_TITLE:
         return CATALOG_TITLE
@@ -3987,6 +3988,11 @@ def source_detail_page(
           <a class="button-link" href="{html.escape(language_href("/terms", lang), quote=True)}">Abrir termos</a>
           <a class="button-link" href="{html.escape(language_href("/flashcards", lang), quote=True)}">Abrir cards</a>
         </div>
+        <form class="inline-action source-delete-form" action="/actions/sources/{source_id}/delete" method="post" onsubmit="return confirm('Excluir a fonte #{source_id} de vez? Segmentos e vinculos de termos serao removidos; os termos ficam.');">
+          <label><input type="checkbox" name="delete_image" value="1" checked> Apagar tambem a imagem</label>
+          {hidden_language_input(lang)}
+          <button type="submit">Excluir fonte</button>
+        </form>
       </section>
 
       {image_block}
@@ -4001,6 +4007,10 @@ def source_detail_page(
         <p><strong>Status:</strong> {escape(source["translated_text_en_status"] or "missing")}</p>
         <p><strong>Provider:</strong> {escape(source["translated_text_en_provider"] or "-")}</p>
         <pre>{html.escape(text(source["translated_text_en"], "(sem tradução em inglês)"))}</pre>
+        <form class="inline-action source-translate-form" action="/actions/sources/{source_id}/translate" method="post">
+          {hidden_language_input(lang)}
+          <button type="submit">{"Traduzir de novo" if source["translated_text_en"] else "Traduzir"}</button>
+        </form>
       </section>
 
       <section class="panel panel-side">
@@ -4201,12 +4211,55 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
     )
 
 
+def skip_rule_form(kind: str, pattern: str, *, op: str, label: str) -> str:
+    return f"""
+        <form class="inline-action" action="/actions/capture-skip-rules" method="post">
+          <input type="hidden" name="op" value="{html.escape(op, quote=True)}">
+          <input type="hidden" name="kind" value="{html.escape(kind, quote=True)}">
+          <input type="hidden" name="pattern" value="{html.escape(pattern, quote=True)}">
+          <button type="submit">{html.escape(label)}</button>
+        </form>
+    """
+
+
+def skip_rules_html(rules: list[sqlite3.Row]) -> str:
+    env_rows = [
+        [escape(kind), f'<span class="mono">{html.escape(pattern)}</span>', f"variavel {html.escape(env_name)}"]
+        for kind, env_name in (
+            ("process", lang_jp.CAPTURE_SKIP_PROCESSES_ENV),
+            ("title", lang_jp.CAPTURE_SKIP_TITLES_ENV),
+        )
+        for pattern in lang_jp.env_capture_skip_patterns(env_name)
+    ]
+    if not rules and not env_rows:
+        return '<p class="muted">Nenhuma janela ignorada: tudo na tela e capturado.</p>'
+    rows = [
+        [
+            escape(row["kind"]),
+            f'<span class="mono">{html.escape(str(row["pattern"]))}</span>',
+            skip_rule_form(str(row["kind"]), str(row["pattern"]), op="remove", label="Remover"),
+        ]
+        for row in rules
+    ]
+    return table_html(["Tipo", "Padrao", "Acoes"], rows + env_rows)
+
+
+def skip_process_button(process_name: str | None, rules: list[sqlite3.Row]) -> str:
+    process = lang_jp.normalize_token(process_name).lower()
+    if not process:
+        return ""
+    if any(row["kind"] == "process" and row["pattern"] == process for row in rules):
+        return ' <span class="muted">(ignorado)</span>'
+    return skip_rule_form("process", process, op="add", label="Ignorar app")
+
+
 def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
     """Capture settings: which languages the worker keeps, the OCR plan, window profiles."""
     with db_connect(db_path) as connection:
         language_rows = list_language_rows(connection)
         capture_codes = lang_jp.capture_language_codes(connection)
         profiles = lang_jp.list_capture_profiles(connection)
+        skip_rules = lang_jp.list_capture_skip_rules(connection)
         recent_jobs = connection.execute(
             """
             SELECT
@@ -4284,7 +4337,7 @@ def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
             escape(row["id"]),
             status_chip(text(row["status"])),
             language_text(truncate(text(row["window_title"], "-"), size=60), None),
-            escape(row["process_name"] or "-"),
+            escape(row["process_name"] or "-") + skip_process_button(row["process_name"], skip_rules),
             escape(row["profile_name"] or "-"),
             (
                 f'<a href="/sources/{row["source_id"]}">#{row["source_id"]} ({escape(row["source_language"])})</a>'
@@ -4343,6 +4396,24 @@ def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
       </section>
 
       <section class="panel panel-wide">
+        <h2>Janelas ignoradas</h2>
+        <p>Capturas dessas janelas sao descartadas antes do OCR (<code>reason=skipped_window</code> no log). <strong>Processo</strong> compara o nome exato do executavel; <strong>titulo</strong> procura o texto dentro do titulo da janela. A lista fica no banco (<code>capture_skip_rules</code>), comeca vazia e vale para o tray, a CLI (<code>skip-window</code>) e esta pagina.</p>
+        {skip_rules_html(skip_rules)}
+        <form class="search capture-skip-form" action="/actions/capture-skip-rules" method="post">
+          <input type="hidden" name="op" value="add">
+          <label>Ignorar uma janela</label>
+          <div class="inputs">
+            <select name="kind">
+              <option value="process">Processo (nome exato)</option>
+              <option value="title">Titulo contem</option>
+            </select>
+            <input type="text" name="pattern" placeholder="ex.: claude.exe ou Lang Catalog" required>
+            <div class="search-actions"><button type="submit">Ignorar</button></div>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-wide">
         <h2>Capturas recentes</h2>
         <p>Titulo e processo da janela em primeiro plano em cada captura: use-os para criar perfis.</p>
         {table_html(["Job", "Status", "Janela", "Processo", "Perfil", "Fonte", "Quando"], job_rows)}
@@ -4361,10 +4432,12 @@ def api_capture_payload(db_path: Path) -> dict[str, object]:
     with db_connect(db_path) as connection:
         capture_codes = lang_jp.capture_language_codes(connection)
         profiles = lang_jp.list_capture_profiles(connection)
+        skip_patterns = lang_jp.capture_skip_patterns(connection)
     plan = plan_ocr_engines(capture_codes)
     return {
         "capture_languages": list(capture_codes),
         "override_env": os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV) or None,
+        "skip_rules": {kind: list(values) for kind, values in skip_patterns.items()},
         "ocr_plan": {
             "backend": plan.backend,
             "engines": list(plan.engine_names),
@@ -4717,6 +4790,9 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/actions/capture-languages":
             self.run_capture_languages_action()
             return
+        if path == "/actions/capture-skip-rules":
+            self.run_capture_skip_rule_action()
+            return
         if path == "/actions/capture-profiles/save":
             self.run_capture_profile_action("save")
             return
@@ -4733,8 +4809,85 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
                 return
             self.run_source_language_action(source_id)
             return
+        if path.startswith("/actions/sources/") and path.endswith("/delete"):
+            source_id = self.parse_int_tail(path[: -len("/delete")], "/actions/sources/")
+            if source_id is None:
+                self.respond_not_found("Fonte invalida.")
+                return
+            self.run_source_delete_action(source_id)
+            return
+        if path.startswith("/actions/sources/") and path.endswith("/translate"):
+            source_id = self.parse_int_tail(path[: -len("/translate")], "/actions/sources/")
+            if source_id is None:
+                self.respond_not_found("Fonte invalida.")
+                return
+            self.run_source_translate_action(source_id)
+            return
 
         self.respond_not_found("Acao nao encontrada.")
+
+    def run_source_translate_action(self, source_id: int) -> None:
+        form_data = self.read_form_data()
+        next_path = language_href(f"/sources/{source_id}", current_language(form_data))
+        try:
+            with db_connect(self.db_path) as connection:
+                result = lang_jp.translate_source_on_demand(connection, source_id=source_id)
+                connection.commit()
+        except SystemExit as exc:
+            if self.prefers_json_response():
+                self.respond_json({"message": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.redirect(self.append_notice(next_path, message=str(exc), level="error"))
+            return
+        if result["status"] == "translated":
+            message, level = f"Fonte traduzida ({result['lines']} linhas).", "info"
+        else:
+            message, level = f"Falha na traducao: {result['error']}", "error"
+        if self.prefers_json_response():
+            self.respond_json({"message": message, **result})
+            return
+        self.redirect(self.append_notice(next_path, message=message, level=level))
+
+    def run_source_delete_action(self, source_id: int) -> None:
+        form_data = self.read_form_data()
+        lang = current_language(form_data)
+        delete_image = first_value(form_data, "delete_image", "") == "1"
+        try:
+            with db_connect(self.db_path) as connection:
+                summary = lang_jp.delete_source(
+                    connection,
+                    source_id=source_id,
+                    delete_image=delete_image,
+                )
+                connection.commit()
+        except SystemExit as exc:
+            self.redirect(
+                self.append_notice(
+                    language_href(f"/sources/{source_id}", lang),
+                    message=str(exc),
+                    level="error",
+                )
+            )
+            return
+        image_removed = lang_jp.remove_deleted_source_image(summary)
+        message = (
+            f"Fonte #{source_id} excluida: {summary['segment_count']} segmentos, "
+            f"{summary['term_count']} termos desvinculados"
+        )
+        if summary["orphaned_terms"]:
+            message += f" ({len(summary['orphaned_terms'])} sem outra fonte)"
+        message += "; imagem apagada." if image_removed else "."
+        if self.prefers_json_response():
+            self.respond_json(
+                {
+                    "message": message,
+                    "source_id": source_id,
+                    "orphaned_terms": summary["orphaned_terms"],
+                    "image_removed": image_removed,
+                }
+            )
+            return
+        self.redirect(self.append_notice(language_href("/sources", lang), message=message, level="info"))
 
     def run_capture_languages_action(self) -> None:
         form_data = self.read_form_data()
@@ -4759,6 +4912,34 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         message = f"Captura: {', '.join(codes)}."
         if self.prefers_json_response():
             self.respond_json({"capture_languages": list(codes), "message": message})
+            return
+        self.redirect(self.append_notice("/capture", message=message, level="info"))
+
+    def run_capture_skip_rule_action(self) -> None:
+        form_data = self.read_form_data()
+        op = first_value(form_data, "op", "add").strip()
+        kind = first_value(form_data, "kind", "")
+        pattern = first_value(form_data, "pattern", "")
+        try:
+            with db_connect(self.db_path) as connection:
+                if op == "remove":
+                    changed = lang_jp.remove_capture_skip_rule(connection, kind, pattern)
+                else:
+                    changed = lang_jp.add_capture_skip_rule(connection, kind, pattern)
+                connection.commit()
+            kind, pattern = lang_jp.normalize_capture_skip_rule(kind, pattern)
+        except SystemExit as exc:
+            if self.prefers_json_response():
+                self.respond_json({"message": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.redirect(self.append_notice("/capture", message=str(exc), level="error"))
+            return
+        if op == "remove":
+            message = f"Janela volta a ser capturada: {kind} {pattern}." if changed else f"{kind} {pattern} nao estava na lista."
+        else:
+            message = f"Janela ignorada: {kind} {pattern}." if changed else f"{kind} {pattern} ja estava na lista."
+        if self.prefers_json_response():
+            self.respond_json({"message": message, "kind": kind, "pattern": pattern, "changed": changed})
             return
         self.redirect(self.append_notice("/capture", message=message, level="info"))
 

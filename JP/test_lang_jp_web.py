@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from datetime import timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -683,8 +684,8 @@ class MultilingualPagesTest(unittest.TestCase):
         self.assertIn("(idioma dos significados)", page)
 
     def test_every_page_title_names_the_catalog(self) -> None:
-        # The capture worker skips windows titled "Lang Catalog"; a page whose
-        # tab title lacks it (e.g. plain "Fontes") was captured back as a source.
+        # LANG_CAPTURE_SKIP_WINDOW_TITLES="Lang Catalog" skips the catalog only
+        # when every tab title names it (plain "Fontes" would be captured).
         pages = {
             "dashboard": lang_jp_web.dashboard_page(self.db_path, {}),
             "terms": lang_jp_web.terms_page(self.db_path, {}),
@@ -736,6 +737,229 @@ class MultilingualPagesTest(unittest.TestCase):
         self.assertEqual(response.status, 303)
         self.assertTrue(location.startswith(f"/sources/{self.es_source}?lang=es&notice="), location)
         self.assertIn(">Привет</a>", page)
+
+    def test_source_detail_offers_delete(self) -> None:
+        page = lang_jp_web.source_detail_page(self.db_path, self.es_source, {"lang": ["es"]})
+        self.assertIn(f'action="/actions/sources/{self.es_source}/delete"', page)
+        self.assertIn("confirm(", page)
+
+    def test_source_delete_action_removes_source_and_refreshes_stats(self) -> None:
+        with closing(db_connect(self.db_path)) as connection:
+            lang_jp.recalculate_term_stats(connection, self.es_term)
+            connection.commit()
+        handler = type("TestHandler", (lang_jp_web.CatalogRequestHandler,), {"db_path": self.db_path})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+            connection.request(
+                "POST",
+                f"/actions/sources/{self.mixed_source}/delete",
+                body=urlencode({"lang": "es"}),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            location = response.getheader("Location") or ""
+            response.read()
+            connection.close()
+
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+            connection.request(
+                "POST",
+                f"/actions/sources/{self.mixed_source}/delete",
+                body=urlencode({"lang": "es"}),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            missing = connection.getresponse()
+            missing_location = missing.getheader("Location") or ""
+            missing.read()
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response.status, 303)
+        self.assertTrue(location.startswith("/sources?lang=es&notice="), location)
+        self.assertIn("level=error", missing_location)
+        with closing(db_connect(self.db_path)) as connection:
+            count = lambda sql: connection.execute(sql, (self.mixed_source,)).fetchone()[0]
+            self.assertEqual(count("SELECT COUNT(*) FROM sources WHERE id = ?"), 0)
+            self.assertEqual(count("SELECT COUNT(*) FROM source_segments WHERE source_id = ?"), 0)
+            self.assertEqual(count("SELECT COUNT(*) FROM source_analysis_segments WHERE source_id = ?"), 0)
+            self.assertEqual(count("SELECT COUNT(*) FROM source_kanji WHERE source_id = ?"), 0)
+            stats = connection.execute(
+                "SELECT total_occurrences, distinct_sources FROM term_stats WHERE term_id = ?",
+                (self.es_term,),
+            ).fetchone()
+            self.assertEqual((stats[0], stats[1]), (0, 0))
+            # Terms and their cards survive; only the source goes.
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM terms").fetchone()[0], 5)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM flashcards").fetchone()[0], 2)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM sources WHERE id = ?", (self.es_source,)).fetchone()[0],
+                1,
+            )
+
+    def test_capture_page_adds_and_removes_skip_rules(self) -> None:
+        page = lang_jp_web.capture_page(self.db_path, {})
+        self.assertIn("Janelas ignoradas", page)
+        self.assertIn("Nenhuma janela ignorada", page)
+
+        handler = type("TestHandler", (lang_jp_web.CatalogRequestHandler,), {"db_path": self.db_path})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def post(fields: dict[str, str]) -> str:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+            connection.request(
+                "POST",
+                "/actions/capture-skip-rules",
+                body=urlencode(fields),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            location = response.getheader("Location") or ""
+            response.read()
+            connection.close()
+            return location
+
+        try:
+            added = post({"op": "add", "kind": "process", "pattern": "Brave.exe"})
+            invalid = post({"op": "add", "kind": "window", "pattern": "x"})
+            page_with_rule = lang_jp_web.capture_page(self.db_path, {})
+            removed = post({"op": "remove", "kind": "process", "pattern": "brave.exe"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertIn("level=info", added)
+        self.assertIn("level=error", invalid)
+        self.assertIn('<span class="mono">brave.exe</span>', page_with_rule)
+        self.assertIn("level=info", removed)
+        with closing(db_connect(self.db_path)) as connection:
+            self.assertEqual(lang_jp.list_capture_skip_rules(connection), [])
+
+    def test_source_detail_offers_on_demand_translation(self) -> None:
+        page = lang_jp_web.source_detail_page(self.db_path, self.es_source, {"lang": ["es"]})
+        self.assertIn(f'action="/actions/sources/{self.es_source}/translate"', page)
+        self.assertIn(">Traduzir</button>", page)
+
+    def test_source_translate_action_stores_translation_and_reports_failures(self) -> None:
+        calls: list[str] = []
+
+        def fake_request(text: str, *, source_language: str, target_language: str) -> str:
+            calls.append(text)
+            return "\n".join(f"{target_language}:{line}" for line in text.split("\n"))
+
+        def failing_request(text: str, *, source_language: str, target_language: str) -> str:
+            raise OSError("HTTP Error 429: Too Many Requests")
+
+        handler = type("TestHandler", (lang_jp_web.CatalogRequestHandler,), {"db_path": self.db_path})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def post_translate() -> tuple[int, str]:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+            connection.request(
+                "POST",
+                f"/actions/sources/{self.mixed_source}/translate",
+                body=urlencode({"lang": "es"}),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            location = response.getheader("Location") or ""
+            response.read()
+            connection.close()
+            return response.status, location
+
+        original = lang_jp.google_gtx_request
+        try:
+            lang_jp.google_gtx_request = fake_request
+            status, location = post_translate()
+            lang_jp.google_gtx_request = failing_request
+            failed_status, failed_location = post_translate()
+        finally:
+            lang_jp.google_gtx_request = original
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(status, 303)
+        self.assertTrue(location.startswith(f"/sources/{self.mixed_source}?lang=es&notice="), location)
+        self.assertIn("level=info", location)
+        # Both source lines go out in a single request.
+        self.assertEqual(calls, ["¡Vamos a la batalla!\n回復"])
+        self.assertEqual(failed_status, 303)
+        self.assertIn("level=error", failed_location)
+        with closing(db_connect(self.db_path)) as connection:
+            row = connection.execute(
+                "SELECT status, translated_text, error_message FROM source_translations WHERE source_id = ?",
+                (self.mixed_source,),
+            ).fetchone()
+        # The failed retry is recorded; the worker no longer picks it up on its own.
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("429", row["error_message"])
+
+    def test_translate_source_lines_falls_back_per_line_when_lines_merge(self) -> None:
+        calls: list[str] = []
+
+        def merging_request(text: str, *, source_language: str, target_language: str) -> str:
+            calls.append(text)
+            return text.replace("\n", " ")
+
+        translated = lang_jp.translate_source_lines(
+            ["一行目", "二行目"],
+            source_language="ja",
+            target_language="en",
+            request_translation=merging_request,
+        )
+        self.assertEqual(translated, "一行目\n二行目")
+        self.assertEqual(calls, ["一行目\n二行目", "一行目", "二行目"])
+
+    def test_translate_source_on_demand_keeps_text_already_in_target_language(self) -> None:
+        def unexpected_request(text: str, *, source_language: str, target_language: str) -> str:
+            raise AssertionError("no request expected")
+
+        with closing(db_connect(self.db_path)) as connection:
+            source_id = self.insert_source(connection, "en", "Hello\n  world  ")
+            result = lang_jp.translate_source_on_demand(
+                connection, source_id=source_id, request_translation=unexpected_request
+            )
+            text = connection.execute(
+                "SELECT translated_text FROM source_translations WHERE source_id = ?", (source_id,)
+            ).fetchone()[0]
+        self.assertEqual(result["status"], "translated")
+        self.assertEqual(text, "Hello\nworld")
+
+    def test_delete_source_only_removes_images_under_data(self) -> None:
+        outside = Path(self.temp_dir.name) / "outside.png"
+        outside.write_bytes(b"png")
+        data_dir = lang_jp.ROOT / "data"
+        data_dir.mkdir(exist_ok=True)
+        inside = data_dir / f"test-delete-source-{self.es_source}-{id(self)}.png"
+        inside.write_bytes(b"png")
+        try:
+            with closing(db_connect(self.db_path)) as connection:
+                connection.execute("UPDATE sources SET source_path = ? WHERE id = ?", (str(outside), self.ar_source))
+                connection.execute(
+                    "UPDATE sources SET source_path = ? WHERE id = ?",
+                    (f"data/{inside.name}", self.es_source),
+                )
+                kept = lang_jp.delete_source(connection, source_id=self.ar_source, delete_image=True)
+                removed = lang_jp.delete_source(connection, source_id=self.es_source, delete_image=True)
+                connection.commit()
+            self.assertFalse(lang_jp.remove_deleted_source_image(kept))
+            self.assertTrue(outside.exists())
+            self.assertTrue(lang_jp.remove_deleted_source_image(removed))
+            self.assertFalse(inside.exists())
+            self.assertEqual(removed["orphaned_terms"], [self.es_water])
+        finally:
+            inside.unlink(missing_ok=True)
 
 
 class DisplayFormattingTest(unittest.TestCase):

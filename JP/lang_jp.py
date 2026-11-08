@@ -84,6 +84,20 @@ CREATE TABLE IF NOT EXISTS capture_profiles (
 );
 """
 
+CAPTURE_SKIP_RULE_SCHEMA_SQL = """
+-- Capture blacklist: windows whose captures the worker rejects before OCR.
+-- kind 'process' matches the foreground process name exactly, 'title' matches
+-- a substring of the window title; both case-insensitive. Edited from the tray
+-- ("Skip windows"), /capture in the web UI and the skip-window CLI commands.
+CREATE TABLE IF NOT EXISTS capture_skip_rules (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('process', 'title')),
+    pattern TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(kind, pattern)
+);
+"""
+
 # Notes on the terms, segments and links that approve_source_analysis_candidates creates.
 AUTO_PROMOTION_NOTES = "approved_from_source_analysis"
 KANJI_SCHEMA_SQL = """
@@ -726,6 +740,132 @@ def set_capture_languages(
 
 
 # ---------------------------------------------------------------------------
+# Capture blacklist (skip rules)
+#
+# How captures get skipped, in order:
+#   1. The tray daemon drops a frame before queueing it only for timing and
+#      duplicates (previous frame still waiting, image hash already stored,
+#      same image in the last frames). It never looks at the window.
+#   2. The worker rejects a queued job before OCR when its foreground window
+#      matches a skip rule: rows of ``capture_skip_rules`` plus the optional
+#      LANG_CAPTURE_SKIP_PROCESSES / LANG_CAPTURE_SKIP_WINDOW_TITLES environment
+#      variables, which add to the table and never replace it. The job ends as
+#      ``rejected`` with ``reason=skipped_window`` and the image is deleted.
+#   3. After OCR, a job with no text in the capture languages is rejected
+#      (``no_target_language_text``).
+# The table starts empty: nothing is skipped until a rule is added from the
+# tray ("Skip windows"), /capture in the web UI or ``skip-window`` in the CLI.
+# ---------------------------------------------------------------------------
+
+CAPTURE_SKIP_RULE_KINDS = ("process", "title")
+CAPTURE_SKIP_PROCESSES_ENV = "LANG_CAPTURE_SKIP_PROCESSES"
+CAPTURE_SKIP_TITLES_ENV = "LANG_CAPTURE_SKIP_WINDOW_TITLES"
+
+
+def normalize_capture_skip_rule(kind: str, pattern: str | None) -> tuple[str, str]:
+    normalized_kind = (kind or "").strip().lower()
+    if normalized_kind not in CAPTURE_SKIP_RULE_KINDS:
+        raise SystemExit(f"Invalid skip rule kind {kind!r}: use 'process' or 'title'.")
+    normalized_pattern = normalize_token(pattern).lower()
+    if not normalized_pattern:
+        raise SystemExit("A skip rule needs a process name or a title text.")
+    return normalized_kind, normalized_pattern
+
+
+def list_capture_skip_rules(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        "SELECT id, kind, pattern, created_at FROM capture_skip_rules ORDER BY kind, pattern"
+    ).fetchall()
+
+
+def add_capture_skip_rule(connection: sqlite3.Connection, kind: str, pattern: str) -> bool:
+    """Add a rule; ``False`` when it already existed."""
+    kind, pattern = normalize_capture_skip_rule(kind, pattern)
+    cursor = connection.execute(
+        "INSERT OR IGNORE INTO capture_skip_rules (kind, pattern) VALUES (?, ?)",
+        (kind, pattern),
+    )
+    return cursor.rowcount > 0
+
+
+def remove_capture_skip_rule(connection: sqlite3.Connection, kind: str, pattern: str) -> bool:
+    kind, pattern = normalize_capture_skip_rule(kind, pattern)
+    cursor = connection.execute(
+        "DELETE FROM capture_skip_rules WHERE kind = ? AND pattern = ?",
+        (kind, pattern),
+    )
+    return cursor.rowcount > 0
+
+
+def env_capture_skip_patterns(name: str) -> tuple[str, ...]:
+    return tuple(
+        pattern
+        for pattern in (normalize_token(raw).lower() for raw in os.environ.get(name, "").split(","))
+        if pattern
+    )
+
+
+def capture_skip_patterns(connection: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
+    """Effective skip lists: database rules first, then the environment extras."""
+    patterns: dict[str, list[str]] = {kind: [] for kind in CAPTURE_SKIP_RULE_KINDS}
+    if table_exists(connection, "capture_skip_rules"):
+        for row in list_capture_skip_rules(connection):
+            patterns[str(row["kind"])].append(str(row["pattern"]))
+    for kind, env_name in (("process", CAPTURE_SKIP_PROCESSES_ENV), ("title", CAPTURE_SKIP_TITLES_ENV)):
+        for pattern in env_capture_skip_patterns(env_name):
+            if pattern not in patterns[kind]:
+                patterns[kind].append(pattern)
+    return {kind: tuple(values) for kind, values in patterns.items()}
+
+
+def capture_skip_reason(
+    patterns: dict[str, tuple[str, ...]],
+    *,
+    window_title: str | None,
+    process_name: str | None,
+) -> str | None:
+    """Why a capture of this window is skipped, or ``None``."""
+    process = normalize_token(process_name).lower()
+    if process and process in patterns.get("process", ()):
+        return f"process {process_name}"
+    title = (window_title or "").lower()
+    for pattern in patterns.get("title", ()):
+        if pattern in title:
+            return f"window title contains {pattern!r}"
+    return None
+
+
+def add_capture_skip_rule_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        added = add_capture_skip_rule(connection, args.kind, args.pattern)
+        connection.commit()
+    kind, pattern = normalize_capture_skip_rule(args.kind, args.pattern)
+    print(f"skip {kind} {pattern!r}: {'added' if added else 'already listed'}")
+
+
+def remove_capture_skip_rule_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        removed = remove_capture_skip_rule(connection, args.kind, args.pattern)
+        connection.commit()
+    kind, pattern = normalize_capture_skip_rule(args.kind, args.pattern)
+    print(f"skip {kind} {pattern!r}: {'removed' if removed else 'was not listed'}")
+
+
+def list_capture_skip_rules_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        rows = list_capture_skip_rules(connection)
+    for row in rows:
+        print(f"{row['kind']}\t{row['pattern']}")
+    env_count = 0
+    for kind, env_name in (("process", CAPTURE_SKIP_PROCESSES_ENV), ("title", CAPTURE_SKIP_TITLES_ENV)):
+        for pattern in env_capture_skip_patterns(env_name):
+            env_count += 1
+            print(f"{kind}\t{pattern}\t(from {env_name})")
+    if not rows and not env_count:
+        print("No skip rules: every window is captured.")
+
+
+# ---------------------------------------------------------------------------
 # Capture profiles: a window title or process name pinned to a language set
 # ---------------------------------------------------------------------------
 
@@ -1177,6 +1317,7 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
             """
         )
     connection.executescript(CAPTURE_PROFILE_SCHEMA_SQL)
+    connection.executescript(CAPTURE_SKIP_RULE_SCHEMA_SQL)
     if table_exists(connection, "flashcards"):
         flashcard_columns = table_columns(connection, "flashcards")
         if "anki_note_id" not in flashcard_columns:
@@ -1462,6 +1603,170 @@ def google_gtx_translate_text(
     if not translated or translated == normalized:
         return None
     return translated
+
+
+SOURCE_TRANSLATION_PROVIDER = "google_gtx"
+# One request carries several source lines joined by newlines; Google keeps the
+# line breaks, so a 4k-character capture costs a few calls instead of hundreds.
+SOURCE_TRANSLATION_CHUNK_CHARS = 1800
+SOURCE_TRANSLATION_TIMEOUT_SECONDS = 20.0
+
+
+def google_gtx_request(
+    text: str,
+    *,
+    source_language: str,
+    target_language: str,
+    timeout: float = SOURCE_TRANSLATION_TIMEOUT_SECONDS,
+) -> str:
+    """Translate ``text`` with the free gtx endpoint, keeping its line breaks."""
+    params = urlencode(
+        {
+            "client": "gtx",
+            "sl": source_language,
+            "tl": target_language,
+            "dt": "t",
+            "q": text,
+        }
+    )
+    request = Request(
+        f"https://translate.googleapis.com/translate_a/single?{params}",
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    segments = payload[0] if isinstance(payload, list) and payload else []
+    return "".join(
+        str(segment[0])
+        for segment in segments
+        if isinstance(segment, list) and segment and segment[0] is not None
+    )
+
+
+def source_text_lines(raw_text: str | None) -> list[str]:
+    if not raw_text:
+        return []
+    normalized = str(raw_text).replace("\r\n", "\n").replace("\r", "\n")
+    return [line for line in (normalize_token(raw) for raw in normalized.split("\n")) if line]
+
+
+def translate_source_lines(
+    lines: list[str],
+    *,
+    source_language: str,
+    target_language: str,
+    request_translation=None,
+) -> str:
+    """Translate source lines in batches, one output line per input line."""
+    request_translation = request_translation or google_gtx_request
+    translated_lines: list[str] = []
+    chunk: list[str] = []
+    chunk_chars = 0
+
+    def flush() -> None:
+        if not chunk:
+            return
+        translated = request_translation(
+            "\n".join(chunk),
+            source_language=source_language,
+            target_language=target_language,
+        )
+        parts = [normalize_token(part) for part in translated.split("\n")]
+        parts = [part for part in parts if part]
+        if len(parts) == len(chunk):
+            translated_lines.extend(parts)
+        else:
+            # Google merged or split lines; fall back to one call per line so
+            # the translation still lines up with the source text.
+            for line in chunk:
+                single = normalize_token(
+                    request_translation(
+                        line,
+                        source_language=source_language,
+                        target_language=target_language,
+                    )
+                )
+                translated_lines.append(single or line)
+        chunk.clear()
+
+    for line in lines:
+        if chunk and chunk_chars + len(line) + 1 > SOURCE_TRANSLATION_CHUNK_CHARS:
+            flush()
+            chunk_chars = 0
+        chunk.append(line)
+        chunk_chars += len(line) + 1
+    flush()
+    return "\n".join(translated_lines)
+
+
+def translate_source_on_demand(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    target_language: str = "en",
+    request_translation=None,
+) -> dict[str, object]:
+    """Translate one source now and store the result.
+
+    Source translations are no longer queued for every capture (that backlog is
+    what kept the free endpoint answering HTTP 429); the web UI asks for one
+    source at a time. The caller commits.
+    """
+    source = connection.execute(
+        "SELECT id, raw_text, language_code, ocr_text_hash FROM sources WHERE id = ?",
+        (source_id,),
+    ).fetchone()
+    if source is None:
+        raise SystemExit(f"Fonte #{source_id} nao encontrada.")
+    lines = source_text_lines(source["raw_text"])
+    if not lines:
+        raise SystemExit("A fonte nao tem texto para traduzir.")
+    text_hash = source["ocr_text_hash"] or stable_text_hash(source["raw_text"])
+    source_language = (
+        languages.base_language_code(source["language_code"]) or DEFAULT_LANGUAGE_CODE
+    )
+    result: dict[str, object] = {
+        "source_id": source_id,
+        "provider": SOURCE_TRANSLATION_PROVIDER,
+        "target_language": target_language,
+        "lines": len(lines),
+    }
+    try:
+        if source_language == languages.base_language_code(target_language):
+            translated_text = "\n".join(lines)
+        else:
+            translated_text = translate_source_lines(
+                lines,
+                source_language=source_language,
+                target_language=target_language,
+                request_translation=request_translation,
+            )
+    except (OSError, TimeoutError, ValueError) as exc:
+        upsert_source_translation(
+            connection,
+            source_id=source_id,
+            source_text_hash=text_hash,
+            target_language=target_language,
+            provider=SOURCE_TRANSLATION_PROVIDER,
+            status="failed",
+            translated_text=None,
+            error_message=str(exc),
+        )
+        return {**result, "status": "failed", "error": str(exc)}
+    upsert_source_translation(
+        connection,
+        source_id=source_id,
+        source_text_hash=text_hash,
+        target_language=target_language,
+        provider=SOURCE_TRANSLATION_PROVIDER,
+        status="translated",
+        translated_text=translated_text,
+        error_message=None,
+    )
+    return {**result, "status": "translated", "text_len": len(translated_text)}
 
 
 def lookup_jmdict_term(
@@ -3685,6 +3990,156 @@ def ignore_source_command(args: argparse.Namespace) -> None:
             args.source_id,
         )
     print_source_review_details(source_row, segments, candidates)
+
+
+def deletable_source_image(
+    connection: sqlite3.Connection,
+    source_id: int,
+    source_path: str | None,
+) -> Path | None:
+    """The source's image file, when it is safe to remove with the source.
+
+    Only files inside ``JP/data`` qualify (captures and imported screenshots),
+    never an image that lives elsewhere on disk, and never one another source
+    still points at.
+    """
+    path = resolve_repo_local_path(source_path)
+    if path is None or not path.is_file():
+        return None
+    data_root = (ROOT / "data").resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    if not resolved.is_relative_to(data_root):
+        return None
+    shared = connection.execute(
+        "SELECT 1 FROM sources WHERE id != ? AND source_path = ? LIMIT 1",
+        (source_id, source_path),
+    ).fetchone()
+    return None if shared is not None else resolved
+
+
+def delete_source(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    delete_image: bool = False,
+) -> dict[str, object]:
+    """Delete a source and everything that hangs off it, then refresh the stats.
+
+    Segments, term links, analysis drafts, translations and kanji links go with
+    the source (ON DELETE CASCADE); flashcards keep their term and only lose the
+    source pointer. Terms themselves are kept, since they may have cards or other
+    sources; ``orphaned_terms`` reports the ones no source mentions any more.
+    The image file is removed only when ``delete_image`` is set, and the file is
+    removed after the rows, so a failed delete never leaves a source without
+    its image.
+    """
+    source = connection.execute(
+        "SELECT id, language_code, source_path, title FROM sources WHERE id = ?",
+        (source_id,),
+    ).fetchone()
+    if source is None:
+        raise SystemExit(f"Source #{source_id} not found.")
+
+    term_ids = [
+        int(row["term_id"])
+        for row in connection.execute(
+            "SELECT DISTINCT term_id FROM source_terms WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+    ]
+    kanji_ids = [
+        int(row["kanji_id"])
+        for row in connection.execute(
+            "SELECT DISTINCT kanji_id FROM source_kanji WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+    ]
+    segment_count = connection.execute(
+        "SELECT COUNT(*) FROM source_segments WHERE source_id = ?",
+        (source_id,),
+    ).fetchone()[0]
+    image_path = (
+        deletable_source_image(connection, source_id, source["source_path"])
+        if delete_image
+        else None
+    )
+
+    connection.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+    for term_id in term_ids:
+        recalculate_term_stats(connection, term_id)
+    for kanji_id in kanji_ids:
+        recalculate_kanji_stats(connection, kanji_id)
+
+    orphaned_terms: list[int] = []
+    if term_ids:
+        placeholders = ", ".join("?" for _ in term_ids)
+        orphaned_terms = [
+            int(row["id"])
+            for row in connection.execute(
+                f"""
+                SELECT t.id
+                FROM terms AS t
+                WHERE
+                    t.id IN ({placeholders})
+                    AND NOT EXISTS (
+                        SELECT 1 FROM source_terms AS st WHERE st.term_id = t.id
+                    )
+                ORDER BY t.id
+                """,
+                term_ids,
+            ).fetchall()
+        ]
+
+    return {
+        "source_id": source_id,
+        "language_code": source["language_code"],
+        "title": source["title"],
+        "segment_count": int(segment_count),
+        "term_count": len(term_ids),
+        "kanji_count": len(kanji_ids),
+        "orphaned_terms": orphaned_terms,
+        "image_path": image_path,
+    }
+
+
+def remove_deleted_source_image(summary: dict[str, object]) -> bool:
+    """Remove the image ``delete_source`` picked, once its rows are committed."""
+    image_path = summary.get("image_path")
+    if not isinstance(image_path, Path):
+        return False
+    try:
+        image_path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def delete_source_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        summary = delete_source(
+            connection,
+            source_id=args.source_id,
+            delete_image=args.delete_image,
+        )
+        connection.commit()
+    image_removed = remove_deleted_source_image(summary)
+    print(
+        f"Deleted source #{summary['source_id']} ({summary['language_code']}): "
+        f"segments={summary['segment_count']}, terms_unlinked={summary['term_count']}, "
+        f"kanji_unlinked={summary['kanji_count']}"
+    )
+    orphaned = summary["orphaned_terms"]
+    if orphaned:
+        print(
+            f"Terms no longer seen in any source (kept): {len(orphaned)} "
+            f"(ids: {', '.join(str(term_id) for term_id in orphaned[:20])}"
+            f"{', ...' if len(orphaned) > 20 else ''})"
+        )
+    if args.delete_image:
+        if image_removed:
+            print(f"Removed image: {summary['image_path']}")
+        else:
+            print("Image kept (missing, outside JP/data, or shared with another source).")
 
 
 def approve_analysis_command(args: argparse.Namespace) -> None:
@@ -7498,6 +7953,18 @@ def build_parser() -> argparse.ArgumentParser:
     ignore_source_parser.add_argument("--notes")
     ignore_source_parser.set_defaults(func=ignore_source_command)
 
+    delete_source_parser = subparsers.add_parser(
+        "delete-source",
+        help="Permanently delete a source with its segments, term links and drafts.",
+    )
+    delete_source_parser.add_argument("--source-id", type=int, required=True)
+    delete_source_parser.add_argument(
+        "--delete-image",
+        action="store_true",
+        help="Also remove the source image when it lives under JP/data and no other source uses it.",
+    )
+    delete_source_parser.set_defaults(func=delete_source_command)
+
     approve_analysis_parser = subparsers.add_parser(
         "approve-analysis",
         help="Promote pending source analysis candidates to official source links.",
@@ -7570,6 +8037,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Capture every built-in language (the default for a fresh install).",
     )
     set_capture_languages_parser.set_defaults(func=set_capture_languages_command)
+
+    skip_window_parser = subparsers.add_parser(
+        "skip-window",
+        help="Add a capture skip rule: windows matching it are rejected before OCR.",
+    )
+    skip_window_parser.add_argument("kind", choices=CAPTURE_SKIP_RULE_KINDS)
+    skip_window_parser.add_argument(
+        "pattern",
+        help="Process name (exact, e.g. claude.exe) or window-title text (substring, e.g. 'Lang Catalog').",
+    )
+    skip_window_parser.set_defaults(func=add_capture_skip_rule_command)
+
+    unskip_window_parser = subparsers.add_parser(
+        "unskip-window",
+        help="Remove a capture skip rule.",
+    )
+    unskip_window_parser.add_argument("kind", choices=CAPTURE_SKIP_RULE_KINDS)
+    unskip_window_parser.add_argument("pattern")
+    unskip_window_parser.set_defaults(func=remove_capture_skip_rule_command)
+
+    list_skip_windows_parser = subparsers.add_parser(
+        "list-skip-windows",
+        help="List the capture skip rules (database and environment).",
+    )
+    list_skip_windows_parser.set_defaults(func=list_capture_skip_rules_command)
 
     list_capture_profiles_parser = subparsers.add_parser(
         "list-capture-profiles",

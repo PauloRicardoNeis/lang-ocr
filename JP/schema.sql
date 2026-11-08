@@ -45,6 +45,18 @@ CREATE TABLE IF NOT EXISTS languages (
 
 -- A window title or process name pinned to a fixed language set: captures from
 -- that window skip language detection (one language) or restrict it (several).
+-- Capture blacklist: windows whose captures the worker rejects before OCR.
+-- kind 'process' matches the foreground process name exactly, 'title' matches
+-- a substring of the window title; both case-insensitive. Edited from the tray
+-- ("Skip windows"), /capture in the web UI and the skip-window CLI commands.
+CREATE TABLE IF NOT EXISTS capture_skip_rules (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('process', 'title')),
+    pattern TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(kind, pattern)
+);
+
 CREATE TABLE IF NOT EXISTS capture_profiles (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,

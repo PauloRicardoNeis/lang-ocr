@@ -64,8 +64,34 @@ MIN_LINE_JAPANESE_RATIO = 0.3
 CONTAINED_BOX_MIN_COVERAGE = 0.7
 FURIGANA_MAX_HEIGHT_RATIO = 0.85
 FURIGANA_MIN_HORIZONTAL_OVERLAP = 0.4
+# Vertical text (manga): a column is at least this much taller than wide.
+VERTICAL_MIN_ASPECT = 1.3
+# Columns of one bubble: the gap between neighbours is at most this many column
+# widths, they share at least this share of the shorter one's height, and their
+# widths differ by less than this ratio.
+VERTICAL_MAX_COLUMN_GAP = 0.9
+VERTICAL_MIN_COLUMN_OVERLAP = 0.3
+VERTICAL_MAX_WIDTH_DIFFERENCE = 0.5
 ROOT = Path(__file__).resolve().parent
 MODEL_CACHE_ROOT = ROOT / "data" / "model_cache"
+
+
+@dataclass(slots=True)
+class OcrTextLine:
+    """One physical line inside a block: its slice ``block.text[start:end]`` and its box.
+
+    A horizontal block is usually one line; a manga bubble is several vertical
+    columns read right to left. Consumers that need to place something on a
+    word (the reading overlay) map character offsets through these.
+    """
+
+    start: int
+    end: int
+    left: float
+    top: float
+    right: float
+    bottom: float
+    vertical: bool = False
 
 
 @dataclass(slots=True)
@@ -73,6 +99,21 @@ class OcrBlock:
     text: str
     confidence: float | None
     bbox: list[list[float]] | None
+    # Per-line geometry when the engine provides it (meikiocr); empty otherwise.
+    lines: tuple[OcrTextLine, ...] = ()
+
+    @property
+    def vertical(self) -> bool:
+        return bool(self.lines) and all(line.vertical for line in self.lines)
+
+    def with_text(self, text: str) -> "OcrBlock":
+        """Same block with new text; the line geometry survives only if the text is unchanged."""
+        return OcrBlock(
+            text=text,
+            confidence=self.confidence,
+            bbox=self.bbox,
+            lines=self.lines if text == self.text else (),
+        )
 
 
 @dataclass(slots=True)
@@ -609,6 +650,8 @@ class OcrLineBox:
     top: float
     right: float
     bottom: float
+    # The engine read it as a vertical column (meikiocr's vertical recognizer).
+    vertical: bool = False
 
     @property
     def width(self) -> float:
@@ -617,6 +660,15 @@ class OcrLineBox:
     @property
     def height(self) -> float:
         return max(1.0, self.bottom - self.top)
+
+    @property
+    def is_vertical_column(self) -> bool:
+        """Read top to bottom: flagged by the engine and clearly taller than wide.
+
+        Requiring both keeps a stray tall box (a stacked menu item read as one
+        horizontal line) out of the vertical path.
+        """
+        return self.vertical and self.height >= VERTICAL_MIN_ASPECT * self.width
 
 
 def meikiocr_line_to_box(
@@ -639,6 +691,7 @@ def meikiocr_line_to_box(
         top=float(min(char["bbox"][1] for char in chars)),
         right=float(max(char["bbox"][2] for char in chars)),
         bottom=float(max(char["bbox"][3] for char in chars)),
+        vertical=bool(line.get("is_vertical")),
     )
 
 
@@ -704,22 +757,61 @@ def drop_contained_boxes(boxes: list[OcrLineBox]) -> list[OcrLineBox]:
 
 
 def is_furigana_box(box: OcrLineBox, boxes: list[OcrLineBox]) -> bool:
-    """owocr-style ruby rule: a kana-only box just above a taller kanji box it overlaps."""
+    """owocr-style ruby rule: a kana-only box set beside a larger kanji line it overlaps.
+
+    Horizontal text carries its ruby above the line; vertical text (manga)
+    carries it in a thin column to the right of the kanji column.
+    """
     core = [char for char in box.text if is_japanese_text_char(char)]
     if not core or any(is_kanji_text_char(char) for char in core):
         return False
+    vertical = box.is_vertical_column
     for other in boxes:
         if other is box or not any(is_kanji_text_char(char) for char in other.text):
             continue
-        if box.height >= FURIGANA_MAX_HEIGHT_RATIO * other.height:
+        if other.is_vertical_column != vertical:
             continue
-        center_gap = (other.top + other.bottom) / 2 - (box.top + box.bottom) / 2
-        if not (abs(other.height - box.height) / 2 <= center_gap <= other.height + box.height / 2):
-            continue
-        overlap_width = min(box.right, other.right) - max(box.left, other.left)
-        if overlap_width > FURIGANA_MIN_HORIZONTAL_OVERLAP * box.width:
+        if vertical:
+            if _is_ruby_beside(
+                thickness=box.width, other_thickness=other.width,
+                center=(box.left + box.right) / 2, other_center=(other.left + other.right) / 2,
+                overlap=min(box.bottom, other.bottom) - max(box.top, other.top), length=box.height,
+                ruby_after=True,
+            ):
+                return True
+        elif _is_ruby_beside(
+            thickness=box.height, other_thickness=other.height,
+            center=(box.top + box.bottom) / 2, other_center=(other.top + other.bottom) / 2,
+            overlap=min(box.right, other.right) - max(box.left, other.left), length=box.width,
+            ruby_after=False,
+        ):
             return True
     return False
+
+
+def _is_ruby_beside(
+    *,
+    thickness: float,
+    other_thickness: float,
+    center: float,
+    other_center: float,
+    overlap: float,
+    length: float,
+    ruby_after: bool,
+) -> bool:
+    """The ruby test along one axis.
+
+    ``thickness`` is the line's cross size (height for horizontal text, width
+    for vertical); ruby is thinner than its base, sits right next to it (before
+    it for horizontal text, i.e. above; after it for vertical text, i.e. to the
+    right) and runs alongside it for part of its length.
+    """
+    if thickness >= FURIGANA_MAX_HEIGHT_RATIO * other_thickness:
+        return False
+    gap = (center - other_center) if ruby_after else (other_center - center)
+    if not (abs(other_thickness - thickness) / 2 <= gap <= other_thickness + thickness / 2):
+        return False
+    return overlap > FURIGANA_MIN_HORIZONTAL_OVERLAP * length
 
 
 def drop_furigana_boxes(boxes: list[OcrLineBox]) -> list[OcrLineBox]:
@@ -966,8 +1058,59 @@ def scale_ocr_blocks(blocks: list[OcrBlock], factor: float) -> list[OcrBlock]:
         bbox = None
         if block.bbox is not None:
             bbox = [[point[0] * factor, point[1] * factor] for point in block.bbox]
-        scaled.append(OcrBlock(text=block.text, confidence=block.confidence, bbox=bbox))
+        lines = tuple(
+            OcrTextLine(
+                start=line.start,
+                end=line.end,
+                left=line.left * factor,
+                top=line.top * factor,
+                right=line.right * factor,
+                bottom=line.bottom * factor,
+                vertical=line.vertical,
+            )
+            for line in block.lines
+        )
+        scaled.append(OcrBlock(text=block.text, confidence=block.confidence, bbox=bbox, lines=lines))
     return scaled
+
+
+def _same_bubble(first: OcrLineBox, second: OcrLineBox) -> bool:
+    """Two vertical columns set side by side in one speech bubble."""
+    widest = max(first.width, second.width)
+    gap = max(first.left, second.left) - min(first.right, second.right)
+    if gap > VERTICAL_MAX_COLUMN_GAP * widest:
+        return False
+    if abs(first.width - second.width) > VERTICAL_MAX_WIDTH_DIFFERENCE * widest:
+        return False
+    overlap = min(first.bottom, second.bottom) - max(first.top, second.top)
+    return overlap >= VERTICAL_MIN_COLUMN_OVERLAP * min(first.height, second.height)
+
+
+def group_vertical_columns_into_bubbles(boxes: list[OcrLineBox]) -> list[list[OcrLineBox]]:
+    """Cluster neighbouring vertical columns; each cluster is read right to left.
+
+    Columns join transitively (a bubble of four columns links through its
+    neighbours), so this is a connected-components pass over the columns.
+    """
+    parent = list(range(len(boxes)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for first in range(len(boxes)):
+        for second in range(first + 1, len(boxes)):
+            if _same_bubble(boxes[first], boxes[second]):
+                parent[find(first)] = find(second)
+    clusters: dict[int, list[OcrLineBox]] = {}
+    for index, box in enumerate(boxes):
+        clusters.setdefault(find(index), []).append(box)
+    bubbles = list(clusters.values())
+    for bubble in bubbles:
+        bubble.sort(key=lambda item: (-item.right, item.top))
+    return bubbles
 
 
 def group_ocr_line_boxes_into_rows(boxes: list[OcrLineBox]) -> list[list[OcrLineBox]]:
@@ -991,21 +1134,67 @@ def group_ocr_line_boxes_into_rows(boxes: list[OcrLineBox]) -> list[list[OcrLine
     return rows
 
 
-def ocr_row_to_block(row: list[OcrLineBox]) -> OcrBlock:
-    left = min(box.left for box in row)
-    top = min(box.top for box in row)
-    right = max(box.right for box in row)
-    bottom = max(box.bottom for box in row)
-    confidences = [box.confidence for box in row if box.confidence is not None]
+def ocr_boxes_to_block(boxes: list[OcrLineBox], *, separator: str) -> OcrBlock:
+    """One block from boxes already in reading order, keeping each box as a text line.
+
+    Horizontal pieces of a row are joined with a space; the columns of a
+    vertical bubble with nothing, since the sentence simply wraps.
+    """
+    left = min(box.left for box in boxes)
+    top = min(box.top for box in boxes)
+    right = max(box.right for box in boxes)
+    bottom = max(box.bottom for box in boxes)
+    confidences = [box.confidence for box in boxes if box.confidence is not None]
+    parts: list[str] = []
+    lines: list[OcrTextLine] = []
+    cursor = 0
+    for box in boxes:
+        text = " ".join(box.text.split())
+        if not text:
+            continue
+        if parts:
+            parts.append(separator)
+            cursor += len(separator)
+        parts.append(text)
+        lines.append(
+            OcrTextLine(
+                start=cursor,
+                end=cursor + len(text),
+                left=box.left,
+                top=box.top,
+                right=box.right,
+                bottom=box.bottom,
+                vertical=box.is_vertical_column,
+            )
+        )
+        cursor += len(text)
     return OcrBlock(
-        text=" ".join(box.text for box in row),
+        text="".join(parts),
         confidence=min(confidences) if confidences else None,
         bbox=[[left, top], [right, top], [right, bottom], [left, bottom]],
+        lines=tuple(lines),
     )
 
 
+def ocr_row_to_block(row: list[OcrLineBox]) -> OcrBlock:
+    return ocr_boxes_to_block(row, separator=" ")
+
+
 def ocr_line_boxes_to_blocks(boxes: list[OcrLineBox]) -> list[OcrBlock]:
-    return [ocr_row_to_block(row) for row in group_ocr_line_boxes_into_rows(boxes)]
+    """Rows of horizontal lines and bubbles of vertical columns, top to bottom.
+
+    Vertical columns never join a horizontal row: side-by-side columns share a
+    band, so the row rule would glue neighbouring bubbles together left to right.
+    """
+    vertical = [box for box in boxes if box.is_vertical_column]
+    horizontal = [box for box in boxes if not box.is_vertical_column]
+    blocks = [ocr_row_to_block(row) for row in group_ocr_line_boxes_into_rows(horizontal)]
+    blocks.extend(
+        ocr_boxes_to_block(bubble, separator="")
+        for bubble in group_vertical_columns_into_bubbles(vertical)
+    )
+    blocks.sort(key=lambda block: (bbox_bounds(block.bbox)[1], bbox_bounds(block.bbox)[0]))
+    return blocks
 
 
 class MangaOcrBackend:

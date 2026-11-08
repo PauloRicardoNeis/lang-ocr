@@ -52,3 +52,14 @@ auto_process_jobs = true
 # on these to pin a window to a fixed language set, and sources get the window
 # title. Set to false to store nothing about the active window.
 # record_foreground_window = true
+
+# Reading overlay (JP/translate_overlay.py), started and kept running by the
+# daemon. overlay_hotkey shows/hides it, overlay_mode_hotkey cycles translation
+# -> furigana -> word by word ("" disables it). On/off, mode and languages are
+# set from the tray ("Reading overlay") and stored in overlay_state_path.
+#
+# overlay_hotkey = "Ctrl+Alt+Q"
+# overlay_mode_hotkey = "Ctrl+Alt+W"
+# overlay_script = "translate_overlay.py"
+# overlay_state_path = "data/translate_overlay.toml"
+# overlay_log_path = "data/translate_overlay.log"

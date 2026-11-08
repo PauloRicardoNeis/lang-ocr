@@ -312,10 +312,34 @@ class ProcessJobTest(unittest.TestCase):
         self.assertIn("stick", lemmas)
         self.assertEqual(pending, ["Frobably"])
 
-    def test_captures_of_the_tooling_are_skipped_before_ocr(self) -> None:
+    def test_nothing_is_skipped_without_skip_rules(self) -> None:
         connection = db_connect(self.db_path)
         try:
             lang_jp.set_capture_languages(connection, ["en"])
+            claude = self.enqueue(connection, "claude", window_title="Claude", process_name="claude.exe")
+            connection.commit()
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("Press START", 10, 10, 200, 40)])
+        with patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub):
+            while capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline()):
+                pass
+        connection = db_connect(self.db_path)
+        try:
+            status = connection.execute("SELECT status FROM capture_jobs WHERE id = ?", (claude,)).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(status, "accepted")
+        self.assertEqual(stub.calls, 1)
+
+    def test_windows_matching_skip_rules_are_skipped_before_ocr(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["en"])
+            # Rules are stored lower-case: process names match exactly, titles by substring.
+            lang_jp.add_capture_skip_rule(connection, "process", "Claude.EXE")
+            lang_jp.add_capture_skip_rule(connection, "title", "Lang Catalog")
+            self.assertFalse(lang_jp.add_capture_skip_rule(connection, "process", "claude.exe"))
             claude = self.enqueue(connection, "claude", window_title="Claude", process_name="Claude.exe")
             catalog = self.enqueue(connection, "catalog", window_title="Lang Catalog - Brave", process_name="brave.exe")
             # Inner catalog pages, titled through lang_jp_web.page_title().

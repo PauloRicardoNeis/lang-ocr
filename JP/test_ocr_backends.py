@@ -387,6 +387,65 @@ class LineBoxPipelineTest(unittest.TestCase):
         self.assertEqual(blocks[0].bbox, [[100, 100], [480, 100], [480, 142], [100, 142]])
 
 
+def column(text: str, left: float, top: float, right: float, bottom: float) -> OcrLineBox:
+    return OcrLineBox(text=text, confidence=0.9, left=left, top=top, right=right, bottom=bottom, vertical=True)
+
+
+class VerticalTextTest(unittest.TestCase):
+    """Manga: columns read top to bottom, right to left, one bubble per block."""
+
+    # Two bubbles side by side at the same height, three and two columns each
+    # (the layout the horizontal row rule used to glue together left to right).
+    RIGHT_BUBBLE = [
+        column("おい、", 1250, 231, 1298, 374),
+        column("そこの剣を", 1168, 233, 1218, 527),
+        column("取ってくれ!", 1087, 232, 1144, 572),
+    ]
+    LEFT_BUBBLE = [
+        column("今日は", 476, 358, 525, 534),
+        column("いいね。", 393, 365, 447, 567),
+    ]
+
+    def test_columns_form_one_block_per_bubble_read_right_to_left(self) -> None:
+        blocks = ocr_line_boxes_to_blocks(list(reversed(self.LEFT_BUBBLE + self.RIGHT_BUBBLE)))
+        self.assertEqual(
+            sorted(block.text for block in blocks),
+            ["おい、そこの剣を取ってくれ!", "今日はいいね。"],
+        )
+        right = next(block for block in blocks if block.text.startswith("おい"))
+        self.assertTrue(right.vertical)
+        self.assertEqual([(line.start, line.end) for line in right.lines], [(0, 3), (3, 8), (8, 14)])
+        self.assertEqual(right.lines[0].left, 1250)
+
+    def test_engine_flag_alone_does_not_make_a_wide_box_vertical(self) -> None:
+        wide = OcrLineBox(text="はい", confidence=0.9, left=0, top=0, right=100, bottom=40, vertical=True)
+        self.assertFalse(wide.is_vertical_column)
+        self.assertFalse(ocr_line_boxes_to_blocks([wide])[0].vertical)
+
+    def test_horizontal_rows_keep_their_pieces_as_lines(self) -> None:
+        blocks = ocr_line_boxes_to_blocks([box("いいえ", 100, 102, 220, 142), box("はい", 400, 100, 480, 140)])
+        self.assertEqual(blocks[0].text, "いいえ はい")
+        self.assertEqual([(line.start, line.end) for line in blocks[0].lines], [(0, 3), (4, 6)])
+        self.assertFalse(blocks[0].vertical)
+
+    def test_vertical_ruby_right_of_its_kanji_column_is_dropped(self) -> None:
+        body = column("勇者の剣", 200, 100, 250, 300)
+        ruby = column("ゆうしゃ", 252, 100, 272, 190)
+        neighbour = column("そうだね", 130, 100, 180, 300)
+        self.assertEqual(drop_furigana_boxes([body, ruby, neighbour]), [body, neighbour])
+
+    def test_scaling_moves_line_geometry_too(self) -> None:
+        block = ocr_line_boxes_to_blocks(self.LEFT_BUBBLE)[0]
+        scaled = scale_ocr_blocks([block], 2.0)[0]
+        self.assertEqual(scaled.lines[0].left, 952)
+        self.assertTrue(scaled.vertical)
+
+    def test_with_text_keeps_geometry_only_for_unchanged_text(self) -> None:
+        block = ocr_line_boxes_to_blocks(self.LEFT_BUBBLE)[0]
+        self.assertEqual(block.with_text(block.text).lines, block.lines)
+        self.assertEqual(block.with_text(block.text + "!").lines, ())
+
+
 class MeikiOcrBackendTest(unittest.TestCase):
     @unittest.skipUnless(find_spec("numpy") is not None, "numpy is only installed in the OCR environment")
     def test_read_blocks_filters_engine_output_without_loading_models(self) -> None:

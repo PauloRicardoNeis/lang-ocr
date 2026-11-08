@@ -18,11 +18,13 @@ use image::codecs::png::PngEncoder;
 use img_hash::image::{ImageBuffer, Rgba, RgbaImage};
 use img_hash::{HasherConfig, ImageHash};
 use rusqlite::{Connection, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use trayicon::{Icon, MenuBuilder, TrayIcon, TrayIconBuilder};
-use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
+use windows_capture::dxgi_duplication_api::{
+    DxgiDuplicationApi, DxgiDuplicationFormat, Error as DxgiDuplicationError,
+};
 use windows_capture::monitor::Monitor;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows_sys::Win32::System::Threading::{
@@ -63,8 +65,15 @@ enum UserEvent {
     OpenCatalog,
     OpenCaptureSettings,
     ToggleCaptureLanguage(String),
+    /// Add or remove one capture skip rule: (kind, pattern).
+    ToggleSkipRule(String, String),
+    SkipLastCaptureApp,
     CaptureAllLanguages,
     CaptureJapaneseOnly,
+    ToggleOverlay,
+    SetOverlayMode(String),
+    ToggleOverlayJapaneseOnly,
+    OpenOverlayLog,
     Quit,
     WorkerExited(WorkerLaunchMode),
 }
@@ -120,6 +129,11 @@ struct DaemonConfig {
     web_log_path: PathBuf,
     #[serde(default = "default_true")]
     record_foreground_window: bool,
+    overlay_hotkey: String,
+    overlay_mode_hotkey: String,
+    overlay_script: PathBuf,
+    overlay_state_path: PathBuf,
+    overlay_log_path: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -145,6 +159,11 @@ struct DaemonConfigPatch {
     web_python_args: Option<Vec<String>>,
     web_log_path: Option<PathBuf>,
     record_foreground_window: Option<bool>,
+    overlay_hotkey: Option<String>,
+    overlay_mode_hotkey: Option<String>,
+    overlay_script: Option<PathBuf>,
+    overlay_state_path: Option<PathBuf>,
+    overlay_log_path: Option<PathBuf>,
 }
 
 fn jp_root() -> PathBuf {
@@ -216,6 +235,11 @@ impl Default for DaemonConfig {
             web_python_args: None,
             web_log_path: jp_root.join("data").join("catalog_web.log"),
             record_foreground_window: true,
+            overlay_hotkey: DEFAULT_OVERLAY_HOTKEY.to_string(),
+            overlay_mode_hotkey: DEFAULT_OVERLAY_MODE_HOTKEY.to_string(),
+            overlay_script: jp_root.join("translate_overlay.py"),
+            overlay_state_path: jp_root.join("data").join("translate_overlay.toml"),
+            overlay_log_path: jp_root.join("data").join("translate_overlay.log"),
         }
     }
 }
@@ -229,6 +253,9 @@ fn default_ocr_max_side() -> u64 {
 }
 
 const DEFAULT_WEB_PORT: u16 = 8766;
+const DEFAULT_OVERLAY_HOTKEY: &str = "Ctrl+Alt+Q";
+const DEFAULT_OVERLAY_MODE_HOTKEY: &str = "Ctrl+Alt+W";
+const OVERLAY_HEALTHY_RUN: Duration = Duration::from_secs(30);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const WEB_SERVER_HEALTHY_RUN: Duration = Duration::from_secs(30);
 const CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -304,6 +331,21 @@ impl DaemonConfig {
         }
         if let Some(value) = patch.record_foreground_window {
             self.record_foreground_window = value;
+        }
+        if let Some(value) = patch.overlay_hotkey {
+            self.overlay_hotkey = value;
+        }
+        if let Some(value) = patch.overlay_mode_hotkey {
+            self.overlay_mode_hotkey = value;
+        }
+        if let Some(value) = patch.overlay_script {
+            self.overlay_script = resolve_jp_config_path(value);
+        }
+        if let Some(value) = patch.overlay_state_path {
+            self.overlay_state_path = resolve_jp_config_path(value);
+        }
+        if let Some(value) = patch.overlay_log_path {
+            self.overlay_log_path = resolve_jp_config_path(value);
         }
         self
     }
@@ -508,6 +550,9 @@ struct SharedState {
     capture_in_progress: bool,
     next_capture_at: Option<SystemTime>,
     pending_manual_capture: bool,
+    /// The next capture tick was asked for by hand (hotkey or tray), so it is
+    /// taken even while the previous frame still waits for the worker.
+    manual_capture_due: bool,
 }
 
 struct Controller {
@@ -522,6 +567,8 @@ struct Controller {
     debug_flag: Arc<AtomicBool>,
     web_child: Arc<Mutex<Option<Child>>>,
     web_stop_flag: Arc<AtomicBool>,
+    overlay_child: Arc<Mutex<Option<Child>>>,
+    overlay_stop_flag: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -545,12 +592,15 @@ impl Controller {
                 capture_in_progress: false,
                 next_capture_at: None,
                 pending_manual_capture: false,
+                manual_capture_due: false,
             })),
             stop_flag: Arc::new(AtomicBool::new(false)),
             pause_flag: Arc::new(AtomicBool::new(false)),
             debug_flag: Arc::new(AtomicBool::new(false)),
             web_child: Arc::new(Mutex::new(None)),
             web_stop_flag: Arc::new(AtomicBool::new(false)),
+            overlay_child: Arc::new(Mutex::new(None)),
+            overlay_stop_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -762,6 +812,7 @@ impl Controller {
         }
 
         guard.pending_manual_capture = false;
+        guard.manual_capture_due = true;
         guard.next_capture_at = Some(SystemTime::now());
         self.append_log(
             "manual capture requested; next capture scheduled immediately and timer reset",
@@ -832,6 +883,136 @@ impl Controller {
     fn shutdown(&self) {
         self.stop();
         self.stop_web_server();
+        self.stop_overlay();
+    }
+
+    /// Keeps `translate_overlay.py` running while the state file says it is enabled.
+    ///
+    /// The overlay owns its hotkeys and its window; the daemon only starts it,
+    /// restarts it when it dies (with the web server's backoff) and stops it
+    /// when it is switched off from the tray or the daemon quits. The mode and
+    /// languages are read by the overlay on every press, so changing them from
+    /// the tray needs no restart.
+    fn spawn_overlay_supervisor(&self) {
+        let config = self.config.clone();
+        let child_slot = Arc::clone(&self.overlay_child);
+        let stop_flag = Arc::clone(&self.overlay_stop_flag);
+        if overlay_hotkeys_clash(&config) {
+            append_log_file(
+                &config.log_path,
+                &format!(
+                    "overlay hotkey {} is also the capture hotkey; one of them will not register",
+                    config.overlay_hotkey
+                ),
+            );
+        }
+        std::thread::spawn(move || {
+            let mut consecutive_failures: u32 = 0;
+            let mut started_at: Option<Instant> = None;
+            let mut next_attempt_at = Instant::now();
+            loop {
+                {
+                    let mut guard = child_slot.lock().unwrap();
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let enabled = load_overlay_state(&config.overlay_state_path).enabled;
+                    if !enabled {
+                        if let Some(mut child) = guard.take() {
+                            kill_process_tree(&mut child);
+                            append_log_file(&config.log_path, "reading overlay stopped (disabled)");
+                        }
+                        consecutive_failures = 0;
+                        next_attempt_at = Instant::now();
+                    } else if let Some(child) = guard.as_mut() {
+                        let exit_status = match child.try_wait() {
+                            Ok(None) => None,
+                            Ok(Some(status)) => Some(status.to_string()),
+                            Err(error) => Some(format!("unknown ({error})")),
+                        };
+                        if let Some(status) = exit_status {
+                            *guard = None;
+                            let ran_for = started_at.take().map(|at| at.elapsed()).unwrap_or_default();
+                            if ran_for >= OVERLAY_HEALTHY_RUN {
+                                consecutive_failures = 0;
+                            }
+                            consecutive_failures += 1;
+                            let delay = web_server_restart_delay(consecutive_failures);
+                            next_attempt_at = Instant::now() + delay;
+                            append_log_file(
+                                &config.log_path,
+                                &format!(
+                                    "reading overlay exited status={status} after {}s; restarting in {}s (see {})",
+                                    ran_for.as_secs(),
+                                    delay.as_secs(),
+                                    short_path(&config.overlay_log_path)
+                                ),
+                            );
+                        }
+                    } else if Instant::now() >= next_attempt_at {
+                        match spawn_overlay_process(&config) {
+                            Ok(child) => {
+                                append_log_file(
+                                    &config.log_path,
+                                    &format!(
+                                        "spawned reading overlay pid={} hotkey={} mode_hotkey={}",
+                                        child.id(),
+                                        config.overlay_hotkey,
+                                        config.overlay_mode_hotkey
+                                    ),
+                                );
+                                *guard = Some(child);
+                                started_at = Some(Instant::now());
+                            }
+                            Err(error) => {
+                                consecutive_failures += 1;
+                                let delay = web_server_restart_delay(consecutive_failures);
+                                next_attempt_at = Instant::now() + delay;
+                                append_log_file(
+                                    &config.log_path,
+                                    &format!(
+                                        "failed to spawn reading overlay: {error:#}; retrying in {}s",
+                                        delay.as_secs()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    fn stop_overlay(&self) {
+        let child = {
+            let mut guard = self.overlay_child.lock().unwrap();
+            self.overlay_stop_flag.store(true, Ordering::Relaxed);
+            guard.take()
+        };
+        if let Some(mut child) = child {
+            kill_process_tree(&mut child);
+            self.append_log("reading overlay stopped");
+        }
+    }
+
+    fn update_overlay_state(&self, change: impl FnOnce(&mut OverlayFileState)) {
+        let mut state = load_overlay_state(&self.config.overlay_state_path);
+        change(&mut state);
+        match save_overlay_state(&self.config.overlay_state_path, &state) {
+            Ok(()) => self.append_log(&format!(
+                "reading overlay enabled={} mode={} languages={}",
+                state.enabled, state.mode, state.languages
+            )),
+            Err(error) => self.append_log(&format!("failed to save overlay state: {error:#}")),
+        }
+    }
+
+    fn open_overlay_log(&self) {
+        let log_path = self.config.overlay_log_path.clone();
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", log_path.to_string_lossy().as_ref()])
+            .spawn();
     }
 
     fn open_catalog(&self) {
@@ -857,6 +1038,32 @@ impl Controller {
                 if current { "disabled" } else { "enabled" }
             )),
             Err(error) => self.append_log(&format!("failed to update capture language {code}: {error:#}")),
+        }
+    }
+
+    /// Adds the rule when it is missing, removes it when present.
+    fn toggle_skip_rule(&self, kind: &str, pattern: &str) {
+        let present = load_skip_rules(&self.config.db_path)
+            .iter()
+            .any(|rule| rule.kind == kind && rule.pattern == pattern);
+        match set_skip_rule(&self.config.db_path, kind, pattern, !present) {
+            Ok(()) => self.append_log(&format!(
+                "capture skip rule {kind} {pattern:?} {}",
+                if present { "removed" } else { "added" }
+            )),
+            Err(error) => self.append_log(&format!("failed to update capture skip rule: {error:#}")),
+        }
+    }
+
+    /// The tray menu itself has focus when it is open, so "this window" means the
+    /// foreground window of the most recent queued capture.
+    fn skip_last_capture_app(&self) {
+        match last_capture_process(&self.config.db_path) {
+            Some(process) => match set_skip_rule(&self.config.db_path, "process", &process, true) {
+                Ok(()) => self.append_log(&format!("capture skip rule process {process:?} added")),
+                Err(error) => self.append_log(&format!("failed to add capture skip rule: {error:#}")),
+            },
+            None => self.append_log("no recent capture with a process name to skip"),
         }
     }
 
@@ -1196,6 +1403,10 @@ impl Controller {
             };
             let mut recent: VecDeque<CaptureFingerprint> = VecDeque::new();
             let hasher = HasherConfig::new().hash_size(8, 8).to_hasher();
+            // Windows drops the duplication on a lock screen, UAC prompt, display
+            // or resolution change and fullscreen switches. Every later acquire then
+            // fails (0x887A0001) until the duplication is created again.
+            let mut recreate_capture = false;
 
             while !stop_flag.load(Ordering::Relaxed) {
                 if pause_flag.load(Ordering::Relaxed) {
@@ -1209,17 +1420,38 @@ impl Controller {
                 continue;
                 }
 
-                {
+                let (manual_tick, worker_running) = {
                     let mut guard = shared_state.lock().unwrap();
                     guard.capture_in_progress = true;
                     guard.next_capture_at = None;
-                }
+                    (
+                        std::mem::take(&mut guard.manual_capture_due)
+                            || matches!(mode, CaptureLoopMode::ManualBurst { .. }),
+                        guard.worker_child.is_some(),
+                    )
+                };
 
                 if debug_flag.load(Ordering::Relaxed) {
                     append_log_file(&log_path, "capture tick");
                 }
 
                 let tick_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // OCR of a full screen takes far longer than the capture
+                    // interval; queueing a frame every tick only piles up PNGs the
+                    // worker never reaches. Wait until it has taken the last one.
+                    let latest_job = db_latest_capture_job(&config.db_path);
+                    if should_wait_for_worker(manual_tick, worker_running, latest_job.as_ref()) {
+                        if let Some(job) = &latest_job {
+                            append_log_file(
+                                &log_path,
+                                &format!(
+                                    "skip capture reason=previous_frame_waiting job={}",
+                                    job.id
+                                ),
+                            );
+                        }
+                        return;
+                    }
                     match capture.acquire_next_frame(33) {
                     Ok(mut frame) => {
                         let frame_buffer = match frame.buffer() {
@@ -1357,6 +1589,9 @@ impl Controller {
                             &log_path,
                             &format!("failed to acquire frame: {error}"),
                         );
+                        if !matches!(error, DxgiDuplicationError::Timeout) {
+                            recreate_capture = true;
+                        }
                     }
                 }
                 }));
@@ -1368,6 +1603,32 @@ impl Controller {
                     );
                 }
 
+                if recreate_capture {
+                    // A fresh duplication of the current primary monitor also covers a
+                    // resolution or primary-display change. If Windows still refuses
+                    // (secure desktop showing), keep the old one and try next tick.
+                    let recreated = Monitor::primary()
+                        .map_err(|error| error.to_string())
+                        .and_then(|monitor| {
+                            DxgiDuplicationApi::new_options(
+                                monitor,
+                                &[DxgiDuplicationFormat::Bgra8, DxgiDuplicationFormat::Rgba8],
+                            )
+                            .map_err(|error| error.to_string())
+                        });
+                    match recreated {
+                        Ok(new_capture) => {
+                            capture = new_capture;
+                            recreate_capture = false;
+                            append_log_file(&log_path, "DXGI duplication recreated");
+                        }
+                        Err(error) => append_log_file(
+                            &log_path,
+                            &format!("failed to recreate DXGI duplication: {error}"),
+                        ),
+                    }
+                }
+
                 let current_interval_seconds = interval_seconds.load(Ordering::Relaxed);
                 let mut follow_up_capture_requested = false;
                 let use_after_source_cadence =
@@ -1377,6 +1638,7 @@ impl Controller {
                     guard.capture_in_progress = false;
                     if guard.pending_manual_capture {
                         guard.pending_manual_capture = false;
+                        guard.manual_capture_due = true;
                         guard.next_capture_at = Some(SystemTime::now());
                         follow_up_capture_requested = true;
                     } else if use_after_source_cadence {
@@ -1466,6 +1728,8 @@ struct App {
     controller: Arc<Controller>,
     proxy: EventLoopProxy<UserEvent>,
     menu_languages: Vec<CaptureLanguage>,
+    menu_skip_rules: Vec<SkipRule>,
+    menu_overlay: OverlayFileState,
     tick_count: u64,
 }
 
@@ -1594,6 +1858,129 @@ fn set_capture_languages_preset(db_path: &Path, japanese_only: bool) -> Result<(
     Ok(())
 }
 
+/// One row of `capture_skip_rules`: captures of matching windows are rejected
+/// by the worker before OCR (`kind` "process" = exact executable name, "title" =
+/// substring of the window title; both stored lower-case). The Python side owns
+/// the schema; the tray only reads and toggles rows. See the "Capture
+/// blacklist" section of lang_jp.py for every skip/reject rule.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SkipRule {
+    kind: String,
+    pattern: String,
+}
+
+/// Shortcuts shown as checkboxes in "Skip windows" even when not listed yet.
+const SKIP_RULE_PRESETS: [(&str, &str, &str); 3] = [
+    ("process", "claude.exe", "Claude (claude.exe)"),
+    ("title", "lang catalog", "Catalog pages (title: Lang Catalog)"),
+    ("process", "desktop_capture_daemon.exe", "This tray app"),
+];
+
+const SKIP_RULE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS capture_skip_rules (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('process', 'title')),
+    pattern TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(kind, pattern)
+)";
+
+fn load_skip_rules(db_path: &Path) -> Vec<SkipRule> {
+    let Ok(connection) = open_db(db_path) else {
+        return Vec::new();
+    };
+    let Ok(mut statement) =
+        connection.prepare("SELECT kind, pattern FROM capture_skip_rules ORDER BY kind, pattern")
+    else {
+        // Table not created yet (older database): nothing is skipped.
+        return Vec::new();
+    };
+    let rows = statement.query_map([], |row| {
+        Ok(SkipRule {
+            kind: row.get::<_, String>(0)?,
+            pattern: row.get::<_, String>(1)?,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.filter_map(Result::ok).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn set_skip_rule(db_path: &Path, kind: &str, pattern: &str, present: bool) -> Result<()> {
+    let pattern = pattern.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    if pattern.is_empty() || !matches!(kind, "process" | "title") {
+        return Err(anyhow!("invalid skip rule {kind} {pattern:?}"));
+    }
+    let connection = open_db(db_path)?;
+    connection.execute(SKIP_RULE_TABLE_SQL, [])?;
+    if present {
+        connection.execute(
+            "INSERT OR IGNORE INTO capture_skip_rules (kind, pattern) VALUES (?1, ?2)",
+            params![kind, pattern],
+        )?;
+    } else {
+        connection.execute(
+            "DELETE FROM capture_skip_rules WHERE kind = ?1 AND pattern = ?2",
+            params![kind, pattern],
+        )?;
+    }
+    Ok(())
+}
+
+fn last_capture_process(db_path: &Path) -> Option<String> {
+    let connection = open_db(db_path).ok()?;
+    connection
+        .query_row(
+            "SELECT process_name FROM capture_jobs
+             WHERE COALESCE(TRIM(process_name), '') <> ''
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
+fn skip_windows_menu(rules: &[SkipRule]) -> MenuBuilder<UserEvent> {
+    let mut menu = MenuBuilder::new()
+        .item("Edit skip list (web)", UserEvent::OpenCaptureSettings)
+        .item("Skip the app of the last capture", UserEvent::SkipLastCaptureApp)
+        .separator();
+    let listed = |kind: &str, pattern: &str| {
+        rules.iter().any(|rule| rule.kind == kind && rule.pattern == pattern)
+    };
+    for (kind, pattern, label) in SKIP_RULE_PRESETS {
+        menu = menu.checkable(
+            label,
+            listed(kind, pattern),
+            UserEvent::ToggleSkipRule(kind.to_string(), pattern.to_string()),
+        );
+    }
+    let others: Vec<&SkipRule> = rules
+        .iter()
+        .filter(|rule| {
+            !SKIP_RULE_PRESETS
+                .iter()
+                .any(|(kind, pattern, _)| rule.kind == *kind && rule.pattern == *pattern)
+        })
+        .collect();
+    if !others.is_empty() {
+        menu = menu.separator();
+    }
+    for rule in others {
+        let label = if rule.kind == "title" {
+            format!("Title: {}", rule.pattern)
+        } else {
+            rule.pattern.clone()
+        };
+        menu = menu.checkable(
+            &label,
+            true,
+            UserEvent::ToggleSkipRule(rule.kind.clone(), rule.pattern.clone()),
+        );
+    }
+    menu
+}
+
 fn capture_languages_menu(languages: &[CaptureLanguage]) -> MenuBuilder<UserEvent> {
     let mut menu = MenuBuilder::new()
         .item("Open capture settings (web)", UserEvent::OpenCaptureSettings)
@@ -1616,6 +2003,168 @@ fn capture_languages_menu(languages: &[CaptureLanguage]) -> MenuBuilder<UserEven
     menu
 }
 
+/// `data/translate_overlay.toml`, shared with `translate_overlay.py`: the tray
+/// writes it, the overlay reads it on every press and writes the mode when its
+/// mode hotkey cycles it and the label size when it is zoomed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+struct OverlayFileState {
+    #[serde(default = "default_overlay_mode")]
+    mode: String,
+    #[serde(default = "default_overlay_languages")]
+    languages: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    /// Label size set from the overlay (Ctrl+wheel, Ctrl+=/-); the tray only
+    /// carries it through when it rewrites the file.
+    #[serde(default = "default_overlay_scale")]
+    scale: f64,
+}
+
+impl Default for OverlayFileState {
+    fn default() -> Self {
+        Self {
+            mode: default_overlay_mode(),
+            languages: default_overlay_languages(),
+            enabled: true,
+            scale: default_overlay_scale(),
+        }
+    }
+}
+
+fn default_overlay_scale() -> f64 {
+    1.0
+}
+
+const OVERLAY_MODES: [(&str, &str); 3] = [
+    ("translation", "Translation (whole lines)"),
+    ("furigana", "Furigana (readings over kanji)"),
+    ("words", "Word by word (gloss under each word)"),
+];
+
+fn default_overlay_mode() -> String {
+    "translation".to_string()
+}
+
+fn default_overlay_languages() -> String {
+    "ja".to_string()
+}
+
+fn load_overlay_state(path: &Path) -> OverlayFileState {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return OverlayFileState::default();
+    };
+    let mut state: OverlayFileState = toml::from_str(&raw).unwrap_or_default();
+    if !OVERLAY_MODES.iter().any(|(mode, _)| *mode == state.mode) {
+        state.mode = default_overlay_mode();
+    }
+    if state.languages != "ja" && state.languages != "capture" {
+        state.languages = default_overlay_languages();
+    }
+    state
+}
+
+fn save_overlay_state(path: &Path, state: &OverlayFileState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, toml::to_string(state)?)?;
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
+fn overlay_hotkeys_clash(config: &DaemonConfig) -> bool {
+    let normalize = |value: &str| value.replace(' ', "").to_ascii_lowercase();
+    config
+        .manual_capture_hotkey
+        .as_deref()
+        .map(|capture| normalize(capture) == normalize(&config.overlay_hotkey))
+        .unwrap_or(false)
+}
+
+fn overlay_submenu_label(config: &DaemonConfig, overlay: &OverlayFileState) -> String {
+    if overlay.enabled {
+        format!("Reading overlay [{}]", config.overlay_hotkey)
+    } else {
+        "Reading overlay (off)".to_string()
+    }
+}
+
+fn overlay_menu(config: &DaemonConfig, overlay: &OverlayFileState) -> MenuBuilder<UserEvent> {
+    let mut menu = MenuBuilder::new()
+        .checkable(
+            &format!("Enabled (show/hide: {})", config.overlay_hotkey),
+            overlay.enabled,
+            UserEvent::ToggleOverlay,
+        )
+        .separator();
+    for (mode, label) in OVERLAY_MODES {
+        menu = menu.checkable(label, overlay.mode == mode, UserEvent::SetOverlayMode(mode.to_string()));
+    }
+    let cycle_label = if config.overlay_mode_hotkey.trim().is_empty() {
+        "Next mode".to_string()
+    } else {
+        format!("Next mode [{}]", config.overlay_mode_hotkey)
+    };
+    menu.item(&cycle_label, UserEvent::SetOverlayMode(next_overlay_mode(&overlay.mode)))
+        .separator()
+        .checkable(
+            "Read Japanese only (fast)",
+            overlay.languages == "ja",
+            UserEvent::ToggleOverlayJapaneseOnly,
+        )
+        .item("Open overlay log", UserEvent::OpenOverlayLog)
+}
+
+fn next_overlay_mode(mode: &str) -> String {
+    let index = OVERLAY_MODES
+        .iter()
+        .position(|(candidate, _)| *candidate == mode)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    OVERLAY_MODES[index % OVERLAY_MODES.len()].0.to_string()
+}
+
+fn overlay_command(config: &DaemonConfig) -> Command {
+    let mut command = Command::new(&config.python_executable);
+    command
+        .args(&config.python_args)
+        .arg(&config.overlay_script)
+        .arg("--db")
+        .arg(&config.db_path)
+        .arg("--state")
+        .arg(&config.overlay_state_path)
+        .arg("--hotkey")
+        .arg(&config.overlay_hotkey)
+        .arg("--mode-hotkey")
+        .arg(&config.overlay_mode_hotkey)
+        .current_dir(jp_root())
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8");
+    command
+}
+
+fn spawn_overlay_process(config: &DaemonConfig) -> Result<Child> {
+    if let Some(parent) = config.overlay_log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.overlay_log_path)
+        .with_context(|| format!("failed to open {}", config.overlay_log_path.display()))?;
+    let stderr_file = log_file.try_clone()?;
+    let mut command = overlay_command(config);
+    command
+        .stdin(Stdio::null())
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .creation_flags(CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .with_context(|| format!("failed to launch {}", config.python_executable))
+}
+
 fn capture_now_menu_label(config: &DaemonConfig) -> String {
     match config
         .manual_capture_hotkey
@@ -1633,11 +2182,25 @@ impl App {
     /// (or always, right after a toggle from the menu itself).
     fn refresh_menu(&mut self, force: bool) {
         let languages = load_capture_languages(&self.controller.config.db_path);
-        if !force && languages == self.menu_languages {
+        let skip_rules = load_skip_rules(&self.controller.config.db_path);
+        // The mode hotkey changes the overlay state too; pick that up here.
+        let overlay = load_overlay_state(&self.controller.config.overlay_state_path);
+        if !force
+            && languages == self.menu_languages
+            && skip_rules == self.menu_skip_rules
+            && overlay == self.menu_overlay
+        {
             return;
         }
         self.menu_languages = languages;
-        let menu = build_tray_menu(&self.controller.config, &self.menu_languages);
+        self.menu_skip_rules = skip_rules;
+        self.menu_overlay = overlay;
+        let menu = build_tray_menu(
+            &self.controller.config,
+            &self.menu_languages,
+            &self.menu_skip_rules,
+            &self.menu_overlay,
+        );
         if let Err(error) = self.tray_icon.set_menu(&menu) {
             self.controller
                 .append_log(&format!("failed to refresh tray menu: {error:?}"));
@@ -1716,6 +2279,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.controller.toggle_capture_language(&code);
                 self.refresh_menu(true);
             }
+            UserEvent::ToggleSkipRule(kind, pattern) => {
+                self.controller.toggle_skip_rule(&kind, &pattern);
+                self.refresh_menu(true);
+            }
+            UserEvent::SkipLastCaptureApp => {
+                self.controller.skip_last_capture_app();
+                self.refresh_menu(true);
+            }
             UserEvent::CaptureAllLanguages => {
                 self.controller.set_capture_preset(false);
                 self.refresh_menu(true);
@@ -1724,6 +2295,25 @@ impl ApplicationHandler<UserEvent> for App {
                 self.controller.set_capture_preset(true);
                 self.refresh_menu(true);
             }
+            UserEvent::ToggleOverlay => {
+                self.controller.update_overlay_state(|state| state.enabled = !state.enabled);
+                self.refresh_menu(true);
+            }
+            UserEvent::SetOverlayMode(mode) => {
+                self.controller.update_overlay_state(|state| state.mode = mode);
+                self.refresh_menu(true);
+            }
+            UserEvent::ToggleOverlayJapaneseOnly => {
+                self.controller.update_overlay_state(|state| {
+                    state.languages = if state.languages == "ja" {
+                        "capture".to_string()
+                    } else {
+                        "ja".to_string()
+                    };
+                });
+                self.refresh_menu(true);
+            }
+            UserEvent::OpenOverlayLog => self.controller.open_overlay_log(),
             UserEvent::Quit => {
                 self.controller.shutdown();
                 event_loop.exit();
@@ -1750,10 +2340,17 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-fn build_tray_menu(config: &DaemonConfig, languages: &[CaptureLanguage]) -> MenuBuilder<UserEvent> {
+fn build_tray_menu(
+    config: &DaemonConfig,
+    languages: &[CaptureLanguage],
+    skip_rules: &[SkipRule],
+    overlay: &OverlayFileState,
+) -> MenuBuilder<UserEvent> {
     MenuBuilder::new()
         .item("Open Lang", UserEvent::OpenCatalog)
+        .submenu(&overlay_submenu_label(config, overlay), overlay_menu(config, overlay))
         .submenu("Capture languages", capture_languages_menu(languages))
+        .submenu("Skip windows", skip_windows_menu(skip_rules))
         .separator()
         .item("Start", UserEvent::Start)
         .item("Pause", UserEvent::Pause)
@@ -1798,6 +2395,8 @@ fn build_tray_icon(
     proxy: EventLoopProxy<UserEvent>,
     config: &DaemonConfig,
     languages: &[CaptureLanguage],
+    skip_rules: &[SkipRule],
+    overlay: &OverlayFileState,
 ) -> Result<TrayIcon<UserEvent>> {
     let icon = Icon::from_buffer(build_tray_icon_ico(), Some(16), Some(16))
         .map_err(|error| anyhow!("failed to create tray icon: {error}"))?;
@@ -1808,7 +2407,7 @@ fn build_tray_icon(
         .icon(icon)
         .tooltip("Lang Capture")
         .on_double_click(UserEvent::OpenCatalog)
-        .menu(build_tray_menu(config, languages))
+        .menu(build_tray_menu(config, languages, skip_rules, overlay))
         .build()
         .map_err(|error| anyhow!("failed to build tray icon: {error}"))?;
     Ok(tray_icon)
@@ -1987,22 +2586,52 @@ fn db_has_pending_capture_jobs(db_path: &Path) -> bool {
         .is_ok()
 }
 
-fn db_has_processing_capture_jobs(db_path: &Path) -> bool {
-    let Ok(connection) = open_db(db_path) else {
-        return false;
-    };
+#[derive(Clone, Debug, PartialEq)]
+struct LatestCaptureJob {
+    id: i64,
+    status: String,
+}
+
+impl LatestCaptureJob {
+    /// Queued and not yet claimed by the worker.
+    fn is_waiting(&self) -> bool {
+        self.status == "pending"
+    }
+
+    /// Queued or being read by the worker right now.
+    fn is_unfinished(&self) -> bool {
+        self.is_waiting() || self.status == "processing"
+    }
+}
+
+/// The most recently queued capture job. The worker claims the newest pending
+/// job first, so this is the frame it will read next.
+fn db_latest_capture_job(db_path: &Path) -> Option<LatestCaptureJob> {
+    let connection = open_db(db_path).ok()?;
     connection
         .query_row(
-            "
-            SELECT 1
-            FROM capture_jobs
-            WHERE status = 'processing'
-            LIMIT 1
-            ",
+            "SELECT id, status FROM capture_jobs ORDER BY id DESC LIMIT 1",
             [],
-            |_| Ok(()),
+            |row| {
+                Ok(LatestCaptureJob {
+                    id: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            },
         )
-        .is_ok()
+        .ok()
+}
+
+/// Whether a scheduled capture tick should be skipped because the previous
+/// frame still waits for the worker. A capture asked for by hand always goes
+/// through, and with no worker running frames are kept for a later "process
+/// pending queue" instead of being dropped.
+fn should_wait_for_worker(
+    manual_tick: bool,
+    worker_running: bool,
+    latest_job: Option<&LatestCaptureJob>,
+) -> bool {
+    !manual_tick && worker_running && latest_job.is_some_and(LatestCaptureJob::is_waiting)
 }
 
 fn capture_pipeline_ready_for_next_capture(
@@ -2018,7 +2647,9 @@ fn capture_pipeline_ready_for_next_capture(
     if worker_busy {
         return false;
     }
-    !db_has_pending_capture_jobs(db_path) && !db_has_processing_capture_jobs(db_path)
+    // Only the daemon's own last frame matters: the worker takes the newest job
+    // first, so an older backlog must not hold the next capture back forever.
+    !db_latest_capture_job(db_path).is_some_and(|job| job.is_unfinished())
 }
 
 fn should_skip_capture(
@@ -2348,6 +2979,7 @@ fn main() -> Result<()> {
     let tray_config = config.clone();
     let controller = Arc::new(Controller::new(config)?);
     controller.spawn_web_server_supervisor();
+    controller.spawn_overlay_supervisor();
     if options.open_catalog {
         controller.open_catalog();
     }
@@ -2364,13 +2996,23 @@ fn main() -> Result<()> {
         });
     }
     let menu_languages = load_capture_languages(&tray_config.db_path);
-    let tray_icon = build_tray_icon(proxy.clone(), &tray_config, &menu_languages)?;
+    let menu_skip_rules = load_skip_rules(&tray_config.db_path);
+    let menu_overlay = load_overlay_state(&tray_config.overlay_state_path);
+    let tray_icon = build_tray_icon(
+        proxy.clone(),
+        &tray_config,
+        &menu_languages,
+        &menu_skip_rules,
+        &menu_overlay,
+    )?;
     let mut app = App {
         window: None,
         tray_icon,
         controller,
         proxy,
         menu_languages,
+        menu_skip_rules,
+        menu_overlay,
         tick_count: 0,
     };
     event_loop.run_app(&mut app)?;
@@ -2481,6 +3123,91 @@ web_log_path = "data/web.log"
     }
 
     #[test]
+    fn overlay_config_defaults_and_overrides() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.overlay_hotkey, "Ctrl+Alt+Q");
+        assert_eq!(config.overlay_mode_hotkey, "Ctrl+Alt+W");
+        assert_eq!(config.overlay_script, jp_root().join("translate_overlay.py"));
+        assert_eq!(config.overlay_state_path, jp_root().join("data").join("translate_overlay.toml"));
+
+        let config = DaemonConfig::from_toml(
+            r#"
+overlay_hotkey = "Ctrl+Shift+F9"
+overlay_mode_hotkey = ""
+overlay_state_path = "data/overlay.toml"
+"#,
+        )
+        .expect("overlay config should parse");
+        assert_eq!(config.overlay_hotkey, "Ctrl+Shift+F9");
+        assert_eq!(config.overlay_mode_hotkey, "");
+        assert_eq!(config.overlay_state_path, jp_root().join("data/overlay.toml"));
+    }
+
+    #[test]
+    fn overlay_state_round_trips_and_repairs_bad_values() {
+        let temp = std::env::temp_dir().join(format!("overlay-state-{}", std::process::id()));
+        let path = temp.join("translate_overlay.toml");
+        assert_eq!(load_overlay_state(&path), OverlayFileState::default());
+
+        let state = OverlayFileState {
+            mode: "words".to_string(),
+            languages: "capture".to_string(),
+            enabled: false,
+            scale: 1.5,
+        };
+        save_overlay_state(&path, &state).expect("save");
+        assert_eq!(load_overlay_state(&path), state);
+
+        // The Python side writes the same keys; the tray keeps the label scale it set.
+        fs::write(&path, "mode = \"furigana\"\nlanguages = \"ja\"\nenabled = true\nscale = 1.32\n").unwrap();
+        let mut from_python = load_overlay_state(&path);
+        assert_eq!(from_python.mode, "furigana");
+        from_python.enabled = false;
+        save_overlay_state(&path, &from_python).expect("save");
+        assert_eq!(load_overlay_state(&path).scale, 1.32);
+        // Older files without a scale read as 1.0.
+        fs::write(&path, "mode = \"words\"\n").unwrap();
+        assert_eq!(load_overlay_state(&path).scale, 1.0);
+
+        fs::write(&path, "mode = \"bogus\"\nlanguages = \"xx\"\n").unwrap();
+        let repaired = load_overlay_state(&path);
+        assert_eq!(repaired.mode, "translation");
+        assert_eq!(repaired.languages, "ja");
+        assert!(repaired.enabled);
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn overlay_modes_cycle_and_hotkey_clash_is_detected() {
+        assert_eq!(next_overlay_mode("translation"), "furigana");
+        assert_eq!(next_overlay_mode("furigana"), "words");
+        assert_eq!(next_overlay_mode("words"), "translation");
+        assert_eq!(next_overlay_mode("bogus"), "translation");
+
+        let mut config = DaemonConfig::default();
+        config.manual_capture_hotkey = Some("Alt+Q".to_string());
+        assert!(!overlay_hotkeys_clash(&config));
+        config.manual_capture_hotkey = Some("ctrl + alt + q".to_string());
+        assert!(overlay_hotkeys_clash(&config));
+    }
+
+    #[test]
+    fn overlay_command_passes_db_state_and_hotkeys() {
+        let config = DaemonConfig::default();
+        let command = overlay_command(&config);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let tail = &args[args.len() - 9..];
+        assert_eq!(tail[0], config.overlay_script.to_string_lossy());
+        assert_eq!(tail[1], "--db");
+        assert_eq!(tail[3], "--state");
+        assert_eq!(tail[4], config.overlay_state_path.to_string_lossy());
+        assert_eq!(&tail[5..], ["--hotkey", "Ctrl+Alt+Q", "--mode-hotkey", "Ctrl+Alt+W"]);
+    }
+
+    #[test]
     fn daemon_config_reads_foreground_window_flag() {
         let config = DaemonConfig::from_toml("record_foreground_window = false")
             .expect("flag should parse");
@@ -2497,6 +3224,35 @@ web_log_path = "data/web.log"
         );
         assert_eq!(process_name_from_path("game/bin/vn.exe"), Some("vn.exe".to_string()));
         assert_eq!(process_name_from_path(""), None);
+    }
+
+    #[test]
+    fn skip_windows_menu_shows_presets_and_extra_rules() {
+        let rules = vec![
+            SkipRule { kind: "process".into(), pattern: "claude.exe".into() },
+            SkipRule { kind: "process".into(), pattern: "brave.exe".into() },
+        ];
+        let debug = format!("{:?}", skip_windows_menu(&rules));
+        assert!(debug.contains("Claude (claude.exe)"));
+        assert!(debug.contains("brave.exe"));
+        assert!(debug.contains("ToggleSkipRule(\"title\", \"lang catalog\")"));
+    }
+
+    #[test]
+    fn set_skip_rule_creates_the_table_and_toggles_rows() {
+        let dir = std::env::temp_dir().join(format!("skip-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("rules.sqlite3");
+        let _ = std::fs::remove_file(&db);
+        set_skip_rule(&db, "process", "Brave.EXE", true).unwrap();
+        set_skip_rule(&db, "process", "brave.exe", true).unwrap();
+        assert_eq!(
+            load_skip_rules(&db),
+            vec![SkipRule { kind: "process".into(), pattern: "brave.exe".into() }]
+        );
+        set_skip_rule(&db, "process", "brave.exe", false).unwrap();
+        assert!(load_skip_rules(&db).is_empty());
+        assert!(set_skip_rule(&db, "window", "x", true).is_err());
     }
 
     #[test]
@@ -2565,6 +3321,70 @@ web_log_path = "data/web.log"
             .expect("row");
         assert_eq!(title, "DRAGON QUEST XI");
         assert_eq!(process, "DQXI.exe");
+        drop(connection);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn job(id: i64, status: &str) -> LatestCaptureJob {
+        LatestCaptureJob {
+            id,
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn scheduled_capture_waits_while_the_last_frame_is_unclaimed() {
+        let waiting = job(7, "pending");
+        assert!(should_wait_for_worker(false, true, Some(&waiting)));
+        // A hand-made capture always goes through.
+        assert!(!should_wait_for_worker(true, true, Some(&waiting)));
+        // With no worker running, frames are kept for later processing.
+        assert!(!should_wait_for_worker(false, false, Some(&waiting)));
+        // The worker already took the last frame: the next one queues behind it.
+        assert!(!should_wait_for_worker(false, true, Some(&job(7, "processing"))));
+        assert!(!should_wait_for_worker(false, true, Some(&job(7, "accepted"))));
+        assert!(!should_wait_for_worker(false, true, Some(&job(7, "rejected"))));
+        assert!(!should_wait_for_worker(false, true, None));
+    }
+
+    #[test]
+    fn latest_capture_job_ignores_an_older_backlog() {
+        let dir = std::env::temp_dir().join(format!("lang-daemon-latest-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let db_path = dir.join("jobs.sqlite3");
+        let _ = fs::remove_file(&db_path);
+        let connection = open_db(&db_path).expect("open db");
+        connection
+            .execute_batch(
+                "CREATE TABLE capture_jobs (
+                    id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                );",
+            )
+            .expect("table");
+        assert_eq!(db_latest_capture_job(&db_path), None);
+
+        connection
+            .execute_batch(
+                "INSERT INTO capture_jobs (id, status) VALUES (1, 'pending'), (2, 'pending'), (3, 'accepted');",
+            )
+            .expect("backlog");
+        let latest = db_latest_capture_job(&db_path).expect("latest job");
+        assert_eq!(latest, job(3, "accepted"));
+        assert!(!latest.is_unfinished());
+
+        connection
+            .execute("INSERT INTO capture_jobs (id, status) VALUES (4, 'processing')", [])
+            .expect("processing job");
+        let latest = db_latest_capture_job(&db_path).expect("latest job");
+        assert!(latest.is_unfinished());
+        assert!(!latest.is_waiting());
+
+        connection
+            .execute("INSERT INTO capture_jobs (id, status) VALUES (5, 'pending')", [])
+            .expect("pending job");
+        assert!(db_latest_capture_job(&db_path).expect("latest job").is_waiting());
+
         drop(connection);
         let _ = fs::remove_dir_all(&dir);
     }

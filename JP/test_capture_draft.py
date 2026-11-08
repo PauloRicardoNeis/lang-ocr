@@ -20,6 +20,7 @@ from capture_worker import (
     GoogleGtxSourceTranslator,
     build_job_log_banner,
     enrich_job_progress_message,
+    TranslationBackoff,
     process_pending_translation_once,
 )
 from lang_jp import (
@@ -547,6 +548,65 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
             connection.close()
             row = None
             connection = None
+
+    def test_failed_translation_pauses_the_backlog_instead_of_retrying_at_once(self) -> None:
+        class RateLimitedTranslator(GoogleGtxSourceTranslator):
+            calls = 0
+
+            def translate_text(self, text: str, *, source_language: str = "ja") -> str:
+                RateLimitedTranslator.calls += 1
+                raise OSError("HTTP Error 429: Too Many Requests")
+
+        connection = db_connect(self.db_path)
+        try:
+            source_id = create_source_record(
+                connection,
+                source_type="image",
+                ingest_mode="auto_capture",
+                review_status="pending",
+                raw_text="一行目",
+                source_path="C:/tmp/test-translation-backoff.png",
+                image_sha256="sha-test-translation-backoff",
+                ocr_text_hash="hash-translation-backoff",
+            )
+            upsert_source_translation(
+                connection,
+                source_id=source_id,
+                source_text_hash="hash-translation-backoff",
+                target_language="en",
+                provider="google_gtx",
+                status="pending",
+                translated_text=None,
+                error_message=None,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        backoff = TranslationBackoff()
+        translator = RateLimitedTranslator(target_language="en")
+        self.assertTrue(process_pending_translation_once(self.db_path, translator=translator, backoff=backoff))
+        self.assertEqual(RateLimitedTranslator.calls, 1)
+        # The failed row is claimable again, but the backlog waits before retrying it.
+        self.assertFalse(process_pending_translation_once(self.db_path, translator=translator, backoff=backoff))
+        self.assertEqual(RateLimitedTranslator.calls, 1)
+
+        backoff.retry_at = 0.0
+        ok = process_pending_translation_once(
+            self.db_path, translator=StubSourceTranslator(target_language="en"), backoff=backoff
+        )
+        self.assertTrue(ok)
+        self.assertEqual(backoff.failures, 0)
+
+    def test_translation_backoff_doubles_up_to_the_cap(self) -> None:
+        backoff = TranslationBackoff()
+        delays = [backoff.failed(now=0.0) for _ in range(8)]
+        self.assertEqual(delays[:3], [60.0, 120.0, 240.0])
+        self.assertEqual(delays[-1], 15 * 60.0)
+        self.assertFalse(backoff.ready(now=10.0))
+        self.assertTrue(backoff.ready(now=15 * 60.0))
+        backoff.succeeded()
+        self.assertTrue(backoff.ready(now=0.0))
 
     def test_create_source_record_stores_original_image_resolution(self) -> None:
         image_path = Path(self.temp_dir.name) / "source-resolution.png"

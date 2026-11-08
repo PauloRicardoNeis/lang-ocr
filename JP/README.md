@@ -7,6 +7,7 @@ Local foundation for cataloging vocabulary from game screenshots and text, in an
 - `lang_jp.py`: CLI for sources, terms, and recurrence.
 - `languages.py`: language registry, offline language detection, mixed-text splitting and per-language analyzers (Sudachi for Japanese, a generic tokenizer for word-delimited languages, jieba/pythainlp when installed).
 - `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs. Picks the OCR engines from the capture language set, merges their output and sorts every block per language.
+- `translate_overlay.py`: reading overlay started by the tray daemon: reads the primary monitor with the capture OCR engines and draws translations, furigana or word-by-word glosses over the text.
 - `ocr_backends.py`: OCR engines (meikiocr, EasyOCR, manga-ocr), engine routing by language set, language-aware line filters and cross-engine block merging.
 - `requirements-capture.txt`: Python worker dependencies for the dedicated 3.12 environment.
 - `requirements-main.txt`: small helper dependencies for the main catalog environment.
@@ -96,7 +97,7 @@ OCR engines follow the set automatically (`LANG_JP_OCR_BACKEND=auto`, the defaul
 
 The multi-reader flow reads captures at up to `LANG_JP_MULTI_OCR_MAX_SIDE` (default 3840, so a 4K screen is read at full size); the tray's `OCR size` (`LANG_JP_OCR_MAX_SIDE`) only applies to the single-engine EasyOCR flow. Desktop text shrunk to 1600px came out as garbage and left almost every box to the slower readers: on a 4K screen with every language on, full size took about 45s instead of 245s. A later reader's text never replaces another one when it looks like a lookalike misreading of Latin text (a lone Cyrillic or Greek letter, a word mixing them with Latin, Devanagari or Arabic digits next to Latin text). With many languages on, a capture takes tens of seconds, so prefer `Cadence: After source ready` over a short fixed interval.
 
-Auto-promotion only creates terms for words the language's `simplemma` dictionary knows; the rest (OCR misreadings, names) stay pending candidates for review. Japanese, Korean, Chinese, Thai and Vietnamese have no such dictionary and promote as before. Meanings of new terms are machine-translated after the source is committed, one short write per term, so the daemon can keep enqueueing. Captures of the tooling itself are rejected before OCR: processes in `LANG_CAPTURE_SKIP_PROCESSES` (default `claude.exe,desktop_capture_daemon.exe`) and window titles containing an entry of `LANG_CAPTURE_SKIP_WINDOW_TITLES` (default `Lang Catalog`).
+Auto-promotion only creates terms for words the language's `simplemma` dictionary knows; the rest (OCR misreadings, names) stay pending candidates for review. Japanese, Korean, Chinese, Thai and Vietnamese have no such dictionary and promote as before. Meanings of new terms are machine-translated after the source is committed, one short write per term, so the daemon can keep enqueueing. Whole-source translations are no longer made for every capture: open a source in the catalog and press **Traduzir** (`POST /actions/sources/<id>/translate`), which translates its lines in a few batched requests and stores the result. `LANG_JP_ENABLE_SOURCE_TRANSLATION=1` brings back the background queue in the worker. No window is skipped by default; see [Skipping windows](#skipping-windows-capture-blacklist).
 
 Capture profiles pin a window to a fixed language set: the daemon records the foreground window title and process name with every job (`capture_jobs.window_title`, `capture_jobs.process_name`, off with `record_foreground_window = false`), and a matching profile fixes the languages for that capture, skipping detection when it has a single language. Sources from the capture get the window title as title and the profile name as game.
 
@@ -153,16 +154,46 @@ The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-op
    - `python .\lang_jp.py review-source --source-id N`
    - `python .\lang_jp.py approve-analysis --source-id N`
    - `python .\lang_jp.py ignore-source --source-id N`
+   - `python .\lang_jp.py delete-source --source-id N [--delete-image]` (permanent; terms stay, their stats are recalculated; also on the source page in the web UI)
 
 The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example` (including `record_foreground_window`).
 
 The tray menu now exposes both capture cadences:
-- `Cadence: Fixed interval`: uses the selected capture interval as before.
-- `Cadence: After source ready`: waits until the current capture job finishes turning into a source before taking the next screenshot. This mode works best with `auto_start_worker = false` and `auto_process_jobs = true`.
+- `Cadence: Fixed interval`: captures on the selected interval, but while a worker is running it skips a tick when its last frame is still waiting to be read (`skip capture reason=previous_frame_waiting` in the log). OCR of a full screen takes 30-50 s on the CPU, so a short interval no longer piles up spool PNGs the worker never reaches; it takes at most one frame ahead of the worker. `Capture now` and the hotkey always capture, and with no worker running frames are kept for a later `Process pending queue`.
+- `Cadence: After source ready`: waits until the daemon's last capture job has finished turning into a source before taking the next screenshot. An older backlog does not block it. This mode works best with `auto_start_worker = false` and `auto_process_jobs = true`.
 - `manual_capture_hotkey` in `desktop_capture_daemon\capture_daemon.toml`: binds a global shortcut to the same `Capture now` action in the tray. Example: `Ctrl+Shift+F8`.
 - `Capture languages`: a checkbox per registered language plus `Capture every language` and `Capture Japanese only`. The choice is stored in the database and shared with the web UI and the CLI.
 
 At the moment, the automatic worker is optimized for normal horizontal text in screenshots. It is not tuned for manga-style vertical text.
+
+## Skipping windows (capture blacklist)
+Every rule that drops a capture, in the order it runs:
+
+1. **Tray daemon, before queueing** (timing and duplicates only; it never looks at the window):
+   - `previous_frame_waiting`: the worker has not taken the last frame yet.
+   - `existing_db_hash`: the same image is already stored.
+   - `recent_exact_duplicate_window`: the same image is among the last `dedupe_window` (12) frames.
+   - `recent_visual_duplicate_window`: near-identical by perceptual hash; off unless `perceptual_dedupe_enabled = true`.
+2. **Worker, before OCR** (the job ends `rejected`, the image is deleted):
+   - `temp_image_missing`: the queued PNG is gone.
+   - `skipped_window`: the foreground window matches a **skip rule** (below).
+   - `duplicate_source`: the image hash is already a source.
+3. **Worker, after OCR**: `no_target_language_text` when nothing is in the capture languages.
+
+**Skip rules** live in the database table `capture_skip_rules` and start empty, so every window is captured until you add one. A `process` rule matches the foreground executable name exactly (`claude.exe`); a `title` rule matches text anywhere in the window title (`Lang Catalog`, which every catalog page title contains). Both are case-insensitive. The worker reads them for every job, so a change applies to the next capture. Three places edit the same table:
+
+- **Tray menu → Skip windows**: checkboxes for Claude, the catalog pages and the tray app itself, one checkbox per other rule (untick to remove), and *Skip the app of the last capture* (the menu has focus while open, so it uses the window of the most recent queued frame).
+- **Web UI → `/capture` → Janelas ignoradas**: add a process or title rule, remove rules, or press *Ignorar app* next to any recent capture.
+- **CLI**:
+
+```powershell
+python .\lang_jp.py skip-window process claude.exe
+python .\lang_jp.py skip-window title "Lang Catalog"
+python .\lang_jp.py unskip-window process claude.exe
+python .\lang_jp.py list-skip-windows
+```
+
+`LANG_CAPTURE_SKIP_PROCESSES` and `LANG_CAPTURE_SKIP_WINDOW_TITLES` (comma-separated) still work and add to the table for one run; they never remove a stored rule.
 
 ## Term meanings (JMdict)
 When a new term is created without `--meaning-pt`, its meaning comes from a local copy of JMdict: the first 1-3 English glosses of the best-matching sense are translated to Portuguese. Only when JMdict has no match is the bare lemma machine-translated, as before. The term's part of speech (Sudachi's first field, or an older English label) is a preference when picking the JMdict entry and sense, so kana grammar words resolve correctly: ます with `助動詞` is the polite auxiliary, not 鱒 "trout".
@@ -188,6 +219,56 @@ python .\lang_jp.py jmdict-meaning-report --missing-only --no-translate --limit 
 ```
 
 Attribution: this project uses the JMdict dictionary files. These files are the property of the [Electronic Dictionary Research and Development Group](https://www.edrdg.org/) and are used in conformance with the Group's [licence](https://www.edrdg.org/edrdg/licence.html) (CC BY-SA 4.0).
+
+## Reading overlay
+`translate_overlay.py` is a resident reading aid. The tray daemon starts it and
+keeps it running; press **Ctrl+Alt+Q** and it grabs the primary monitor, reads
+it with the same OCR engines as the capture worker (loaded once, so each press
+only pays for OCR and one request per language) and draws over the text in one
+of three modes:
+
+| Mode | What it shows |
+| --- | --- |
+| Translation | each line covered by its English translation, romaji under it |
+| Furigana | hiragana over the kanji of each word (romanization per word for Korean, Chinese, Russian, ...); the text stays visible |
+| Word by word | a short gloss under each content word, with its reading; glosses come from JMdict (English target) or the catalog's `meaning_pt` (Portuguese target) first, machine translation for the rest |
+
+**Ctrl+Alt+W** cycles the mode; while the overlay is up it re-draws the same
+read in the next mode without reading the screen again. Press Ctrl+Alt+Q again,
+or Esc, to clear it; it also clears when the foreground window changes.
+
+While the overlay is up, **Ctrl+scroll wheel** or **Ctrl+= / Ctrl+-** (main or
+numpad keys) make the labels bigger or smaller, and **Ctrl+0** resets them. The
+current labels are redrawn at the new size without reading the screen again, and
+the size is saved (`scale` in `data/translate_overlay.toml`, 0.5x to 3x). These
+keys, like Esc, are only taken while the overlay is showing, so browser zoom
+works as usual the rest of the time.
+
+Tray menu, **Reading overlay**: switch it on or off, pick the mode, and choose
+"Read Japanese only (fast)" or the capture language set. Those choices live in
+`data/translate_overlay.toml`, shared by the tray and the overlay, so the menu
+and the mode hotkey stay in sync and nothing needs a restart. The overlay logs to
+`data/translate_overlay.log` ("Open overlay log" in the menu). Hotkeys are set in
+`capture_daemon.toml` (`overlay_hotkey`, `overlay_mode_hotkey`).
+
+It also runs on its own:
+
+```powershell
+..\.venv-capture312\Scripts\python.exe .\translate_overlay.py
+..\.venv-capture312\Scripts\python.exe .\translate_overlay.py --mode furigana --hotkey Ctrl+Alt+Q --mode-hotkey Ctrl+Alt+W
+..\.venv-capture312\Scripts\python.exe .\translate_overlay.py --image .\data\ocr_bench\png\1159.png
+```
+
+- Target language `en` (`--target`, `LANG_OVERLAY_TARGET`; `pt` switches to Portuguese). Lines already in the target language are left alone. Nothing is written to the catalog.
+- Japanese only (meikiocr) takes about 0.3 s of OCR on a 4K screen; the full
+  22-language capture set also runs EasyOCR and takes about 12 s on CPU.
+  `--languages ja,en` overrides the state file.
+- The overlay window is click-through and excluded from screen capture
+  (`WDA_EXCLUDEFROMCAPTURE`), so the passive capture never OCRs it.
+- Translation uses the same Google endpoint as the source translation backlog. When it
+  answers HTTP 429 the overlay still shows the readings and says so in its status bar.
+- `--image` reads one file and prints the lines instead of opening the overlay;
+  `--trigger-now`, `--exit-after` and `--capturable` exist for testing.
 
 ## Single-image OCR
 For a working one-image-at-a-time OCR path, use `single_image_ocr.py`.

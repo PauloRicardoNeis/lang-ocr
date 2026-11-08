@@ -16,6 +16,7 @@
 - When a visible string is a compound that should be studied as smaller units, preserve the original string as a reviewed source segment and link multiple canonical terms to that same segment.
 - Preserve the current workflow and schema implemented in `JP/lang_jp.py`; language profiles, detection, analyzers and romanizers live in `JP/languages.py`.
 - The passive capture is polyglot by default: which languages the worker keeps is stored in the database (`languages.capture_enabled`, edited from the tray, `/capture` in the web UI, or `set-capture-languages` in the CLI). Do not reintroduce Japanese-only filters outside the meikiocr pass, and do not require `LANG_CAPTURE_LANGUAGES`; it is only an override.
+- Windows skipped by the capture are database rows too (`capture_skip_rules`, empty by default, edited from the tray "Skip windows" menu, `/capture`, or `skip-window` / `unskip-window` in the CLI). Do not hard-code skipped processes or titles; the full list of skip and reject rules is documented in `JP/README.md` ("Skipping windows") and in the "Capture blacklist" comment block of `JP/lang_jp.py`.
 
 ## Expected Outcome
 - After an image-only message, the database should be updated and the user should receive:
