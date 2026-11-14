@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 import jmdict
 import languages
+from catalog_changes import ensure_catalog_change_log
 from languages import (
     ALL_LANGUAGES_CODE,
     AUTO_LANGUAGE_CODE,
@@ -1418,6 +1419,7 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
         ensure_view_definition(connection, "v_flashcards_overview", FLASHCARD_VIEW_SQL)
         or changed
     )
+    changed = ensure_catalog_change_log(connection) or changed
 
     if changed:
         connection.commit()

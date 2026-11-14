@@ -443,3 +443,16 @@ SELECT
 FROM flashcards AS f
 JOIN terms AS t
     ON t.id = f.term_id;
+
+-- Change log for the live web UI. Rows are written only by the triggers that
+-- catalog_changes.ensure_catalog_change_log() creates on every connection (they
+-- are generated from CHANGE_SPECS there, so they are not repeated here).
+CREATE TABLE IF NOT EXISTS catalog_changes (
+    id INTEGER PRIMARY KEY,
+    entity TEXT NOT NULL,
+    entity_id INTEGER,
+    changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalog_changes_entity
+    ON catalog_changes(entity, entity_id, id);

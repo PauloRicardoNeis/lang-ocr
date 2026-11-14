@@ -428,6 +428,67 @@ class ProcessJobTest(unittest.TestCase):
         self.assertEqual(job["status"], "rejected")
         self.assertEqual((sources, terms), (0, 0))
 
+    def logged_entities(self, since: int) -> list[str]:
+        connection = db_connect(self.db_path)
+        try:
+            return [
+                row["entity"]
+                for row in connection.execute(
+                    "SELECT entity FROM catalog_changes WHERE id > ? ORDER BY id", (since,)
+                )
+            ]
+        finally:
+            connection.close()
+
+    def test_rejected_frames_log_only_job_changes(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            self.enqueue(connection, "blank", window_title="Desktop", process_name="explorer.exe")
+            connection.commit()
+            start = connection.execute("SELECT COALESCE(MAX(id), 0) FROM catalog_changes").fetchone()[0]
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("Seguir", 10, 10, 200, 40, conf=0.2)])
+        with patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        self.assertEqual(set(self.logged_entities(start)), {"job"})
+
+    def test_accepted_job_logs_its_source_and_terms_then_their_meanings(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            self.enqueue(connection, "menu", window_title="Menu", process_name="game.exe")
+            connection.commit()
+            start = connection.execute("SELECT COALESCE(MAX(id), 0) FROM catalog_changes").fetchone()[0]
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("No puede ser", 10, 10, 200, 40, conf=0.9)])
+        with (
+            patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub),
+            patch.object(capture_worker, "auto_translate_term_meaning_pt", side_effect=lambda lemma, **_: f"pt:{lemma}"),
+        ):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        entities = self.logged_entities(start)
+        self.assertIn("source", entities)
+        self.assertIn("term", entities)
+        connection = db_connect(self.db_path)
+        try:
+            term_ids = {row[0] for row in connection.execute("SELECT id FROM terms")}
+            # The meanings are filled after the source commit; each fill logs its term.
+            last_source = connection.execute(
+                "SELECT MAX(id) FROM catalog_changes WHERE entity = 'source'"
+            ).fetchone()[0]
+            meaning_terms = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT entity_id FROM catalog_changes WHERE entity = 'term' AND id > ?", (last_source,)
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(meaning_terms, term_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
