@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS capture_jobs (
     ocr_text_hash TEXT,
     window_title TEXT,
     process_name TEXT,
-    capture_profile_id INTEGER
+    capture_profile_id INTEGER,
+    progress_step TEXT,
+    progress_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_created_at

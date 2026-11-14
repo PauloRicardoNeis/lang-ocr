@@ -144,6 +144,17 @@ On Windows, the single entry point is `..\open_lang.cmd` from the repository roo
 
 The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-open-browser` on `web_port` (default 8766), restarts it with backoff if it exits, and stops it on Quit. If something else is already serving that port (for example a manual `browse`), the daemon reuses it instead of starting a second server. Web server output goes to `data/catalog_web.log`. Use `Open Lang` in the tray menu, or double-click the tray icon, to open the catalog. Only one daemon runs at a time; launching it again just opens the catalog. To follow the capture log live, use `Tail logs` in the tray menu.
 
+## Live updates in the web UI
+
+Catalog pages update themselves while the capture worker runs: a new source shows up in the lists, a source page fills in its term meanings and its English translation as they arrive, and `/capture` shows the job being processed, its stage and how long it has been running. Nothing reloads; only the parts of a page whose content changed are swapped, and sort order, scroll position and whatever you are typing stay as they were.
+
+How it works:
+
+- **Change log.** SQLite triggers append an entity key (`source`, `term`, `kanji`, `flashcard`, `language`, `job`) to the `catalog_changes` table on every write to a table the UI shows, whoever writes it: the worker, the CLI, a web action or the Anki sync. The triggers are generated from `CHANGE_SPECS` in `catalog_changes.py` and kept in sync on every connection. Capture jobs only log `job`, so rejected frames and job-status churn never wake a catalog page. The log keeps its last 20,000 rows.
+- **Pages watch what they show.** Each page is a view (`web_views.PageView`) with named live regions and a watch set: a list page watches its kind (`term`), a source page watches itself plus its linked terms and characters.
+- **Polling.** The browser asks `/live/changes?since=<revision>&watch=...` every 2.5 s while the tab is visible (one indexed query on a read-only connection). Only when something watched changed does it fetch the same URL with `Accept: application/vnd.lang.fragments+json` and swap the regions whose hash differs. A region holding the focused field, or any region while the Anki sync runs, waits until focus leaves it.
+- **Job progress.** The worker records the stage a job enters (`ocr`, `analyze`, `save`, `meanings`) in `capture_jobs.progress_step` and `progress_at`; the log lines in `capture_daemon.log` are unchanged.
+
 ## Passive capture workflow
 1. Prepare a dedicated Python 3.12 environment for the capture worker and install `requirements-capture.txt`.
 2. Start the Rust tray daemon with `..\open_lang.cmd` from the repository root, or run `cargo run` inside `desktop_capture_daemon` if you want to launch it manually from a shell.

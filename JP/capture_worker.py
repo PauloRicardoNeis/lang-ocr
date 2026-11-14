@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import languages
@@ -45,6 +46,7 @@ from lang_jp import (
     recalculate_term_stats,
     recover_stale_capture_jobs,
     resolve_repo_local_path,
+    set_capture_job_progress,
     stable_text_hash,
     store_segment_candidates,
     upsert_source_translation,
@@ -326,9 +328,25 @@ class DiagnosticProbe:
 
 
 class WorkerJobProbe:
-    def __init__(self, job_id: int) -> None:
+    """Times one job: ``mark`` logs a finished step, ``begin`` reports the stage now running.
+
+    ``on_progress`` receives each ``begin`` stage (the worker stores it on the
+    job row for the live capture page); a failure there is logged, never raised,
+    since progress reporting must not fail a capture.
+    """
+
+    def __init__(self, job_id: int, *, on_progress: Callable[[str], None] | None = None) -> None:
         self._job_id = job_id
         self._started_at = time.perf_counter()
+        self._on_progress = on_progress
+
+    def begin(self, stage: str) -> None:
+        if self._on_progress is None:
+            return
+        try:
+            self._on_progress(stage)
+        except Exception as exc:  # noqa: BLE001 - progress is best effort
+            append_worker_log(build_log_event(job_log_prefix(self._job_id, "progress"), stage=stage, error=exc))
 
     def elapsed_ms(self) -> int:
         return int((time.perf_counter() - self._started_at) * 1000)
@@ -1654,6 +1672,20 @@ def fill_source_term_meanings(db_path: Path, source_id: int) -> int:
         connection.close()
 
 
+def job_progress_recorder(db_path: Path, job_id: int) -> Callable[[str], None]:
+    """Store each stage a job enters on its row, in a short write of its own."""
+
+    def record(stage: str) -> None:
+        connection = db_connect(db_path)
+        try:
+            set_capture_job_progress(connection, job_id=job_id, step=stage)
+            connection.commit()
+        finally:
+            connection.close()
+
+    return record
+
+
 def process_job_once(
     db_path: Path,
     *,
@@ -1703,7 +1735,7 @@ def process_job_once(
             )
 
     job_id = int(job["id"])
-    probe = WorkerJobProbe(job_id)
+    probe = WorkerJobProbe(job_id, on_progress=job_progress_recorder(db_path, job_id))
     temp_image_path = resolve_repo_local_path(job["temp_image_path"])
     if temp_image_path is None:
         temp_image_path = Path(str(job["temp_image_path"]))
@@ -1787,6 +1819,7 @@ def process_job_once(
         finally:
             connection.close()
 
+        probe.begin("ocr")
         blocks = ocr.extract_blocks(
             temp_image_path,
             progress_label=job_log_prefix(job_id, "ocr"),
@@ -1806,6 +1839,7 @@ def process_job_once(
         )
         analyzed_blocks: list[list[tuple[dict[str, Any], list[dict[str, Any]]]]] = []
         if target_found:
+            probe.begin("analyze")
             connection = db_connect(db_path)
             try:
                 analyzed_blocks = analyzer.analyze_blocks(connection, normalized_blocks)
@@ -1845,6 +1879,7 @@ def process_job_once(
             )
             return True
 
+        probe.begin("save")
         final_path = build_capture_path(captured_at, image_sha256)
         final_path.parent.mkdir(parents=True, exist_ok=True)
         if final_path.exists():
@@ -1928,6 +1963,7 @@ def process_job_once(
         finally:
             connection.close()
         if promoted_terms:
+            probe.begin("meanings")
             probe.mark("meanings", filled=fill_source_term_meanings(db_path, source_id))
         if translator is not None and raw_text:
             connection = db_connect(db_path)

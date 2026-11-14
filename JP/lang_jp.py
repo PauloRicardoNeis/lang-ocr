@@ -256,7 +256,9 @@ CREATE TABLE IF NOT EXISTS capture_jobs (
     ocr_text_hash TEXT,
     window_title TEXT,
     process_name TEXT,
-    capture_profile_id INTEGER
+    capture_profile_id INTEGER,
+    progress_step TEXT,
+    progress_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_capture_jobs_status_created_at
@@ -1305,6 +1307,8 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
             ("window_title", "TEXT"),
             ("process_name", "TEXT"),
             ("capture_profile_id", "INTEGER"),
+            ("progress_step", "TEXT"),
+            ("progress_at", "TEXT"),
         ):
             if column_name not in capture_job_columns:
                 connection.execute(
@@ -2139,6 +2143,18 @@ def update_capture_job_status(
             capture_profile_id,
             job_id,
         ),
+    )
+
+
+def set_capture_job_progress(connection: sqlite3.Connection, *, job_id: int, step: str) -> None:
+    """Record the stage a processing job just entered, for the live capture page.
+
+    ``updated_at`` stays the claim time, so the page can show both how long the
+    job and how long this stage have been running.
+    """
+    connection.execute(
+        "UPDATE capture_jobs SET progress_step = ?, progress_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (step, job_id),
     )
 
 

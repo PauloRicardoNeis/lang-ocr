@@ -240,6 +240,13 @@ class ChangesSinceTest(unittest.TestCase):
         status = changes_since(self.connection, 99, Watch.of("term"))
         self.assertEqual((status.revision, status.changed, status.reset), (3, True, True))
 
+    def test_watch_with_too_many_ids_falls_back_to_the_kind(self) -> None:
+        many = range(catalog_changes.WATCH_MAX_IDS + 1)
+        watch = Watch.of(source=[7], term=many)
+        self.assertEqual(watch.kinds, frozenset({"term"}))
+        self.assertEqual(watch.ids, frozenset({("source", 7)}))
+        self.assertEqual(Watch.of("term", term=[1]).ids, frozenset())
+
     def test_watch_round_trips_and_rejects_junk(self) -> None:
         watch = Watch.of("source", "language", term=[3, 1], kanji=[9])
         self.assertEqual(watch.encode(), "language,source,kanji:9,term:1,term:3")

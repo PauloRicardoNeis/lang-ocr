@@ -489,6 +489,58 @@ class ProcessJobTest(unittest.TestCase):
             connection.close()
         self.assertEqual(meaning_terms, term_ids)
 
+    def test_job_row_follows_the_stage_the_worker_is_in(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            job_id = self.enqueue(connection, "menu", window_title="Menu", process_name="game.exe")
+            connection.commit()
+        finally:
+            connection.close()
+        seen: list[tuple[str, str]] = []
+        record = capture_worker.job_progress_recorder
+
+        def spy(db_path, recorded_job_id):
+            inner = record(db_path, recorded_job_id)
+
+            def stage(name: str) -> None:
+                inner(name)
+                check = db_connect(db_path)
+                try:
+                    row = check.execute(
+                        "SELECT status, progress_step FROM capture_jobs WHERE id = ?", (recorded_job_id,)
+                    ).fetchone()
+                finally:
+                    check.close()
+                seen.append((row["status"], row["progress_step"]))
+
+            return stage
+
+        stub = StubEngine("stub", [block("No puede ser", 10, 10, 200, 40, conf=0.9)])
+        with (
+            patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub),
+            patch.object(capture_worker, "job_progress_recorder", side_effect=spy),
+            patch.object(capture_worker, "auto_translate_term_meaning_pt", return_value="x"),
+        ):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        self.assertEqual(
+            seen,
+            [("processing", "ocr"), ("processing", "analyze"), ("processing", "save"), ("accepted", "meanings")],
+        )
+        connection = db_connect(self.db_path)
+        try:
+            job = connection.execute("SELECT progress_at FROM capture_jobs WHERE id = ?", (job_id,)).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(job["progress_at"])
+
+    def test_progress_failures_never_fail_the_job(self) -> None:
+        def broken(_stage: str) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        probe = capture_worker.WorkerJobProbe(1, on_progress=broken)
+        probe.begin("ocr")  # logged, not raised
+
 
 if __name__ == "__main__":
     unittest.main()

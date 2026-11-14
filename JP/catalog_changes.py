@@ -34,6 +34,8 @@ CREATE INDEX IF NOT EXISTS idx_catalog_changes_entity
 CHANGE_RETENTION = 20_000
 TRIGGER_PREFIX = "catalog_change_"
 TRIGGER_EVENTS = ("INSERT", "UPDATE", "DELETE")
+# Past this many ids of one entity a page watches the whole kind (see Watch.of).
+WATCH_MAX_IDS = 150
 
 
 @dataclass(frozen=True)
@@ -227,13 +229,22 @@ class Watch:
 
     @classmethod
     def of(cls, *kinds: str, **ids: object) -> "Watch":
-        """``Watch.of("source", term=[1, 2], kanji=[5])``."""
+        """``Watch.of("source", term=[1, 2], kanji=[5])``.
+
+        An entity with more than ``WATCH_MAX_IDS`` ids is watched as a kind
+        instead: the page then also wakes for unrelated changes of that kind,
+        but its poll URL stays short (a capture can link hundreds of terms).
+        """
+        all_kinds = set(kinds)
         pairs: set[tuple[str, int]] = set()
         for entity, values in ids.items():
-            for value in values or ():  # type: ignore[union-attr]
-                if value is not None:
-                    pairs.add((entity, int(value)))
-        return cls(kinds=frozenset(kinds), ids=frozenset(pairs))
+            entity_ids = {int(value) for value in values or () if value is not None}  # type: ignore[union-attr]
+            if len(entity_ids) > WATCH_MAX_IDS:
+                all_kinds.add(entity)
+            else:
+                pairs.update((entity, entity_id) for entity_id in entity_ids)
+        pairs = {(entity, entity_id) for entity, entity_id in pairs if entity not in all_kinds}
+        return cls(kinds=frozenset(all_kinds), ids=frozenset(pairs))
 
     def __bool__(self) -> bool:
         return bool(self.kinds or self.ids)
