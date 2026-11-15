@@ -50,6 +50,25 @@ class RegistryTest(unittest.TestCase):
                     settings.serialize_value(setting, setting.default),
                 )
 
+    def test_daemon_defaults_match_the_registry(self) -> None:
+        """The tray daemon (Rust) keeps the defaults of the settings it touches."""
+        import re
+
+        source = (TESTS_ROOT / "desktop_capture_daemon" / "src" / "main.rs").read_text(encoding="utf-8")
+        block = re.search(
+            r"const DAEMON_SETTING_DEFAULTS: &\[\(&str, &str\)\] = &\[(.*?)\];", source, re.S
+        )
+        self.assertIsNotNone(block)
+        pairs = re.findall(r'\("([^"]+)",\s*"([^"]*)"\)', block.group(1))
+        self.assertGreaterEqual(len(pairs), 7)
+        for key, default in pairs:
+            with self.subTest(key=key):
+                setting = settings.setting_for(key)
+                self.assertEqual(settings.serialize_value(setting, setting.default), default)
+        # Every key the daemon names as a constant has a default in that list.
+        named = set(re.findall(r'const SETTING_[A-Z_]+: &str = "([^"]+)";', source))
+        self.assertEqual(named, {key for key, _ in pairs})
+
     def test_every_section_has_settings(self) -> None:
         for section in SECTIONS:
             self.assertTrue(settings.section_settings(section.key), section.key)
