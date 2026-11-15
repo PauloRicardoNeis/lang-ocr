@@ -366,6 +366,7 @@ py -3.12 .\single_image_ocr.py `
 - `list-flashcards`, `export-anki-tsv`, and `sync-anki` use the current `term_stats.priority_score`, so upload/review order stays aligned with the latest score instead of the original card creation id.
 - `sync-anki` also repositions existing Anki new cards by the current score when AnkiConnect exposes the custom `repositionNewCards` action.
 - `sync-anki` creates decks on demand and keeps track of the linked Anki note id.
+- `sync-anki` reads what the target decks already hold in a few requests, then sends only what differs (new notes, changed fields, misplaced cards, tag differences), about 100 changes per AnkiConnect `multi` request. A card Anki already has as the catalog wants it costs no request and is reported as `unchanged`.
 - `sync-anki-words` regenerates vocabulary flashcards before syncing, so missing term cards are created and existing ones are refreshed in one step.
 - `generate-kanji-flashcards` and `sync-anki-kanji` use the word deck of the character's language (`Lang::Japanese` for kanji), so kanji and vocabulary share the same new-card queue. Both accept `--language`.
 - `refresh-kanji-metadata` fetches canonical kanji meanings plus `on/kun` readings from `kanjiapi.dev`.

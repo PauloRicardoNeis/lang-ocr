@@ -366,6 +366,9 @@ CREATE INDEX IF NOT EXISTS idx_flashcards_export_status
 CREATE INDEX IF NOT EXISTS idx_flashcards_anki_note_id
     ON flashcards(anki_note_id);
 
+CREATE INDEX IF NOT EXISTS idx_flashcards_deck_front
+    ON flashcards(deck_name, front_text);
+
 CREATE TABLE IF NOT EXISTS kanji_flashcards (
     id INTEGER PRIMARY KEY,
     kanji_id INTEGER NOT NULL REFERENCES kanji(id) ON DELETE CASCADE,

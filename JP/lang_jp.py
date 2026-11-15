@@ -11,6 +11,7 @@ import re
 import sqlite3
 import sys
 import unicodedata
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -19,6 +20,7 @@ from urllib.error import URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+import anki_connect
 import jmdict
 import languages
 import settings as app_settings
@@ -41,9 +43,8 @@ DEFAULT_ANKI_EXPORT_PATH = ROOT / "exports" / "anki_basic.tsv"
 DEFAULT_JP_DECK_NAME = "Lang::Japanese"
 DEFAULT_JP_KANJI_DECK_NAME = DEFAULT_JP_DECK_NAME
 DEFAULT_UI_PORT = 8766
-DEFAULT_ANKI_CONNECT_HOST = "127.0.0.1"
-DEFAULT_ANKI_CONNECT_PORT = 8765
-ANKI_CONNECT_VERSION = 6
+ANKI_SYNC_BATCH_ACTIONS = 100
+ANKI_IDENTITY_TAG_PREFIXES = ("term_", "kanji_")
 JMDICT_DB_PATH = Path(
     os.environ.get("LANG_JP_JMDICT_DB_PATH", str(jmdict.DEFAULT_JMDICT_DB_PATH))
 )
@@ -1372,6 +1373,14 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_flashcards_anki_note_id
                 ON flashcards(anki_note_id)
+            """
+        )
+        # Card generation asks, for every term, whether another card in the
+        # deck already has its front; without this that is a full table scan.
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_flashcards_deck_front
+                ON flashcards(deck_name, front_text)
             """
         )
 
@@ -3587,7 +3596,8 @@ def recalculate_kanji_stats(connection: sqlite3.Connection, kanji_id: int) -> No
     )
 
 
-def refresh_source_kanji(connection: sqlite3.Connection, source_id: int) -> None:
+def rebuild_source_kanji_links(connection: sqlite3.Connection, source_id: int) -> set[int]:
+    """Rebuild one source's ``source_kanji`` rows; returns every kanji it had or has now."""
     previous_kanji_ids = {
         int(row["kanji_id"])
         for row in connection.execute(
@@ -3659,7 +3669,11 @@ def refresh_source_kanji(connection: sqlite3.Connection, source_id: int) -> None
             (source_id, kanji_id, count_in_source),
         )
 
-    for kanji_id in sorted(previous_kanji_ids | current_kanji_ids):
+    return previous_kanji_ids | current_kanji_ids
+
+
+def refresh_source_kanji(connection: sqlite3.Connection, source_id: int) -> None:
+    for kanji_id in sorted(rebuild_source_kanji_links(connection, source_id)):
         recalculate_kanji_stats(connection, kanji_id)
 
 
@@ -3681,8 +3695,14 @@ def source_ids_for_derived_refresh(connection: sqlite3.Connection) -> list[int]:
 
 def refresh_all_source_kanji(connection: sqlite3.Connection) -> int:
     source_ids = source_ids_for_derived_refresh(connection)
+    # A kanji's stats are computed from all of its sources at once, so each one
+    # is recalculated a single time after every source has its links rebuilt,
+    # not again for every source it appears in.
+    affected_kanji_ids: set[int] = set()
     for source_id in source_ids:
-        refresh_source_kanji(connection, source_id)
+        affected_kanji_ids |= rebuild_source_kanji_links(connection, source_id)
+    for kanji_id in sorted(affected_kanji_ids):
+        recalculate_kanji_stats(connection, kanji_id)
     return len(source_ids)
 
 
@@ -5231,6 +5251,9 @@ def refresh_kanji_metadata(
         filters.append("id = ?")
         params.append(kanji_id)
     if not force:
+        # A kanji fetched once is settled: plenty have no kun or no on reading,
+        # and asking again on every sync never fills those in.
+        filters.append("metadata_updated_at IS NULL")
         filters.append(
             """
             (
@@ -6312,102 +6335,27 @@ def export_anki_tsv(args: argparse.Namespace) -> None:
     print(f"Exported {len(rows)} flashcards to {args.output}")
 
 
-def anki_connect_request(
-    *,
-    host: str,
-    port: int,
-    action: str,
-    params: dict[str, object] | None = None,
-) -> object:
-    payload: dict[str, object] = {
-        "action": action,
-        "version": ANKI_CONNECT_VERSION,
-    }
-    if params is not None:
-        payload["params"] = params
-
-    request = Request(
-        f"http://{host}:{port}",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=10) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-    except URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        raise SystemExit(
-            f"Could not reach AnkiConnect at http://{host}:{port}. "
-            f"Is Anki open? ({reason})"
-        ) from exc
-
-    if not isinstance(response_data, dict):
-        raise SystemExit(f"Unexpected response from AnkiConnect action {action}.")
-    if response_data.get("error") is not None:
-        error_text = str(response_data["error"])
-        if action == "addNote" and "duplicate" in error_text.lower():
-            return None
-        raise SystemExit(
-            f"AnkiConnect action {action} failed: {error_text}"
-        )
-    if "result" not in response_data:
-        raise SystemExit(f"Missing result in AnkiConnect action {action}.")
-    return response_data["result"]
+# ---------------------------------------------------------------------------
+# Pushing flashcards to Anki
+#
+# AnkiConnect answers from a timer on Anki's UI thread, so every request costs
+# a fixed ~60 ms however little it carries. The sync therefore never talks to
+# Anki once per card: it reads what the target decks already hold in a handful
+# of requests (AnkiNoteIndex), works out locally what each card needs
+# (plan_anki_notes), and sends only the differences, many cards per `multi`
+# request (apply_anki_note_plans). A card Anki already has as the catalog wants
+# it costs no request at all.
+# ---------------------------------------------------------------------------
 
 
-def anki_find_existing_note_id(
-    row: sqlite3.Row,
-    *,
-    host: str,
-    port: int,
-) -> int | None:
-    entity_type, entity_id = row_identity_tag(row)
-    deck_name = str(row["deck_name"]).replace('"', '\\"')
-    query = (
-        f'deck:"{deck_name}" '
-        f'tag:{entity_type}_{entity_id} '
-        f'tag:template_{row["template_name"]}'
-    )
-    note_ids = anki_connect_request(
-        host=host,
-        port=port,
-        action="findNotes",
-        params={"query": query},
-    )
-    if not isinstance(note_ids, list):
-        raise SystemExit("AnkiConnect returned an invalid findNotes payload.")
-    if len(note_ids) > 1:
-        raise SystemExit(
-            "Found multiple Anki notes for the same flashcard tags. "
-            f"Resolve duplicates for {entity_type} #{entity_id} in deck {row['deck_name']}."
-        )
-    if not note_ids:
-        return None
-    return int(note_ids[0])
+def anki_same_text(left: str | None, right: str | None) -> bool:
+    """Anki stores note text NFC-normalized, so compare it that way."""
+    if left is None or right is None:
+        return False
+    return unicodedata.normalize("NFC", left) == unicodedata.normalize("NFC", right)
 
 
-def anki_note_info(
-    note_id: int,
-    *,
-    host: str,
-    port: int,
-) -> dict[str, object] | None:
-    result = anki_connect_request(
-        host=host,
-        port=port,
-        action="notesInfo",
-        params={"notes": [note_id]},
-    )
-    if not isinstance(result, list) or not result:
-        return None
-    note = result[0]
-    if not isinstance(note, dict):
-        return None
-    return note
-
-
-def anki_front_lookup_key(
+def anki_front_key(
     deck_name: str,
     note_type: str,
     front_value: str,
@@ -6416,204 +6364,450 @@ def anki_front_lookup_key(
     return (deck_name, note_type, front_value.strip(), language_tag_value or "")
 
 
-def anki_front_lookup_get(
-    lookup: dict[tuple[str, str, str, str], int],
-    row: sqlite3.Row,
-) -> int | None:
-    """Note with the row's front in its deck, never one tagged for another language.
+def row_anki_front_key(row: sqlite3.Row) -> tuple[str, str, str, str]:
+    return anki_front_key(
+        str(row["deck_name"]),
+        str(row["note_type"]),
+        str(row["front_text"] or ""),
+        language_tag(row_language_code(row)),
+    )
 
-    Notes tagged with the row's language win; untagged notes (made by hand or by
-    an old export) still match, as they did before languages existed.
+
+class AnkiNoteIndex:
+    """What Anki holds for the decks of a set of flashcards, read up front.
+
+    Covers every note in those decks (subdecks included) plus the notes the
+    flashcards are already linked to, wherever those live now.
     """
-    deck_name = str(row["deck_name"])
-    note_type = str(row["note_type"])
-    front_value = str(row["front_text"])
-    wanted = language_tag(row_language_code(row))
-    note_id = lookup.get(anki_front_lookup_key(deck_name, note_type, front_value, wanted))
-    if note_id is not None:
-        return note_id
-    return lookup.get(anki_front_lookup_key(deck_name, note_type, front_value, None))
+
+    def __init__(self, *, front_field: str) -> None:
+        self.front_field = front_field
+        self._notes: dict[int, dict[str, object]] = {}
+        self._deck_cards: dict[str, set[int]] = {}
+        self._by_identity: dict[tuple[str, str], list[int]] = {}
+        self._by_front: dict[tuple[str, str, str, str], int] = {}
+
+    @classmethod
+    def load(
+        cls,
+        rows: Iterable[sqlite3.Row],
+        *,
+        host: str,
+        port: int,
+        front_field: str,
+    ) -> AnkiNoteIndex:
+        rows = list(rows)
+        index = cls(front_field=front_field)
+        deck_names = sorted({str(row["deck_name"]) for row in rows})
+        actions: list[dict[str, object]] = []
+        for deck_name in deck_names:
+            actions.append(
+                {"action": "findNotes", "params": {"query": anki_connect.deck_search(deck_name)}}
+            )
+            actions.append(
+                {
+                    "action": "findCards",
+                    "params": {"query": anki_connect.deck_search(deck_name, include_subdecks=False)},
+                }
+            )
+        results = [
+            anki_connect.action_result(action, outcome)
+            for action, outcome in zip(
+                actions, anki_connect.multi(actions, host=host, port=port)
+            )
+        ]
+
+        deck_note_ids: dict[str, list[int]] = {}
+        for position, deck_name in enumerate(deck_names):
+            note_ids = results[2 * position]
+            card_ids = results[2 * position + 1]
+            if not isinstance(note_ids, list):
+                raise SystemExit("AnkiConnect returned an invalid findNotes payload.")
+            if not isinstance(card_ids, list):
+                raise SystemExit("AnkiConnect returned an invalid findCards payload.")
+            deck_note_ids[deck_name] = [int(note_id) for note_id in note_ids]
+            index._deck_cards[deck_name] = {int(card_id) for card_id in card_ids}
+
+        wanted_note_ids = dict.fromkeys(
+            note_id for note_ids in deck_note_ids.values() for note_id in note_ids
+        )
+        wanted_note_ids.update(
+            dict.fromkeys(
+                int(row["anki_note_id"]) for row in rows if row["anki_note_id"] is not None
+            )
+        )
+        index._notes = anki_connect.notes_info(list(wanted_note_ids), host=host, port=port)
+
+        for deck_name, note_ids in deck_note_ids.items():
+            for note_id in note_ids:
+                note = index._notes.get(note_id)
+                if note is not None:
+                    index._index_deck_note(deck_name, note_id, note)
+        return index
+
+    def _index_deck_note(
+        self,
+        deck_name: str,
+        note_id: int,
+        note: dict[str, object],
+    ) -> None:
+        tags = anki_connect.note_tags(note)
+        for tag in {tag.lower() for tag in tags}:
+            if tag.startswith(ANKI_IDENTITY_TAG_PREFIXES):
+                self._by_identity.setdefault((deck_name, tag), []).append(note_id)
+
+        front = anki_connect.note_field(note, self.front_field)
+        if front is not None:
+            key = anki_front_key(
+                deck_name,
+                str(note.get("modelName") or ""),
+                front,
+                anki_note_language_tag(tags),
+            )
+            # Anki's own order decides between notes sharing a front.
+            self._by_front.setdefault(key, note_id)
+
+    def note(self, note_id: int | None) -> dict[str, object] | None:
+        """The note as Anki has it, or None when it no longer exists."""
+        if note_id is None:
+            return None
+        return self._notes.get(note_id)
+
+    def find_by_identity(self, row: sqlite3.Row) -> int | None:
+        """Note in the row's deck tagged with its ``term_N``/``kanji_N`` and template."""
+        entity_type, entity_id = row_identity_tag(row)
+        template_tag = f"template_{row['template_name']}".lower()
+        matches = [
+            note_id
+            for note_id in self._by_identity.get(
+                (str(row["deck_name"]), f"{entity_type}_{entity_id}"), []
+            )
+            if template_tag in {tag.lower() for tag in anki_connect.note_tags(self._notes[note_id])}
+        ]
+        if len(matches) > 1:
+            raise SystemExit(
+                "Found multiple Anki notes for the same flashcard tags. "
+                f"Resolve duplicates for {entity_type} #{entity_id} in deck {row['deck_name']}."
+            )
+        return matches[0] if matches else None
+
+    def find_by_front(self, row: sqlite3.Row) -> int | None:
+        """Note with the row's front in its deck, never one tagged for another language.
+
+        Notes tagged with the row's language win; untagged notes (made by hand or by
+        an old export) still match, as they did before languages existed.
+        """
+        deck_name, note_type, front_value, wanted = row_anki_front_key(row)
+        note_id = self._by_front.get((deck_name, note_type, front_value, wanted))
+        if note_id is not None:
+            return note_id
+        return self._by_front.get((deck_name, note_type, front_value, ""))
+
+    def cards_outside_deck(self, note: dict[str, object], deck_name: str) -> list[int]:
+        """The note's cards when any of them is not directly in ``deck_name``."""
+        cards = note.get("cards")
+        if not isinstance(cards, list) or not cards:
+            return []
+        card_ids = [int(card_id) for card_id in cards]
+        in_deck = self._deck_cards.get(deck_name, set())
+        if all(card_id in in_deck for card_id in card_ids):
+            return []
+        return card_ids
 
 
-def anki_front_note_lookup(
-    rows: Iterable[sqlite3.Row],
+@dataclass
+class AnkiNotePlan:
+    """The requests one flashcard needs; none when Anki already matches it."""
+
+    row: sqlite3.Row
+    note_id: int | None  # None: the note has to be created
+    actions: list[dict[str, object]]
+
+
+@dataclass
+class AnkiPushResult:
+    created: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    duplicates: list[sqlite3.Row] = field(default_factory=list)
+
+
+def anki_add_note_action(
+    row: sqlite3.Row,
     *,
+    front_field: str,
+    back_field: str,
+) -> dict[str, object]:
+    row_language = row_language_code(row)
+    return {
+        "action": "addNote",
+        "params": {
+            "note": {
+                "deckName": row["deck_name"],
+                "modelName": row["note_type"],
+                "fields": {
+                    front_field: row["front_text"],
+                    back_field: row["back_text"],
+                },
+                "tags": tags_with_language(row["tags"], row_language),
+                "options": anki_add_note_options(row_language, str(row["deck_name"])),
+            }
+        },
+    }
+
+
+def anki_update_note_actions(
+    row: sqlite3.Row,
+    note_id: int,
+    note: dict[str, object],
+    index: AnkiNoteIndex,
+    *,
+    front_field: str,
+    back_field: str,
+) -> list[dict[str, object]]:
+    """Only what differs between the note in Anki and the flashcard."""
+    actions: list[dict[str, object]] = []
+    if not (
+        anki_same_text(anki_connect.note_field(note, front_field), row["front_text"])
+        and anki_same_text(anki_connect.note_field(note, back_field), row["back_text"])
+    ):
+        actions.append(
+            {
+                "action": "updateNoteFields",
+                "params": {
+                    "note": {
+                        "id": note_id,
+                        "fields": {
+                            front_field: row["front_text"],
+                            back_field: row["back_text"],
+                        },
+                    }
+                },
+            }
+        )
+
+    misplaced_cards = index.cards_outside_deck(note, str(row["deck_name"]))
+    if misplaced_cards:
+        actions.append(
+            {
+                "action": "changeDeck",
+                "params": {"cards": misplaced_cards, "deck": row["deck_name"]},
+            }
+        )
+
+    # Anki tags ignore case: adding `kanji` to a note tagged `Kanji` does nothing
+    # and removing `Kanji` then strips it, so tags are compared the way Anki does.
+    current_tags = {tag.lower(): tag for tag in anki_connect.note_tags(note)}
+    desired_tags = {
+        tag.lower(): tag for tag in tags_with_language(row["tags"], row_language_code(row))
+    }
+    for action, tags in (
+        ("addTags", sorted(tag for key, tag in desired_tags.items() if key not in current_tags)),
+        ("removeTags", sorted(tag for key, tag in current_tags.items() if key not in desired_tags)),
+    ):
+        if tags:
+            actions.append(
+                {"action": action, "params": {"notes": [note_id], "tags": " ".join(tags)}}
+            )
+    return actions
+
+
+def plan_anki_notes(
+    rows: list[sqlite3.Row],
+    index: AnkiNoteIndex,
+    *,
+    front_field: str,
+    back_field: str,
+    match_by_front: bool,
+) -> tuple[list[AnkiNotePlan], list[sqlite3.Row]]:
+    """Plans for ``rows`` plus the rows to plan again once these are applied.
+
+    A flashcard is matched to its stored note id, then to a note carrying its
+    identity tags, then (``match_by_front``) to a note with the same front. A
+    row is put off when an earlier row of this pass creates the note it would
+    match by front, so it links to that note instead of adding a duplicate.
+    """
+    plans: list[AnkiNotePlan] = []
+    deferred: list[sqlite3.Row] = []
+    fronts_being_created: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        if row["anki_note_id"] is not None:
+            note_id: int | None = int(row["anki_note_id"])
+        else:
+            note_id = index.find_by_identity(row)
+            if note_id is None and match_by_front:
+                note_id = index.find_by_front(row)
+
+        note = index.note(note_id)
+        if note_id is not None and note is not None:
+            actions = anki_update_note_actions(
+                row,
+                note_id,
+                note,
+                index,
+                front_field=front_field,
+                back_field=back_field,
+            )
+            plans.append(AnkiNotePlan(row=row, note_id=note_id, actions=actions))
+            continue
+
+        if match_by_front:
+            front_key = row_anki_front_key(row)
+            if front_key in fronts_being_created:
+                deferred.append(row)
+                continue
+            fronts_being_created.add(front_key)
+        plans.append(
+            AnkiNotePlan(
+                row=row,
+                note_id=None,
+                actions=[anki_add_note_action(row, front_field=front_field, back_field=back_field)],
+            )
+        )
+    return plans, deferred
+
+
+def anki_plan_batches(
+    plans: list[AnkiNotePlan],
+    max_actions: int,
+) -> Iterable[list[AnkiNotePlan]]:
+    """Whole plans grouped until a group carries ``max_actions`` requests."""
+    batch: list[AnkiNotePlan] = []
+    action_count = 0
+    for plan in plans:
+        batch.append(plan)
+        action_count += len(plan.actions)
+        if action_count >= max_actions:
+            yield batch
+            batch = []
+            action_count = 0
+    if batch:
+        yield batch
+
+
+def apply_anki_note_plans(
+    connection: sqlite3.Connection,
+    plans: list[AnkiNotePlan],
+    *,
+    table: str,
+    host: str,
+    port: int,
+    result: AnkiPushResult,
+) -> None:
+    """Send one batch to Anki and record, then commit, what it did."""
+    outcomes = iter(
+        anki_connect.multi(
+            [action for plan in plans for action in plan.actions],
+            host=host,
+            port=port,
+        )
+    )
+    synced: list[tuple[int, int]] = []
+    failure: str | None = None
+    for plan in plans:
+        note_id = plan.note_id
+        rejected_as_duplicate = False
+        for action, (value, error) in [(action, next(outcomes)) for action in plan.actions]:
+            if error is None:
+                if action["action"] == "addNote":
+                    note_id = int(value)
+            elif action["action"] == "addNote" and "duplicate" in error.lower():
+                rejected_as_duplicate = True
+            elif failure is None:
+                failure = f"AnkiConnect action {action['action']} failed: {error}"
+        if failure is not None:
+            break
+        if rejected_as_duplicate:
+            result.duplicates.append(plan.row)
+            continue
+        if plan.note_id is None:
+            result.created += 1
+        elif plan.actions:
+            result.updated += 1
+        else:
+            result.unchanged += 1
+        synced.append((int(note_id), int(plan.row["id"])))
+
+    # Committed per batch so an interrupted sync keeps the notes already linked.
+    connection.executemany(
+        f"""
+        UPDATE {table}
+        SET
+            anki_note_id = ?,
+            export_status = 'exported',
+            exported_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        synced,
+    )
+    connection.commit()
+    if failure is not None:
+        raise SystemExit(failure)
+
+
+def anki_prepare_decks(rows: list[sqlite3.Row], *, host: str, port: int) -> None:
+    """Fail on note types Anki lacks, then create the decks the rows go to."""
+    model_names = anki_connect.request(host=host, port=port, action="modelNames")
+    if not isinstance(model_names, list):
+        raise SystemExit("AnkiConnect returned an invalid modelNames payload.")
+    known_models = {str(name) for name in model_names}
+    missing_models = sorted(
+        {str(row["note_type"]) for row in rows if str(row["note_type"]) not in known_models}
+    )
+    if missing_models:
+        raise SystemExit(
+            "Missing Anki note types: "
+            + ", ".join(missing_models)
+            + ". Create them in Anki or regenerate cards with a different note type."
+        )
+
+    actions: list[dict[str, object]] = [
+        {"action": "createDeck", "params": {"deck": deck_name}}
+        for deck_name in sorted({str(row["deck_name"]) for row in rows})
+    ]
+    for action, outcome in zip(actions, anki_connect.multi(actions, host=host, port=port)):
+        anki_connect.action_result(action, outcome)
+
+
+def push_flashcards_to_anki(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    *,
+    table: str,
     host: str,
     port: int,
     front_field: str,
-) -> dict[tuple[str, str, str, str], int]:
-    by_scope: dict[tuple[str, str], list[sqlite3.Row]] = {}
-    for row in rows:
-        key = (str(row["deck_name"]), str(row["note_type"]))
-        by_scope.setdefault(key, []).append(row)
+    back_field: str,
+    match_by_front: bool,
+) -> AnkiPushResult:
+    """Create or update the Anki notes of ``rows`` (from ``table``) and link them."""
+    result = AnkiPushResult()
+    if not rows:
+        return result
 
-    lookup: dict[tuple[str, str, str, str], int] = {}
-    for (deck_name, note_type), scoped_rows in by_scope.items():
-        note_ids = anki_connect_request(
-            host=host,
-            port=port,
-            action="findNotes",
-            params={"query": f'deck:"{deck_name}" note:"{note_type}"'},
+    anki_prepare_decks(rows, host=host, port=port)
+    remaining = list(rows)
+    while remaining:
+        index = AnkiNoteIndex.load(remaining, host=host, port=port, front_field=front_field)
+        # Each pass plans at least its first row, so this always ends.
+        plans, remaining = plan_anki_notes(
+            remaining,
+            index,
+            front_field=front_field,
+            back_field=back_field,
+            match_by_front=match_by_front,
         )
-        if not isinstance(note_ids, list) or not note_ids:
-            continue
-
-        wanted_fronts = {
-            str(row["front_text"]).strip()
-            for row in scoped_rows
-            if row["front_text"] is not None
-        }
-        if not wanted_fronts:
-            continue
-
-        for start in range(0, len(note_ids), 100):
-            note_batch = note_ids[start : start + 100]
-            notes = anki_connect_request(
+        for batch in anki_plan_batches(plans, ANKI_SYNC_BATCH_ACTIONS):
+            apply_anki_note_plans(
+                connection,
+                batch,
+                table=table,
                 host=host,
                 port=port,
-                action="notesInfo",
-                params={"notes": note_batch},
+                result=result,
             )
-            if not isinstance(notes, list):
-                raise SystemExit("AnkiConnect returned an invalid notesInfo payload.")
-
-            for note in notes:
-                if not isinstance(note, dict):
-                    continue
-                fields = note.get("fields")
-                if not isinstance(fields, dict):
-                    continue
-                front = fields.get(front_field)
-                if not isinstance(front, dict):
-                    continue
-                front_value = str(front.get("value") or "").strip()
-                if front_value not in wanted_fronts:
-                    continue
-                note_tags = note.get("tags")
-                key = anki_front_lookup_key(
-                    deck_name,
-                    note_type,
-                    front_value,
-                    anki_note_language_tag(note_tags if isinstance(note_tags, list) else []),
-                )
-                if key not in lookup:
-                    lookup[key] = int(note["noteId"])
-
-    return lookup
-
-
-def anki_sync_tags(
-    note_id: int,
-    desired_tags: list[str],
-    *,
-    existing_tags: list[str],
-    host: str,
-    port: int,
-) -> None:
-    current = set(existing_tags)
-    desired = set(desired_tags)
-    tags_to_add = sorted(desired - current)
-    tags_to_remove = sorted(current - desired)
-
-    if tags_to_add:
-        anki_connect_request(
-            host=host,
-            port=port,
-            action="addTags",
-            params={"notes": [note_id], "tags": " ".join(tags_to_add)},
-        )
-    if tags_to_remove:
-        anki_connect_request(
-            host=host,
-            port=port,
-            action="removeTags",
-            params={"notes": [note_id], "tags": " ".join(tags_to_remove)},
-        )
-
-
-def batch_values(values: list[int], size: int) -> Iterable[list[int]]:
-    if size <= 0:
-        raise ValueError("Batch size must be positive.")
-
-    for index in range(0, len(values), size):
-        yield values[index : index + size]
-
-
-def anki_available_actions(*, host: str, port: int) -> set[str]:
-    try:
-        result = anki_connect_request(
-            host=host,
-            port=port,
-            action="apiReflect",
-            params={"scopes": ["actions"]},
-        )
-    except SystemExit:
-        return set()
-
-    if not isinstance(result, dict):
-        return set()
-
-    actions = result.get("actions")
-    if not isinstance(actions, list):
-        return set()
-
-    return {str(action) for action in actions}
-
-
-def anki_notes_info(
-    note_ids: list[int],
-    *,
-    host: str,
-    port: int,
-) -> dict[int, dict[str, object]]:
-    notes: dict[int, dict[str, object]] = {}
-    for batch in batch_values(note_ids, 250):
-        result = anki_connect_request(
-            host=host,
-            port=port,
-            action="notesInfo",
-            params={"notes": batch},
-        )
-        if not isinstance(result, list):
-            raise SystemExit("AnkiConnect returned an invalid notesInfo payload.")
-
-        for note in result:
-            if not isinstance(note, dict):
-                continue
-            note_id = note.get("noteId")
-            if note_id is None:
-                continue
-            notes[int(note_id)] = note
-
-    return notes
-
-
-def anki_cards_info(
-    card_ids: list[int],
-    *,
-    host: str,
-    port: int,
-) -> dict[int, dict[str, object]]:
-    cards: dict[int, dict[str, object]] = {}
-    for batch in batch_values(card_ids, 250):
-        result = anki_connect_request(
-            host=host,
-            port=port,
-            action="cardsInfo",
-            params={"cards": batch},
-        )
-        if not isinstance(result, list):
-            raise SystemExit("AnkiConnect returned an invalid cardsInfo payload.")
-
-        for card in result:
-            if not isinstance(card, dict):
-                continue
-            card_id = card.get("cardId")
-            if card_id is None:
-                continue
-            cards[int(card_id)] = card
-
-    return cards
+    return result
 
 
 def is_anki_new_card(card: dict[str, object] | None) -> bool:
@@ -6755,7 +6949,7 @@ def reprioritize_anki_learning_path(
     if not note_ids:
         return 0
 
-    note_infos = anki_notes_info(note_ids, host=host, port=port)
+    note_infos = anki_connect.notes_info(note_ids, host=host, port=port)
     note_to_new_cards: dict[int, list[int]] = {}
     all_card_ids: list[int] = []
     for note_id in note_ids:
@@ -6770,7 +6964,7 @@ def reprioritize_anki_learning_path(
     if not all_card_ids:
         return 0
 
-    card_infos = anki_cards_info(list(dict.fromkeys(all_card_ids)), host=host, port=port)
+    card_infos = anki_connect.cards_info(list(dict.fromkeys(all_card_ids)), host=host, port=port)
     for note_id in note_ids:
         note = note_infos.get(note_id)
         if note is None:
@@ -6884,7 +7078,7 @@ def reprioritize_anki_learning_path(
     if not ordered_card_ids:
         return 0
 
-    result = anki_connect_request(
+    result = anki_connect.request(
         host=host,
         port=port,
         action="repositionNewCards",
@@ -6935,7 +7129,7 @@ def reprioritize_anki_deck(
         return 0
 
     note_ids = list(dict.fromkeys(int(row["anki_note_id"]) for row in rows))
-    note_infos = anki_notes_info(note_ids, host=host, port=port)
+    note_infos = anki_connect.notes_info(note_ids, host=host, port=port)
 
     ordered_card_ids: list[int] = []
     for note_id in note_ids:
@@ -6952,7 +7146,7 @@ def reprioritize_anki_deck(
         return 0
 
     ordered_card_ids = list(dict.fromkeys(ordered_card_ids))
-    card_infos = anki_cards_info(ordered_card_ids, host=host, port=port)
+    card_infos = anki_connect.cards_info(ordered_card_ids, host=host, port=port)
     new_card_ids = [
         card_id
         for card_id in ordered_card_ids
@@ -6962,7 +7156,7 @@ def reprioritize_anki_deck(
     if not new_card_ids:
         return 0
 
-    result = anki_connect_request(
+    result = anki_connect.request(
         host=host,
         port=port,
         action="repositionNewCards",
@@ -7010,7 +7204,7 @@ def reprioritize_anki_kanji_deck(
         return 0
 
     note_ids = list(dict.fromkeys(int(row["anki_note_id"]) for row in rows))
-    note_infos = anki_notes_info(note_ids, host=host, port=port)
+    note_infos = anki_connect.notes_info(note_ids, host=host, port=port)
 
     ordered_card_ids: list[int] = []
     for note_id in note_ids:
@@ -7027,7 +7221,7 @@ def reprioritize_anki_kanji_deck(
         return 0
 
     ordered_card_ids = list(dict.fromkeys(ordered_card_ids))
-    card_infos = anki_cards_info(ordered_card_ids, host=host, port=port)
+    card_infos = anki_connect.cards_info(ordered_card_ids, host=host, port=port)
     new_card_ids = [
         card_id
         for card_id in ordered_card_ids
@@ -7037,7 +7231,7 @@ def reprioritize_anki_kanji_deck(
     if not new_card_ids:
         return 0
 
-    result = anki_connect_request(
+    result = anki_connect.request(
         host=host,
         port=port,
         action="repositionNewCards",
@@ -7059,7 +7253,7 @@ def reprioritize_anki_kanji_deck(
 
 
 def sync_anki(args: argparse.Namespace) -> None:
-    anki_version = anki_connect_request(
+    anki_version = anki_connect.request(
         host=args.host,
         port=args.port,
         action="version",
@@ -7116,13 +7310,6 @@ def sync_anki(args: argparse.Namespace) -> None:
         ).fetchall()
         rows = filter_blacklisted_term_rows(rows)
 
-        sync_deck_names = sorted({str(row["deck_name"]) for row in rows})
-        front_note_lookup = anki_front_note_lookup(
-            rows,
-            host=args.host,
-            port=args.port,
-            front_field=args.front_field,
-        )
         # Only the decks of the languages being synced are reordered, so
         # `sync-anki --language es` never touches the Japanese deck.
         reprioritize_language_sql, reprioritize_language_params = term_language_filter_clause(
@@ -7150,171 +7337,18 @@ def sync_anki(args: argparse.Namespace) -> None:
             }
         )
 
-        created = 0
-        updated = 0
-        skipped_duplicates = 0
+        pushed = push_flashcards_to_anki(
+            connection,
+            rows,
+            table="flashcards",
+            host=args.host,
+            port=args.port,
+            front_field=args.front_field,
+            back_field=args.back_field,
+            match_by_front=True,
+        )
 
-        if rows:
-            model_names = anki_connect_request(
-                host=args.host,
-                port=args.port,
-                action="modelNames",
-            )
-            if not isinstance(model_names, list):
-                raise SystemExit("AnkiConnect returned an invalid modelNames payload.")
-            missing_models = sorted(
-                {
-                    str(row["note_type"])
-                    for row in rows
-                    if str(row["note_type"]) not in model_names
-                }
-            )
-            if missing_models:
-                raise SystemExit(
-                    "Missing Anki note types: "
-                    + ", ".join(missing_models)
-                    + ". Create them in Anki or regenerate cards with a different note type."
-                )
-
-            for deck_name in sync_deck_names:
-                anki_connect_request(
-                    host=args.host,
-                    port=args.port,
-                    action="createDeck",
-                    params={"deck": deck_name},
-                )
-
-        for row in rows:
-            note_id = (
-                int(row["anki_note_id"])
-                if row["anki_note_id"] is not None
-                else anki_find_existing_note_id(
-                    row,
-                    host=args.host,
-                    port=args.port,
-                )
-            )
-            if note_id is None:
-                note_id = anki_front_lookup_get(front_note_lookup, row)
-            row_language = row_language_code(row)
-            desired_tags = tags_with_language(row["tags"], row_language)
-            add_note_options = anki_add_note_options(row_language, str(row["deck_name"]))
-
-            if note_id is None:
-                note_id_result = anki_connect_request(
-                    host=args.host,
-                    port=args.port,
-                    action="addNote",
-                    params={
-                        "note": {
-                            "deckName": row["deck_name"],
-                            "modelName": row["note_type"],
-                            "fields": {
-                                args.front_field: row["front_text"],
-                                args.back_field: row["back_text"],
-                            },
-                            "tags": desired_tags,
-                            "options": add_note_options,
-                        }
-                    },
-                )
-                if note_id_result is None:
-                    skipped_duplicates += 1
-                    continue
-                note_id = int(note_id_result)
-                created += 1
-                front_note_lookup[
-                    anki_front_lookup_key(
-                        str(row["deck_name"]),
-                        str(row["note_type"]),
-                        str(row["front_text"]),
-                        language_tag(row_language),
-                    )
-                ] = note_id
-            else:
-                note = anki_note_info(
-                    note_id,
-                    host=args.host,
-                    port=args.port,
-                )
-                if note is None:
-                    note_id_result = anki_connect_request(
-                        host=args.host,
-                        port=args.port,
-                        action="addNote",
-                        params={
-                            "note": {
-                                "deckName": row["deck_name"],
-                                "modelName": row["note_type"],
-                                "fields": {
-                                    args.front_field: row["front_text"],
-                                    args.back_field: row["back_text"],
-                                },
-                                "tags": desired_tags,
-                                "options": add_note_options,
-                            }
-                        },
-                    )
-                    if note_id_result is None:
-                        skipped_duplicates += 1
-                        continue
-                    note_id = int(note_id_result)
-                    created += 1
-                else:
-                    note_id_result = anki_connect_request(
-                        host=args.host,
-                        port=args.port,
-                        action="updateNoteFields",
-                        params={
-                            "note": {
-                                "id": note_id,
-                                "fields": {
-                                    args.front_field: row["front_text"],
-                                    args.back_field: row["back_text"],
-                                },
-                            }
-                        }
-                    )
-
-                    cards = note.get("cards")
-                    if isinstance(cards, list) and cards:
-                        anki_connect_request(
-                            host=args.host,
-                            port=args.port,
-                            action="changeDeck",
-                            params={"cards": cards, "deck": row["deck_name"]},
-                        )
-
-                    note_tags = note.get("tags")
-                    existing_tags = (
-                        [str(tag) for tag in note_tags]
-                        if isinstance(note_tags, list)
-                        else []
-                    )
-                    anki_sync_tags(
-                        note_id,
-                        desired_tags,
-                        existing_tags=existing_tags,
-                        host=args.host,
-                        port=args.port,
-                    )
-                    updated += 1
-
-            connection.execute(
-                """
-                UPDATE flashcards
-                SET
-                    anki_note_id = ?,
-                    export_status = 'exported',
-                    exported_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (note_id, row["id"]),
-            )
-            connection.commit()
-
-        actions = anki_available_actions(host=args.host, port=args.port)
+        actions = anki_connect.available_actions(host=args.host, port=args.port)
         reprioritized_cards = 0
         reprioritized_decks = 0
         reprioritization_warning = None
@@ -7352,8 +7386,9 @@ def sync_anki(args: argparse.Namespace) -> None:
 
     print(
         f"Synced {len(rows)} flashcards with Anki "
-        f"(created={created}, updated={updated}, "
-        f"skipped_duplicates={skipped_duplicates}, "
+        f"(created={pushed.created}, updated={pushed.updated}, "
+        f"unchanged={pushed.unchanged}, "
+        f"skipped_duplicates={len(pushed.duplicates)}, "
         f"reprioritized_new_cards={reprioritized_cards}, "
         f"reprioritized_decks={reprioritized_decks}, version={anki_version})."
     )
@@ -7376,8 +7411,8 @@ def prune_blacklisted_terms(
     connection: sqlite3.Connection,
     *,
     delete_anki_notes: bool = False,
-    host: str = DEFAULT_ANKI_CONNECT_HOST,
-    port: int = DEFAULT_ANKI_CONNECT_PORT,
+    host: str = anki_connect.DEFAULT_HOST,
+    port: int = anki_connect.DEFAULT_PORT,
 ) -> dict[str, object]:
     entries = blacklisted_term_entries(connection)
     if not entries:
@@ -7425,7 +7460,7 @@ def prune_blacklisted_terms(
         ).fetchall()
     ]
     if delete_anki_notes and anki_note_ids:
-        anki_connect_request(
+        anki_connect.request(
             host=host,
             port=port,
             action="deleteNotes",
@@ -7503,7 +7538,7 @@ def prune_blacklisted_terms_command(args: argparse.Namespace) -> None:
 
 
 def sync_anki_kanji(args: argparse.Namespace) -> None:
-    anki_version = anki_connect_request(
+    anki_version = anki_connect.request(
         host=args.host,
         port=args.port,
         action="version",
@@ -7566,7 +7601,6 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
             params,
         ).fetchall()
 
-        sync_deck_names = sorted({str(row["deck_name"]) for row in rows})
         reprioritize_language_sql, reprioritize_language_params = term_language_filter_clause(
             language,
             "k.language_code",
@@ -7587,158 +7621,24 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
             ).fetchall()
         ]
 
-        created = 0
-        updated = 0
-
-        if rows:
-            model_names = anki_connect_request(
-                host=args.host,
-                port=args.port,
-                action="modelNames",
-            )
-            if not isinstance(model_names, list):
-                raise SystemExit("AnkiConnect returned an invalid modelNames payload.")
-            missing_models = sorted(
-                {
-                    str(row["note_type"])
-                    for row in rows
-                    if str(row["note_type"]) not in {str(name) for name in model_names}
-                }
-            )
-            if missing_models:
-                raise SystemExit(
-                    "Missing Anki note type(s) for kanji sync: "
-                    + ", ".join(missing_models)
-                )
-
-            for deck_name in sync_deck_names:
-                anki_connect_request(
-                    host=args.host,
-                    port=args.port,
-                    action="createDeck",
-                    params={"deck": deck_name},
-                )
-
-        for row in rows:
-            note_id = (
-                int(row["anki_note_id"])
-                if row["anki_note_id"] is not None
-                else anki_find_existing_note_id(
-                    row,
-                    host=args.host,
-                    port=args.port,
-                )
-            )
-            row_language = row_language_code(row)
-            desired_tags = tags_with_language(row["tags"], row_language)
-            add_note_options = anki_add_note_options(row_language, str(row["deck_name"]))
-
-            if note_id is None:
-                note_id_result = anki_connect_request(
-                    host=args.host,
-                    port=args.port,
-                    action="addNote",
-                    params={
-                        "note": {
-                            "deckName": row["deck_name"],
-                            "modelName": row["note_type"],
-                            "fields": {
-                                args.front_field: row["front_text"],
-                                args.back_field: row["back_text"],
-                            },
-                            "tags": desired_tags,
-                            "options": add_note_options,
-                        }
-                    },
-                )
-                if note_id_result is None:
-                    raise SystemExit(
-                        f"Anki rejected kanji flashcard #{row['id']} as a duplicate."
-                    )
-                note_id = int(note_id_result)
-                created += 1
-            else:
-                note = anki_note_info(note_id, host=args.host, port=args.port)
-                if note is None:
-                    note_id_result = anki_connect_request(
-                        host=args.host,
-                        port=args.port,
-                        action="addNote",
-                        params={
-                            "note": {
-                                "deckName": row["deck_name"],
-                                "modelName": row["note_type"],
-                                "fields": {
-                                    args.front_field: row["front_text"],
-                                    args.back_field: row["back_text"],
-                                },
-                                "tags": desired_tags,
-                                "options": add_note_options,
-                            }
-                        },
-                    )
-                    if note_id_result is None:
-                        raise SystemExit(
-                            f"Anki rejected kanji flashcard #{row['id']} as a duplicate."
-                        )
-                    note_id = int(note_id_result)
-                    created += 1
-                else:
-                    anki_connect_request(
-                        host=args.host,
-                        port=args.port,
-                        action="updateNoteFields",
-                        params={
-                            "note": {
-                                "id": note_id,
-                                "fields": {
-                                    args.front_field: row["front_text"],
-                                    args.back_field: row["back_text"],
-                                },
-                            }
-                        }
-                    )
-
-                    cards = note.get("cards")
-                    if isinstance(cards, list) and cards:
-                        anki_connect_request(
-                            host=args.host,
-                            port=args.port,
-                            action="changeDeck",
-                            params={"cards": cards, "deck": row["deck_name"]},
-                        )
-
-                    note_tags = note.get("tags")
-                    existing_tags = (
-                        [str(tag) for tag in note_tags]
-                        if isinstance(note_tags, list)
-                        else []
-                    )
-                    anki_sync_tags(
-                        note_id,
-                        desired_tags,
-                        existing_tags=existing_tags,
-                        host=args.host,
-                        port=args.port,
-                    )
-                    updated += 1
-
-            connection.execute(
-                """
-                UPDATE kanji_flashcards
-                SET
-                    anki_note_id = ?,
-                    export_status = 'exported',
-                    exported_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (note_id, row["id"]),
+        pushed = push_flashcards_to_anki(
+            connection,
+            rows,
+            table="kanji_flashcards",
+            host=args.host,
+            port=args.port,
+            front_field=args.front_field,
+            back_field=args.back_field,
+            match_by_front=False,
+        )
+        if pushed.duplicates:
+            raise SystemExit(
+                f"Anki rejected kanji flashcard #{pushed.duplicates[0]['id']} as a duplicate."
             )
 
         reprioritized_cards = 0
         reprioritized_decks = 0
-        actions = anki_available_actions(host=args.host, port=args.port)
+        actions = anki_connect.available_actions(host=args.host, port=args.port)
         reprioritization_warning = None
 
         if "repositionNewCards" in actions:
@@ -7778,7 +7678,8 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
     )
     print(
         f"Synced {len(rows)} kanji flashcards with Anki "
-        f"(created={created}, updated={updated}, "
+        f"(created={pushed.created}, updated={pushed.updated}, "
+        f"unchanged={pushed.unchanged}, "
         f"reprioritized_new_cards={reprioritized_cards}, "
         f"reprioritized_decks={reprioritized_decks}, version={anki_version})."
     )
@@ -7973,12 +7874,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prune_blacklisted_terms_parser.add_argument(
         "--host",
-        default=DEFAULT_ANKI_CONNECT_HOST,
+        default=anki_connect.DEFAULT_HOST,
     )
     prune_blacklisted_terms_parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_ANKI_CONNECT_PORT,
+        default=anki_connect.DEFAULT_PORT,
     )
     prune_blacklisted_terms_parser.set_defaults(func=prune_blacklisted_terms_command)
 
@@ -8455,12 +8356,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_cards_parser.add_argument(
         "--host",
-        default=DEFAULT_ANKI_CONNECT_HOST,
+        default=anki_connect.DEFAULT_HOST,
     )
     sync_cards_parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_ANKI_CONNECT_PORT,
+        default=anki_connect.DEFAULT_PORT,
     )
     sync_cards_parser.add_argument(
         "--status",
@@ -8479,12 +8380,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_words_parser.add_argument(
         "--host",
-        default=DEFAULT_ANKI_CONNECT_HOST,
+        default=anki_connect.DEFAULT_HOST,
     )
     sync_words_parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_ANKI_CONNECT_PORT,
+        default=anki_connect.DEFAULT_PORT,
     )
     sync_words_parser.add_argument(
         "--status",
@@ -8526,12 +8427,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_kanji_cards_parser.add_argument(
         "--host",
-        default=DEFAULT_ANKI_CONNECT_HOST,
+        default=anki_connect.DEFAULT_HOST,
     )
     sync_kanji_cards_parser.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_ANKI_CONNECT_PORT,
+        default=anki_connect.DEFAULT_PORT,
     )
     sync_kanji_cards_parser.add_argument(
         "--status",
