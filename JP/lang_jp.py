@@ -21,6 +21,7 @@ from urllib.request import Request, urlopen
 
 import jmdict
 import languages
+import settings
 from catalog_changes import ensure_catalog_change_log
 from languages import (
     ALL_LANGUAGES_CODE,
@@ -869,6 +870,52 @@ def list_capture_skip_rules_command(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Settings: the registry lives in settings.py, the values in the ``settings``
+# table. The same values are edited from /settings in the web UI and the tray.
+# ---------------------------------------------------------------------------
+
+
+def list_settings_command(args: argparse.Namespace) -> None:
+    connection = db_connect(args.db)
+    try:
+        snapshot = settings.load_settings(connection)
+    finally:
+        connection.close()
+    for setting in settings.REGISTRY:
+        source = snapshot.source(setting.key)
+        note = f"env {setting.env}" if source == settings.SOURCE_ENV else source
+        print(f"{setting.key}	{snapshot.text(setting.key)}	({note})")
+
+
+def set_setting_command(args: argparse.Namespace) -> None:
+    connection = db_connect(args.db)
+    try:
+        value = settings.set_setting(connection, args.key, args.value)
+        connection.commit()
+        snapshot = settings.load_settings(connection)
+    finally:
+        connection.close()
+    setting = settings.setting_for(args.key)
+    print(f"{args.key} = {settings.serialize_value(setting, value)}")
+    if snapshot.is_pinned(args.key):
+        print(
+            f"Note: {setting.env} is set and pins this setting to "
+            f"{snapshot.text(args.key)} until it is removed."
+        )
+
+
+def reset_setting_command(args: argparse.Namespace) -> None:
+    connection = db_connect(args.db)
+    try:
+        settings.reset_settings(connection, [args.key])
+        connection.commit()
+    finally:
+        connection.close()
+    setting = settings.setting_for(args.key)
+    print(f"{args.key} = {settings.serialize_value(setting, setting.default)} (default)")
+
+
+# ---------------------------------------------------------------------------
 # Capture profiles: a window title or process name pinned to a language set
 # ---------------------------------------------------------------------------
 
@@ -1323,6 +1370,7 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
         )
     connection.executescript(CAPTURE_PROFILE_SCHEMA_SQL)
     connection.executescript(CAPTURE_SKIP_RULE_SCHEMA_SQL)
+    connection.executescript(settings.SETTINGS_SCHEMA_SQL)
     if table_exists(connection, "flashcards"):
         flashcard_columns = table_columns(connection, "flashcards")
         if "anki_note_id" not in flashcard_columns:
@@ -8080,6 +8128,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="List the capture skip rules (database and environment).",
     )
     list_skip_windows_parser.set_defaults(func=list_capture_skip_rules_command)
+
+    list_settings_parser = subparsers.add_parser(
+        "list-settings",
+        help="Show every setting, its value and where the value comes from.",
+    )
+    list_settings_parser.set_defaults(func=list_settings_command)
+
+    set_setting_parser = subparsers.add_parser(
+        "set-setting",
+        help="Change a setting (stored in the database; applies without a restart).",
+    )
+    set_setting_parser.add_argument("key", help="Setting key, for example ocr.min_confidence.")
+    set_setting_parser.add_argument("value", help="New value; on/off for switches.")
+    set_setting_parser.set_defaults(func=set_setting_command)
+
+    reset_setting_parser = subparsers.add_parser(
+        "reset-setting",
+        help="Put a setting back to its default.",
+    )
+    reset_setting_parser.add_argument("key")
+    reset_setting_parser.set_defaults(func=reset_setting_command)
 
     list_capture_profiles_parser = subparsers.add_parser(
         "list-capture-profiles",

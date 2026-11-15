@@ -102,6 +102,7 @@ CHANGE_SPECS: tuple[ChangeSpec, ...] = (
     ChangeSpec("source_kanji", (("source", "{row}.source_id"), ("kanji", "{row}.kanji_id"))),
     ChangeSpec("flashcards", (("flashcard", "{row}.id"), ("term", "{row}.term_id"))),
     ChangeSpec("languages", (("language", None),)),
+    ChangeSpec("settings", (("setting", None),)),
     ChangeSpec("capture_jobs", (("job", "{row}.id"),)),
 )
 

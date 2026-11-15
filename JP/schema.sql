@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS capture_skip_rules (
     UNIQUE(kind, pattern)
 );
 
+-- User settings (OCR, capture, translation, hotkeys). settings.py declares
+-- every key with its type and default; only values that differ from the default
+-- have a row. Edited from /settings in the web UI, the tray and the
+-- set-setting CLI command.
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS capture_profiles (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
