@@ -91,7 +91,6 @@ class Setting:
     aliases: tuple[tuple[str, str], ...] = ()
     minimum: float | None = None
     maximum: float | None = None
-    step: float | None = None
     advanced: bool = False
 
     def choice_values(self) -> tuple[str, ...]:
@@ -151,7 +150,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_MAX_SIDE",
         minimum=0,
         maximum=8192,
-        step=1,
     ),
     Setting(
         "ocr.multi_max_side",
@@ -163,7 +161,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_MULTI_OCR_MAX_SIDE",
         minimum=0,
         maximum=8192,
-        step=1,
     ),
     Setting(
         "ocr.min_confidence",
@@ -175,7 +172,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_MIN_CONFIDENCE",
         minimum=0.0,
         maximum=1.0,
-        step=0.05,
     ),
     Setting(
         "ocr.min_term_confidence",
@@ -187,7 +183,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_MIN_TERM_CONFIDENCE",
         minimum=0.0,
         maximum=1.0,
-        step=0.05,
     ),
     Setting(
         "ocr.confident_read",
@@ -199,7 +194,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_CONFIDENT_READ",
         minimum=0.0,
         maximum=1.0,
-        step=0.05,
         advanced=True,
     ),
     Setting(
@@ -211,7 +205,6 @@ REGISTRY: tuple[Setting, ...] = (
         "Caracteres lidos abaixo disso sao descartados da linha.",
         minimum=0.0,
         maximum=1.0,
-        step=0.05,
         advanced=True,
     ),
     Setting(
@@ -224,7 +217,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_HORIZONTAL_MIN_RATIO",
         minimum=0.1,
         maximum=20.0,
-        step=0.1,
         advanced=True,
     ),
     Setting(
@@ -237,7 +229,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_HORIZONTAL_MAX_ANGLE",
         minimum=0.0,
         maximum=90.0,
-        step=1,
         advanced=True,
     ),
     Setting(
@@ -250,7 +241,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_REGION_PADDING",
         minimum=0,
         maximum=400,
-        step=1,
         advanced=True,
     ),
     Setting(
@@ -263,7 +253,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_MAX_REGIONS",
         minimum=1,
         maximum=50,
-        step=1,
         advanced=True,
     ),
     Setting(
@@ -287,7 +276,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_OCR_PROGRESS_INTERVAL",
         minimum=0.5,
         maximum=600.0,
-        step=0.5,
         advanced=True,
     ),
     # --- Capture -----------------------------------------------------------
@@ -302,7 +290,6 @@ REGISTRY: tuple[Setting, ...] = (
         "Em segundos. Tambem no tray, em Capture interval.",
         minimum=1,
         maximum=3600,
-        step=1,
     ),
     Setting(
         "capture.after_source_ready",
@@ -341,7 +328,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_CAPTURE_STALE_JOB_HOURS",
         minimum=0.1,
         maximum=720.0,
-        step=0.5,
         advanced=True,
     ),
     # --- Translation -------------------------------------------------------
@@ -400,7 +386,6 @@ REGISTRY: tuple[Setting, ...] = (
         env="LANG_JP_TERM_TRANSLATION_TIMEOUT_SECONDS",
         minimum=1.0,
         maximum=120.0,
-        step=1,
         advanced=True,
     ),
     # --- Reading overlay ---------------------------------------------------
@@ -445,7 +430,6 @@ REGISTRY: tuple[Setting, ...] = (
         "Multiplicador; tambem muda com Ctrl+roda do mouse enquanto o overlay esta visivel.",
         minimum=0.5,
         maximum=3.0,
-        step=0.05,
     ),
     # --- Hotkeys -----------------------------------------------------------
     Setting(

@@ -691,6 +691,7 @@ class MultilingualPagesTest(unittest.TestCase):
             "sources": lang_jp_web.sources_page(self.db_path, {"lang": ["ja"]}),
             "flashcards": lang_jp_web.flashcards_page(self.db_path, {}),
             "capture": lang_jp_web.capture_page(self.db_path, {}),
+            "settings": lang_jp_web.settings_page(self.db_path, {}),
             "kanji_detail": lang_jp_web.kanji_detail_page(self.db_path, self.kanji_id, {}),
         }
         for name, page in pages.items():
@@ -971,6 +972,7 @@ class MultilingualPagesTest(unittest.TestCase):
             "sources": lang_jp_web.sources_view(self.db_path, empty),
             "flashcards": lang_jp_web.flashcards_view(self.db_path, empty),
             "capture": lang_jp_web.capture_view(self.db_path, empty),
+            "settings": lang_jp_web.settings_view(self.db_path, empty),
             "term": lang_jp_web.term_detail_view(self.db_path, self.ja_term, empty),
             "kanji_detail": lang_jp_web.kanji_detail_view(self.db_path, self.kanji_id, empty),
             "source": lang_jp_web.source_detail_view(self.db_path, self.mixed_source, empty),

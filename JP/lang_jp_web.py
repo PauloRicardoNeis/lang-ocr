@@ -26,6 +26,8 @@ from uuid import uuid4
 import catalog_changes
 import lang_jp
 import languages
+import settings as app_settings
+import web_settings
 from catalog_changes import Watch
 from lang_jp import (
     ensure_runtime_schema,
@@ -701,8 +703,113 @@ PAGE_STYLE = """
     .live-region.is-updated > * { animation: none; }
   }
 
+  /* Settings page: one form per section, a row per setting. */
+  .section-index {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .section-index .muted { margin-left: auto; font-size: 0.92rem; }
+  .settings-section { scroll-margin-top: 16px; }
+  .setting-summary { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 4px; }
+  .setting-summary .chip { min-height: 26px; font-size: 0.82rem; font-weight: 600; }
+
+  .setting-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(190px, 280px);
+    gap: 16px;
+    align-items: center;
+    padding: 12px 0;
+    border-bottom: 1px solid rgba(215, 195, 161, 0.7);
+  }
+
+  .setting-label { font-weight: 600; }
+  .setting-chips .chip { min-height: 22px; padding: 0 8px; margin-left: 6px; font-size: 0.76rem; }
+  .chip.is-cool { background: rgba(51, 92, 103, 0.14); color: #27474f; }
+  .panel .setting-help { margin: 4px 0 0; font-size: 0.9rem; line-height: 1.45; }
+
+  .setting-control input[type="number"],
+  .setting-control input[type="text"],
+  .setting-control select {
+    width: 100%;
+    min-height: 38px;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(51, 92, 103, 0.24);
+    background: rgba(255, 253, 249, 0.9);
+    padding: 0 12px;
+  }
+
+  .setting-control.is-switch { text-align: right; }
+
+  .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+
+  .switch span {
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: rgba(95, 101, 95, 0.35);
+    transition: background 0.15s ease;
+    pointer-events: none;
+  }
+
+  .switch span::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: white;
+    transition: transform 0.15s ease;
+  }
+
+  .switch input:checked + span { background: var(--accent-cool); }
+  .switch input:checked + span::after { transform: translateX(20px); }
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .setting-lock {
+    padding: 8px 10px;
+    border-radius: var(--radius-md);
+    border: 1px dashed rgba(95, 101, 95, 0.5);
+    background: rgba(255, 252, 247, 0.8);
+    color: var(--muted);
+    font-size: 0.86rem;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  .setting-advanced summary {
+    padding: 12px 0;
+    color: var(--accent-cool);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .setting-advanced[open] summary { border-bottom: 1px solid rgba(215, 195, 161, 0.7); }
+
+  button.button-quiet {
+    border: 1px solid rgba(51, 92, 103, 0.16);
+    background: rgba(255, 252, 247, 0.92);
+    color: var(--accent-cool);
+    box-shadow: none;
+    font-weight: 600;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .switch span, .switch span::after { transition: none; }
+  }
+
   @media (max-width: 900px) {
     .panel-wide, .panel-side { grid-column: span 12; }
+  }
+
+  @media (max-width: 700px) {
+    .setting-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+    .setting-control.is-switch { text-align: left; }
   }
 </style>
 """
@@ -2204,6 +2311,7 @@ def layout(
             nav_link("/sources", "Fontes", active_path, lang),
             nav_link("/flashcards", "Cards", active_path, lang),
             nav_link("/capture", "Captura", active_path),
+            nav_link("/settings", "Ajustes", active_path),
         )
     )
     return f"""<!doctype html>
@@ -4483,6 +4591,7 @@ def capture_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
         <ul class="meta-list">{engines_html}</ul>
         {unsupported_html}
         <p class="footer-note">Captura atual: {html.escape(", ".join(capture_codes))}</p>
+        <p class="footer-note"><a href="/settings#ocr">Ajustes de OCR</a> (motor, tamanho da imagem, confianca).</p>
       </section>
 
       <section class="panel panel-wide">
@@ -4537,6 +4646,63 @@ def capture_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
         regions=live.regions,
         watch=Watch.of("job"),
     )
+
+
+def settings_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
+    """Every setting of the registry (settings.py), one form per section.
+
+    The forms are static; what changes under them (a value set from the tray or
+    the CLI) shows in each section's live summary and in the index.
+    """
+    with db_connect(db_path) as connection:
+        snapshot = load_settings(connection)
+        language_options = [
+            (str(row["code"]), get_language(str(row["code"])).name)
+            for row in list_language_rows(connection)
+        ]
+    # A notice about one section is shown in that section, where the save landed.
+    noticed_section = first_value(params, "section", "")
+    live = LiveRegions()
+    sections = []
+    for section in app_settings.SECTIONS:
+        notice = notice_banner(params) if section.key == noticed_section else ""
+        sections.append(
+            f"""
+      <section class="panel settings-section" id="{html.escape(section.key, quote=True)}">
+        {notice}
+        <h2>{html.escape(section.label)}</h2>
+        <p>{html.escape(section.help)}</p>
+        {live.region(f"settings-{section.key}", web_settings.section_summary_html(section, snapshot))}
+        {web_settings.section_form_html(section, snapshot)}
+      </section>"""
+        )
+    top_notice = notice_banner(params) if noticed_section not in {s.key for s in app_settings.SECTIONS} else ""
+    body = f"""
+    <div class="grid">
+      <section class="panel">
+        {top_notice}
+        <h2>Ajustes</h2>
+        <p>Valem para o worker, o overlay e o tray sem reiniciar nada: cada um le os ajustes do banco quando vai usa-los. Os mesmos valores aparecem no menu do tray e em <code>lang_jp.py list-settings</code>.</p>
+        {live.region("settings-index", web_settings.section_index_html(snapshot))}
+      </section>
+      {"".join(sections)}
+    </div>
+    {web_settings.language_datalist_html(language_options)}
+    """
+    return PageView(
+        title="Ajustes",
+        body=body,
+        active_path="/settings",
+        lang=ALL_LANGUAGES_CODE,
+        language_bar=language_bar_html(db_path, active_path="/settings", lang=ALL_LANGUAGES_CODE),
+        regions=live.regions,
+        watch=Watch.of("setting"),
+    )
+
+
+def api_settings_payload(db_path: Path) -> dict[str, object]:
+    with db_connect(db_path) as connection:
+        return web_settings.settings_api_payload(load_settings(connection))
 
 
 def api_capture_payload(db_path: Path) -> dict[str, object]:
@@ -4870,6 +5036,10 @@ def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
     return render_view_html(db_path, lambda: capture_view(db_path, params))  # type: ignore[return-value]
 
 
+def settings_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    return render_view_html(db_path, lambda: settings_view(db_path, params))  # type: ignore[return-value]
+
+
 def term_detail_page(db_path: Path, term_id: int, params: dict[str, list[str]] | None = None) -> str | None:
     return render_view_html(db_path, lambda: term_detail_view(db_path, term_id, params))
 
@@ -4905,6 +5075,7 @@ class PageRoute:
 PAGE_ROUTES: tuple[PageRoute, ...] = (
     PageRoute("/", dashboard_view),
     PageRoute("/capture", capture_view),
+    PageRoute("/settings", settings_view),
     PageRoute("/terms", terms_view),
     PageRoute("/terms", term_detail_view, True, "Termo invalido.", "Termo nao encontrado."),
     PageRoute("/kanji", kanji_view),
@@ -4934,6 +5105,9 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/capture":
             self.respond_json(api_capture_payload(self.db_path))
+            return
+        if path == "/api/settings":
+            self.respond_json(api_settings_payload(self.db_path))
             return
         if path == "/api/terms":
             self.respond_json(api_terms_payload(self.db_path, params))
@@ -5011,6 +5185,9 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/actions/capture-languages":
             self.run_capture_languages_action()
+            return
+        if path == "/actions/settings":
+            self.run_settings_action()
             return
         if path == "/actions/capture-skip-rules":
             self.run_capture_skip_rule_action()
@@ -5136,6 +5313,34 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             self.respond_json({"capture_languages": list(codes), "message": message})
             return
         self.redirect(self.append_notice("/capture", message=message, level="info"))
+
+    def run_settings_action(self) -> None:
+        """Save or reset one section of /settings (see web_settings.apply_settings_form)."""
+        # Blank values matter here: an empty hotkey turns the hotkey off.
+        form_data = self.read_form_data(keep_blank_values=True)
+        section_key = first_value(form_data, "section", "")
+
+        def back(message: str, level: str) -> str:
+            target = build_query_path("/settings", {"section": section_key})
+            notice_path = self.append_notice(target, message=message, level=level)
+            return f"{notice_path}#{section_key}" if section_key.isidentifier() else notice_path
+
+        try:
+            with db_connect(self.db_path) as connection:
+                result = web_settings.apply_settings_form(connection, form_data)
+                connection.commit()
+        except SystemExit as exc:
+            if self.prefers_json_response():
+                self.respond_json({"message": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.redirect(back(str(exc), "error"))
+            return
+        if self.prefers_json_response():
+            self.respond_json(
+                {"message": result.message, "section": result.section.key, "settings": result.values}
+            )
+            return
+        self.redirect(back(result.message, "info"))
 
     def run_capture_skip_rule_action(self) -> None:
         form_data = self.read_form_data()
@@ -5307,7 +5512,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def read_form_data(self) -> dict[str, list[str]]:
+    def read_form_data(self, *, keep_blank_values: bool = False) -> dict[str, list[str]]:
         content_length = self.headers.get("Content-Length")
         if content_length is None:
             return {}
@@ -5316,7 +5521,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             return {}
         raw_body = self.rfile.read(length).decode("utf-8")
-        return parse_qs(raw_body)
+        return parse_qs(raw_body, keep_blank_values=keep_blank_values)
 
     def run_catalog_command(self, *command_parts: str) -> subprocess.CompletedProcess[str]:
         return run_catalog_command_for_db(self.db_path, *command_parts)
