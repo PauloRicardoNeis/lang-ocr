@@ -144,6 +144,10 @@ Databases created before this change are upgraded in place on the next command: 
 
 On Windows, the single entry point is `..\open_lang.cmd` from the repository root. It builds `desktop_capture_daemon.exe` when Cargo is available (otherwise it reuses an existing build), starts the tray daemon, and opens the catalog in the browser. If the daemon is already running, it only opens the catalog.
 
+To start the tray daemon automatically at logon (20 seconds after sign-in, without opening the browser), run `powershell -ExecutionPolicy Bypass -File ..\register_startup.ps1` once from the repository root. It registers a per-user scheduled task named "Lang tray daemon"; pass `-DelaySeconds N` to change the delay or `-Remove` to unregister it.
+
+However the daemon is opened (shortcut, `open_lang.cmd`, the logon task), it starts the capture service by itself `capture.autostart_delay_seconds` seconds later (default 20), unless the service was started, paused or stopped by hand in the meantime. Turn it off with the setting `capture.autostart` (web UI `/settings`, or `lang_jp.py set-setting capture.autostart 0`); both apply the next time the daemon opens.
+
 The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-open-browser` on `web_port` (default 8766), restarts it with backoff if it exits, and stops it on Quit. If something else is already serving that port (for example a manual `browse`), the daemon reuses it instead of starting a second server. Web server output goes to `data/catalog_web.log`. Use `Open Lang` in the tray menu, or double-click the tray icon, to open the catalog. Only one daemon runs at a time; launching it again just opens the catalog. To follow the capture log live, use `Tail logs` in the tray menu.
 
 ## Live updates in the web UI

@@ -47,6 +47,8 @@ use winit::window::Window;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UserEvent {
     Start,
+    /// The delayed start after the daemon opens (`capture.autostart`).
+    AutoStart,
     Pause,
     Resume,
     CaptureNow,
@@ -418,6 +420,8 @@ const SETTING_INTERVAL_SECONDS: &str = "capture.interval_seconds";
 const SETTING_AFTER_SOURCE_READY: &str = "capture.after_source_ready";
 const SETTING_OCR_MAX_SIDE: &str = "ocr.max_side";
 const SETTING_DEBUG_LOG: &str = "capture.debug_log";
+const SETTING_AUTOSTART: &str = "capture.autostart";
+const SETTING_AUTOSTART_DELAY_SECONDS: &str = "capture.autostart_delay_seconds";
 const SETTING_MANUAL_CAPTURE_HOTKEY: &str = "hotkeys.manual_capture";
 const SETTING_OVERLAY_HOTKEY: &str = "hotkeys.overlay_toggle";
 const SETTING_OVERLAY_MODE_HOTKEY: &str = "hotkeys.overlay_mode";
@@ -432,6 +436,8 @@ const DAEMON_SETTING_DEFAULTS: &[(&str, &str)] = &[
     ("capture.after_source_ready", "0"),
     ("ocr.max_side", "1600"),
     ("capture.debug_log", "0"),
+    ("capture.autostart", "1"),
+    ("capture.autostart_delay_seconds", "20"),
     ("hotkeys.manual_capture", ""),
     ("hotkeys.overlay_toggle", "Ctrl+Alt+Q"),
     ("hotkeys.overlay_mode", "Ctrl+Alt+W"),
@@ -522,6 +528,9 @@ struct DaemonSettings {
     capture_after_source_ready: bool,
     ocr_max_side: u64,
     debug_log: bool,
+    /// Start the capture service by itself when the daemon opens.
+    autostart: bool,
+    autostart_delay_seconds: u64,
     manual_capture_hotkey: String,
     overlay_hotkey: String,
     overlay_mode_hotkey: String,
@@ -550,6 +559,8 @@ impl DaemonSettings {
             capture_after_source_ready: flag(SETTING_AFTER_SOURCE_READY),
             ocr_max_side: number(SETTING_OCR_MAX_SIDE),
             debug_log: flag(SETTING_DEBUG_LOG),
+            autostart: flag(SETTING_AUTOSTART),
+            autostart_delay_seconds: number(SETTING_AUTOSTART_DELAY_SECONDS),
             manual_capture_hotkey: text(SETTING_MANUAL_CAPTURE_HOTKEY),
             overlay_hotkey: text(SETTING_OVERLAY_HOTKEY),
             overlay_mode_hotkey: text(SETTING_OVERLAY_MODE_HOTKEY),
@@ -972,6 +983,17 @@ impl Controller {
             self.append_log("automatic OCR worker disabled; capture jobs will stay pending until processed manually");
         }
         self.spawn_capture_loop(proxy, CaptureLoopMode::Continuous);
+    }
+
+    /// The automatic start only takes an idle service: if the capture was
+    /// started, paused or stopped by hand during the delay, that choice stands.
+    fn auto_start(&self, proxy: EventLoopProxy<UserEvent>) {
+        if self.state() != ServiceState::Idle {
+            self.append_log("automatic capture start skipped: the service was already handled");
+            return;
+        }
+        self.append_log("automatic capture start");
+        self.start(proxy);
     }
 
     fn pause(&self) {
@@ -2453,6 +2475,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Start => self.controller.start(self.proxy.clone()),
+            UserEvent::AutoStart => self.controller.auto_start(self.proxy.clone()),
             UserEvent::Pause => self.controller.pause(),
             UserEvent::Resume => self.controller.resume(self.proxy.clone()),
             UserEvent::CaptureNow => self.controller.capture_now(self.proxy.clone()),
@@ -3189,6 +3212,21 @@ impl LaunchOptions {
     }
 }
 
+/// Schedules the automatic capture start when `capture.autostart` is on. Read
+/// once here, so a change applies the next time the daemon opens, whether from
+/// open_lang.cmd, the shortcut or the logon task.
+fn spawn_capture_autostart(config: &DaemonConfig, proxy: EventLoopProxy<UserEvent>) {
+    let settings = DaemonSettings::load(&config.db_path).unwrap_or_default();
+    if !settings.autostart {
+        return;
+    }
+    let delay = Duration::from_secs(settings.autostart_delay_seconds);
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let _ = proxy.send_event(UserEvent::AutoStart);
+    });
+}
+
 fn main() -> Result<()> {
     let options = LaunchOptions::from_args(std::env::args().skip(1));
     let config = DaemonConfig::load();
@@ -3209,6 +3247,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     spawn_manual_capture_hotkey_listener(&tray_config, proxy.clone());
+    spawn_capture_autostart(&tray_config, proxy.clone());
     {
         let tick_proxy = proxy.clone();
         std::thread::spawn(move || {
@@ -3383,6 +3422,8 @@ overlay_script = "tools/overlay.py"
         assert!(!defaults.capture_after_source_ready);
         assert_eq!(defaults.ocr_max_side, 1600);
         assert!(!defaults.debug_log);
+        assert!(defaults.autostart);
+        assert_eq!(defaults.autostart_delay_seconds, 20);
         assert_eq!(defaults.manual_capture_hotkey_option(), None);
 
         let mut rows = HashMap::new();
@@ -3390,7 +3431,11 @@ overlay_script = "tools/overlay.py"
         rows.insert(SETTING_AFTER_SOURCE_READY.to_string(), "1".to_string());
         rows.insert(SETTING_OCR_MAX_SIDE.to_string(), "0".to_string());
         rows.insert(SETTING_DEBUG_LOG.to_string(), "garbage".to_string());
+        rows.insert(SETTING_AUTOSTART.to_string(), "0".to_string());
+        rows.insert(SETTING_AUTOSTART_DELAY_SECONDS.to_string(), "0".to_string());
         let settings = DaemonSettings::from_rows(&rows);
+        assert!(!settings.autostart);
+        assert_eq!(settings.autostart_delay_seconds, 0);
         assert_eq!(settings.interval_seconds, 15);
         assert!(settings.capture_after_source_ready);
         assert_eq!(settings.ocr_max_side, 0);

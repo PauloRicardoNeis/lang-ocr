@@ -301,6 +301,27 @@ REGISTRY: tuple[Setting, ...] = (
         "Conta o intervalo a partir do fim do job anterior, em vez de um relogio fixo.",
     ),
     Setting(
+        "capture.autostart",
+        KIND_BOOL,
+        # Must equal DAEMON_SETTING_DEFAULTS in desktop_capture_daemon/src/main.rs.
+        True,
+        "capture",
+        "Iniciar a captura ao abrir o tray",
+        "Quando o tray abre (atalho, open_lang ou logon), a captura comeca sozinha depois do atraso abaixo.",
+        applies=APPLIES_DAEMON_RESTART,
+    ),
+    Setting(
+        "capture.autostart_delay_seconds",
+        KIND_INT,
+        20,
+        "capture",
+        "Atraso do inicio automatico",
+        "Em segundos, contados a partir da abertura do tray. 0 inicia na hora.",
+        applies=APPLIES_DAEMON_RESTART,
+        minimum=0,
+        maximum=600,
+    ),
+    Setting(
         "capture.auto_promote_terms",
         KIND_BOOL,
         True,
