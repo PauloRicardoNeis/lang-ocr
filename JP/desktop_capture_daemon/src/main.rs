@@ -18,7 +18,7 @@ use image::codecs::png::PngEncoder;
 use img_hash::image::{ImageBuffer, Rgba, RgbaImage};
 use img_hash::{HasherConfig, ImageHash};
 use rusqlite::{Connection, params};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use trayicon::{Icon, MenuBuilder, TrayIcon, TrayIconBuilder};
@@ -135,7 +135,6 @@ struct DaemonConfig {
     overlay_hotkey: String,
     overlay_mode_hotkey: String,
     overlay_script: PathBuf,
-    overlay_state_path: PathBuf,
     overlay_log_path: PathBuf,
 }
 
@@ -159,7 +158,6 @@ struct DaemonConfigPatch {
     web_log_path: Option<PathBuf>,
     record_foreground_window: Option<bool>,
     overlay_script: Option<PathBuf>,
-    overlay_state_path: Option<PathBuf>,
     overlay_log_path: Option<PathBuf>,
 }
 
@@ -233,7 +231,6 @@ impl Default for DaemonConfig {
             overlay_hotkey: settings.overlay_hotkey,
             overlay_mode_hotkey: settings.overlay_mode_hotkey,
             overlay_script: jp_root.join("translate_overlay.py"),
-            overlay_state_path: jp_root.join("data").join("translate_overlay.toml"),
             overlay_log_path: jp_root.join("data").join("translate_overlay.log"),
         }
     }
@@ -320,9 +317,6 @@ impl DaemonConfig {
         }
         if let Some(value) = patch.overlay_script {
             self.overlay_script = resolve_jp_config_path(value);
-        }
-        if let Some(value) = patch.overlay_state_path {
-            self.overlay_state_path = resolve_jp_config_path(value);
         }
         if let Some(value) = patch.overlay_log_path {
             self.overlay_log_path = resolve_jp_config_path(value);
@@ -424,6 +418,9 @@ const SETTING_DEBUG_LOG: &str = "capture.debug_log";
 const SETTING_MANUAL_CAPTURE_HOTKEY: &str = "hotkeys.manual_capture";
 const SETTING_OVERLAY_HOTKEY: &str = "hotkeys.overlay_toggle";
 const SETTING_OVERLAY_MODE_HOTKEY: &str = "hotkeys.overlay_mode";
+const SETTING_OVERLAY_ENABLED: &str = "overlay.enabled";
+const SETTING_OVERLAY_MODE: &str = "overlay.mode";
+const SETTING_OVERLAY_LANGUAGES: &str = "overlay.languages";
 
 /// Default of every setting the daemon touches, as stored text.
 /// JP/test_settings.py checks this list against the registry in settings.py.
@@ -435,6 +432,9 @@ const DAEMON_SETTING_DEFAULTS: &[(&str, &str)] = &[
     ("hotkeys.manual_capture", ""),
     ("hotkeys.overlay_toggle", "Ctrl+Alt+Q"),
     ("hotkeys.overlay_mode", "Ctrl+Alt+W"),
+    ("overlay.enabled", "1"),
+    ("overlay.mode", "translation"),
+    ("overlay.languages", "ja"),
 ];
 
 const SETTINGS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS settings (
@@ -494,6 +494,24 @@ fn setting_flag_text(enabled: bool) -> &'static str {
     if enabled { "1" } else { "0" }
 }
 
+/// The value of `key` in `rows`, or its default.
+fn setting_text(rows: &HashMap<String, String>, key: &str) -> String {
+    rows.get(key)
+        .map(String::as_str)
+        .unwrap_or_else(|| setting_default(key))
+        .trim()
+        .to_string()
+}
+
+/// An on/off setting; text that is neither reads as the default, as in settings.py.
+fn setting_flag(rows: &HashMap<String, String>, key: &str) -> bool {
+    match setting_text(rows, key).to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => setting_default(key) == "1",
+    }
+}
+
 /// The settings the daemon consumes or shows, typed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DaemonSettings {
@@ -514,13 +532,7 @@ impl Default for DaemonSettings {
 
 impl DaemonSettings {
     fn from_rows(rows: &HashMap<String, String>) -> Self {
-        let text = |key: &str| -> String {
-            rows.get(key)
-                .map(String::as_str)
-                .unwrap_or_else(|| setting_default(key))
-                .trim()
-                .to_string()
-        };
+        let text = |key: &str| setting_text(rows, key);
         // A stored value that does not parse falls back to the default, as in settings.py.
         let number = |key: &str| -> u64 {
             text(key)
@@ -529,13 +541,7 @@ impl DaemonSettings {
                 .or_else(|| setting_default(key).parse::<u64>().ok())
                 .unwrap_or(0)
         };
-        let flag = |key: &str| -> bool {
-            match text(key).to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                _ => setting_default(key) == "1",
-            }
-        };
+        let flag = |key: &str| setting_flag(rows, key);
         Self {
             interval_seconds: number(SETTING_INTERVAL_SECONDS).max(1),
             capture_after_source_ready: flag(SETTING_AFTER_SOURCE_READY),
@@ -1117,13 +1123,17 @@ impl Controller {
             let mut consecutive_failures: u32 = 0;
             let mut started_at: Option<Instant> = None;
             let mut next_attempt_at = Instant::now();
+            let mut enabled = OverlayState::default().enabled;
             loop {
                 {
                     let mut guard = child_slot.lock().unwrap();
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    let enabled = load_overlay_state(&config.overlay_state_path).enabled;
+                    // An unreadable database keeps the overlay as it is.
+                    if let Some(state) = load_overlay_state(&config.db_path) {
+                        enabled = state.enabled;
+                    }
                     if !enabled {
                         if let Some(mut child) = guard.take() {
                             kill_process_tree(&mut child);
@@ -1203,10 +1213,13 @@ impl Controller {
         }
     }
 
-    fn update_overlay_state(&self, change: impl FnOnce(&mut OverlayFileState)) {
-        let mut state = load_overlay_state(&self.config.overlay_state_path);
+    fn update_overlay_state(&self, change: impl FnOnce(&mut OverlayState)) {
+        let Some(mut state) = load_overlay_state(&self.config.db_path) else {
+            self.append_log("overlay state not changed: the database could not be read");
+            return;
+        };
         change(&mut state);
-        match save_overlay_state(&self.config.overlay_state_path, &state) {
+        match save_overlay_state(&self.config.db_path, &state) {
             Ok(()) => self.append_log(&format!(
                 "reading overlay enabled={} mode={} languages={}",
                 state.enabled, state.mode, state.languages
@@ -1937,7 +1950,7 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     menu_languages: Vec<CaptureLanguage>,
     menu_skip_rules: Vec<SkipRule>,
-    menu_overlay: OverlayFileState,
+    menu_overlay: OverlayState,
     tick_count: u64,
 }
 
@@ -2211,36 +2224,21 @@ fn capture_languages_menu(languages: &[CaptureLanguage]) -> MenuBuilder<UserEven
     menu
 }
 
-/// `data/translate_overlay.toml`, shared with `translate_overlay.py`: the tray
-/// writes it, the overlay reads it on every press and writes the mode when its
-/// mode hotkey cycles it and the label size when it is zoomed.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-struct OverlayFileState {
-    #[serde(default = "default_overlay_mode")]
+/// The `overlay.*` settings, shared with `translate_overlay.py`: the tray
+/// writes them, the overlay reads them on every press and writes the mode when
+/// its mode hotkey cycles it. The label size (`overlay.scale`) is the overlay's
+/// own; the tray never touches it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverlayState {
     mode: String,
-    #[serde(default = "default_overlay_languages")]
     languages: String,
-    #[serde(default = "default_true")]
     enabled: bool,
-    /// Label size set from the overlay (Ctrl+wheel, Ctrl+=/-); the tray only
-    /// carries it through when it rewrites the file.
-    #[serde(default = "default_overlay_scale")]
-    scale: f64,
 }
 
-impl Default for OverlayFileState {
+impl Default for OverlayState {
     fn default() -> Self {
-        Self {
-            mode: default_overlay_mode(),
-            languages: default_overlay_languages(),
-            enabled: true,
-            scale: default_overlay_scale(),
-        }
+        Self::from_rows(&HashMap::new())
     }
-}
-
-fn default_overlay_scale() -> f64 {
-    1.0
 }
 
 const OVERLAY_MODES: [(&str, &str); 3] = [
@@ -2249,35 +2247,34 @@ const OVERLAY_MODES: [(&str, &str); 3] = [
     ("words", "Word by word (gloss under each word)"),
 ];
 
-fn default_overlay_mode() -> String {
-    "translation".to_string()
+impl OverlayState {
+    /// Values the overlay would not accept read as their default.
+    fn from_rows(rows: &HashMap<String, String>) -> Self {
+        let mut mode = setting_text(rows, SETTING_OVERLAY_MODE);
+        if !OVERLAY_MODES.iter().any(|(candidate, _)| *candidate == mode) {
+            mode = setting_default(SETTING_OVERLAY_MODE).to_string();
+        }
+        let mut languages = setting_text(rows, SETTING_OVERLAY_LANGUAGES);
+        if languages != "ja" && languages != "capture" {
+            languages = setting_default(SETTING_OVERLAY_LANGUAGES).to_string();
+        }
+        Self {
+            mode,
+            languages,
+            enabled: setting_flag(rows, SETTING_OVERLAY_ENABLED),
+        }
+    }
 }
 
-fn default_overlay_languages() -> String {
-    "ja".to_string()
+/// `None` when the database could not be read; the caller keeps what it has.
+fn load_overlay_state(db_path: &Path) -> Option<OverlayState> {
+    load_setting_rows(db_path).map(|rows| OverlayState::from_rows(&rows))
 }
 
-fn load_overlay_state(path: &Path) -> OverlayFileState {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return OverlayFileState::default();
-    };
-    let mut state: OverlayFileState = toml::from_str(&raw).unwrap_or_default();
-    if !OVERLAY_MODES.iter().any(|(mode, _)| *mode == state.mode) {
-        state.mode = default_overlay_mode();
-    }
-    if state.languages != "ja" && state.languages != "capture" {
-        state.languages = default_overlay_languages();
-    }
-    state
-}
-
-fn save_overlay_state(path: &Path, state: &OverlayFileState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, toml::to_string(state)?)?;
-    fs::rename(&temp, path)?;
+fn save_overlay_state(db_path: &Path, state: &OverlayState) -> Result<()> {
+    store_setting(db_path, SETTING_OVERLAY_MODE, &state.mode)?;
+    store_setting(db_path, SETTING_OVERLAY_LANGUAGES, &state.languages)?;
+    store_setting(db_path, SETTING_OVERLAY_ENABLED, setting_flag_text(state.enabled))?;
     Ok(())
 }
 
@@ -2290,7 +2287,7 @@ fn overlay_hotkeys_clash(config: &DaemonConfig) -> bool {
         .unwrap_or(false)
 }
 
-fn overlay_submenu_label(config: &DaemonConfig, overlay: &OverlayFileState) -> String {
+fn overlay_submenu_label(config: &DaemonConfig, overlay: &OverlayState) -> String {
     if overlay.enabled {
         format!("Reading overlay [{}]", config.overlay_hotkey)
     } else {
@@ -2298,7 +2295,7 @@ fn overlay_submenu_label(config: &DaemonConfig, overlay: &OverlayFileState) -> S
     }
 }
 
-fn overlay_menu(config: &DaemonConfig, overlay: &OverlayFileState) -> MenuBuilder<UserEvent> {
+fn overlay_menu(config: &DaemonConfig, overlay: &OverlayState) -> MenuBuilder<UserEvent> {
     let mut menu = MenuBuilder::new()
         .checkable(
             &format!("Enabled (show/hide: {})", config.overlay_hotkey),
@@ -2340,8 +2337,6 @@ fn overlay_command(config: &DaemonConfig) -> Command {
         .arg(&config.overlay_script)
         .arg("--db")
         .arg(&config.db_path)
-        .arg("--state")
-        .arg(&config.overlay_state_path)
         .arg("--hotkey")
         .arg(&config.overlay_hotkey)
         .arg("--mode-hotkey")
@@ -2391,8 +2386,9 @@ impl App {
     fn refresh_menu(&mut self, force: bool) {
         let languages = load_capture_languages(&self.controller.config.db_path);
         let skip_rules = load_skip_rules(&self.controller.config.db_path);
-        // The mode hotkey changes the overlay state too; pick that up here.
-        let overlay = load_overlay_state(&self.controller.config.overlay_state_path);
+        // The mode hotkey and the web UI change the overlay state too; pick that up here.
+        let overlay = load_overlay_state(&self.controller.config.db_path)
+            .unwrap_or_else(|| self.menu_overlay.clone());
         if !force
             && languages == self.menu_languages
             && skip_rules == self.menu_skip_rules
@@ -2561,7 +2557,7 @@ fn build_tray_menu(
     config: &DaemonConfig,
     languages: &[CaptureLanguage],
     skip_rules: &[SkipRule],
-    overlay: &OverlayFileState,
+    overlay: &OverlayState,
 ) -> MenuBuilder<UserEvent> {
     MenuBuilder::new()
         .item("Open Lang", UserEvent::OpenCatalog)
@@ -2614,7 +2610,7 @@ fn build_tray_icon(
     config: &DaemonConfig,
     languages: &[CaptureLanguage],
     skip_rules: &[SkipRule],
-    overlay: &OverlayFileState,
+    overlay: &OverlayState,
 ) -> Result<TrayIcon<UserEvent>> {
     let icon = Icon::from_buffer(build_tray_icon_ico(), Some(16), Some(16))
         .map_err(|error| anyhow!("failed to create tray icon: {error}"))?;
@@ -3215,7 +3211,7 @@ fn main() -> Result<()> {
     }
     let menu_languages = load_capture_languages(&tray_config.db_path);
     let menu_skip_rules = load_skip_rules(&tray_config.db_path);
-    let menu_overlay = load_overlay_state(&tray_config.overlay_state_path);
+    let menu_overlay = load_overlay_state(&tray_config.db_path).unwrap_or_default();
     let tray_icon = build_tray_icon(
         proxy.clone(),
         &tray_config,
@@ -3351,15 +3347,14 @@ web_log_path = "data/web.log"
         assert_eq!(config.overlay_hotkey, "Ctrl+Alt+Q");
         assert_eq!(config.overlay_mode_hotkey, "Ctrl+Alt+W");
         assert_eq!(config.overlay_script, jp_root().join("translate_overlay.py"));
-        assert_eq!(config.overlay_state_path, jp_root().join("data").join("translate_overlay.toml"));
 
         let config = DaemonConfig::from_toml(
             r#"
-overlay_state_path = "data/overlay.toml"
+overlay_script = "tools/overlay.py"
 "#,
         )
         .expect("overlay config should parse");
-        assert_eq!(config.overlay_state_path, jp_root().join("data/overlay.toml"));
+        assert_eq!(config.overlay_script, jp_root().join("tools/overlay.py"));
 
         // The hotkeys come from the settings table.
         let mut rows = HashMap::new();
@@ -3423,36 +3418,36 @@ overlay_state_path = "data/overlay.toml"
 
     #[test]
     fn overlay_state_round_trips_and_repairs_bad_values() {
-        let temp = std::env::temp_dir().join(format!("overlay-state-{}", std::process::id()));
-        let path = temp.join("translate_overlay.toml");
-        assert_eq!(load_overlay_state(&path), OverlayFileState::default());
+        let dir = std::env::temp_dir().join(format!("overlay-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("overlay.sqlite3");
+        let _ = std::fs::remove_file(&db);
+        assert_eq!(load_overlay_state(&db), Some(OverlayState::default()));
+        assert_eq!(OverlayState::default().mode, "translation");
+        assert_eq!(OverlayState::default().languages, "ja");
+        assert!(OverlayState::default().enabled);
 
-        let state = OverlayFileState {
+        let state = OverlayState {
             mode: "words".to_string(),
             languages: "capture".to_string(),
             enabled: false,
-            scale: 1.5,
         };
-        save_overlay_state(&path, &state).expect("save");
-        assert_eq!(load_overlay_state(&path), state);
+        save_overlay_state(&db, &state).expect("save");
+        assert_eq!(load_overlay_state(&db), Some(state));
 
-        // The Python side writes the same keys; the tray keeps the label scale it set.
-        fs::write(&path, "mode = \"furigana\"\nlanguages = \"ja\"\nenabled = true\nscale = 1.32\n").unwrap();
-        let mut from_python = load_overlay_state(&path);
-        assert_eq!(from_python.mode, "furigana");
-        from_python.enabled = false;
-        save_overlay_state(&path, &from_python).expect("save");
-        assert_eq!(load_overlay_state(&path).scale, 1.32);
-        // Older files without a scale read as 1.0.
-        fs::write(&path, "mode = \"words\"\n").unwrap();
-        assert_eq!(load_overlay_state(&path).scale, 1.0);
+        // The overlay keeps its label size in the same table; the tray leaves it alone.
+        store_setting(&db, "overlay.scale", "1.32").unwrap();
+        save_overlay_state(&db, &OverlayState::default()).expect("save");
+        let rows = load_setting_rows(&db).unwrap();
+        assert_eq!(rows.get("overlay.scale").map(String::as_str), Some("1.32"));
+        assert_eq!(rows.len(), 1);
 
-        fs::write(&path, "mode = \"bogus\"\nlanguages = \"xx\"\n").unwrap();
-        let repaired = load_overlay_state(&path);
-        assert_eq!(repaired.mode, "translation");
-        assert_eq!(repaired.languages, "ja");
-        assert!(repaired.enabled);
-        let _ = fs::remove_dir_all(&temp);
+        let mut rows = HashMap::new();
+        rows.insert(SETTING_OVERLAY_MODE.to_string(), "bogus".to_string());
+        rows.insert(SETTING_OVERLAY_LANGUAGES.to_string(), "xx".to_string());
+        rows.insert(SETTING_OVERLAY_ENABLED.to_string(), "maybe".to_string());
+        assert_eq!(OverlayState::from_rows(&rows), OverlayState::default());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3477,12 +3472,11 @@ overlay_state_path = "data/overlay.toml"
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        let tail = &args[args.len() - 9..];
+        let tail = &args[args.len() - 7..];
         assert_eq!(tail[0], config.overlay_script.to_string_lossy());
         assert_eq!(tail[1], "--db");
-        assert_eq!(tail[3], "--state");
-        assert_eq!(tail[4], config.overlay_state_path.to_string_lossy());
-        assert_eq!(&tail[5..], ["--hotkey", "Ctrl+Alt+Q", "--mode-hotkey", "Ctrl+Alt+W"]);
+        assert_eq!(tail[2], config.db_path.to_string_lossy());
+        assert_eq!(&tail[3..], ["--hotkey", "Ctrl+Alt+Q", "--mode-hotkey", "Ctrl+Alt+W"]);
     }
 
     #[test]

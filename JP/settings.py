@@ -102,6 +102,7 @@ SECTIONS: tuple[Section, ...] = (
     Section("ocr", "OCR", "Como o texto de cada captura e lido."),
     Section("capture", "Captura", "Quando a tela e capturada e o que o worker faz com ela."),
     Section("translation", "Traducao", "Significados dos termos e traducao das fontes."),
+    Section("overlay", "Overlay de leitura", "A camada de leitura sobre a tela."),
     Section("hotkeys", "Atalhos", "Atalhos globais registrados pelo tray."),
 )
 
@@ -401,6 +402,50 @@ REGISTRY: tuple[Setting, ...] = (
         maximum=120.0,
         step=1,
         advanced=True,
+    ),
+    # --- Reading overlay ---------------------------------------------------
+    # The tray and the overlay's own hotkeys change these too (mode with the
+    # mode hotkey, scale with Ctrl+wheel); the overlay reads them on every press.
+    Setting(
+        "overlay.enabled",
+        KIND_BOOL,
+        True,
+        "overlay",
+        "Overlay ligado",
+        "O tray mantem o processo do overlay rodando enquanto isto estiver ligado.",
+    ),
+    Setting(
+        "overlay.mode",
+        KIND_CHOICE,
+        "translation",
+        "overlay",
+        "Modo",
+        "O que o overlay mostra sobre o texto lido.",
+        choices=(
+            ("translation", "Traducao (linhas inteiras)"),
+            ("furigana", "Furigana (leitura sobre os kanji)"),
+            ("words", "Palavra por palavra"),
+        ),
+    ),
+    Setting(
+        "overlay.languages",
+        KIND_CHOICE,
+        "ja",
+        "overlay",
+        "Idiomas lidos",
+        "Somente japones usa so o meikiocr e e mais rapido.",
+        choices=(("ja", "Somente japones (rapido)"), ("capture", "Idiomas capturados")),
+    ),
+    Setting(
+        "overlay.scale",
+        KIND_FLOAT,
+        1.0,
+        "overlay",
+        "Tamanho dos rotulos",
+        "Multiplicador; tambem muda com Ctrl+roda do mouse enquanto o overlay esta visivel.",
+        minimum=0.5,
+        maximum=3.0,
+        step=0.05,
     ),
     # --- Hotkeys -----------------------------------------------------------
     Setting(

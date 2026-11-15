@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -200,18 +201,32 @@ class BuildOverlayItemsTests(unittest.TestCase):
 
 
 class StateFileTests(unittest.TestCase):
+    """The overlay state is the ``overlay.*`` settings of the catalog database."""
+
     def test_round_trip_and_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.toml"
-            self.assertEqual(load_overlay_state(path), OverlayState())
-            save_overlay_state(path, OverlayState(mode="words", languages="capture", enabled=False))
+            db_path = Path(tmp) / "state.sqlite3"
+            self.assertEqual(load_overlay_state(db_path), OverlayState())
+            save_overlay_state(db_path, OverlayState(mode="words", languages="capture", enabled=False))
             self.assertEqual(
-                load_overlay_state(path), OverlayState(mode="words", languages="capture", enabled=False)
+                load_overlay_state(db_path), OverlayState(mode="words", languages="capture", enabled=False)
             )
-            path.write_text('mode = "bogus"\nlanguages = 3\n', encoding="utf-8")
-            self.assertEqual(load_overlay_state(path), OverlayState())
-            path.write_text("not toml [", encoding="utf-8")
-            self.assertEqual(load_overlay_state(path), OverlayState())
+            # The tray and the web UI write the same rows; a bad one reads as the default.
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute("UPDATE settings SET value = 'bogus' WHERE key = 'overlay.mode'")
+                connection.execute("UPDATE settings SET value = '3' WHERE key = 'overlay.languages'")
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(load_overlay_state(db_path), OverlayState(enabled=False))
+            # Back at the defaults nothing is stored.
+            save_overlay_state(db_path, OverlayState())
+            connection = sqlite3.connect(db_path)
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM settings").fetchone()[0], 0)
+            finally:
+                connection.close()
 
     def test_next_mode_cycles(self) -> None:
         self.assertEqual(next_mode("translation"), "furigana")
@@ -380,13 +395,18 @@ class ScaleTests(unittest.TestCase):
 
     def test_scale_is_saved_and_clamped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.toml"
-            save_overlay_state(path, OverlayState(scale=1.32))
-            self.assertEqual(load_overlay_state(path).scale, 1.32)
-            path.write_text("scale = 9\n", encoding="utf-8")
-            self.assertEqual(load_overlay_state(path).scale, 3.0)
-            path.write_text("scale = true\n", encoding="utf-8")
-            self.assertEqual(load_overlay_state(path).scale, 1.0)
+            db_path = Path(tmp) / "state.sqlite3"
+            save_overlay_state(db_path, OverlayState(scale=1.32))
+            self.assertEqual(load_overlay_state(db_path).scale, 1.32)
+            save_overlay_state(db_path, OverlayState(scale=9))
+            self.assertEqual(load_overlay_state(db_path).scale, 3.0)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute("UPDATE settings SET value = 'big' WHERE key = 'overlay.scale'")
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(load_overlay_state(db_path).scale, 1.0)
 
     def test_wheel_direction(self) -> None:
         self.assertEqual(wheel_event(120 << 16), "zoom_in")
