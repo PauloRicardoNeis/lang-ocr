@@ -252,6 +252,9 @@ const MOVED_TOML_KEYS: &[(&str, &str)] = &[
 ];
 const OVERLAY_HEALTHY_RUN: Duration = Duration::from_secs(30);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// The daemon is launched hidden, so a console child would inherit that invisible
+/// console; this flag gives it a visible one of its own.
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const WEB_SERVER_HEALTHY_RUN: Duration = Duration::from_secs(30);
 const CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const INSTANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1229,10 +1232,15 @@ impl Controller {
     }
 
     fn open_overlay_log(&self) {
-        let log_path = self.config.overlay_log_path.clone();
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", log_path.to_string_lossy().as_ref()])
-            .spawn();
+        self.open_text_file(&self.config.overlay_log_path);
+    }
+
+    /// Opens a log in Notepad. `.log` often has no file association on Windows, so
+    /// `start <file>` fails silently; naming the viewer always works.
+    fn open_text_file(&self, path: &Path) {
+        if let Err(error) = Command::new("notepad.exe").arg(path).spawn() {
+            self.append_log(&format!("failed to open {}: {error}", path.display()));
+        }
     }
 
     fn open_catalog(&self) {
@@ -1409,18 +1417,19 @@ impl Controller {
     }
 
     fn open_logs(&self) {
-        let log_path = self.config.log_path.clone();
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", log_path.to_string_lossy().as_ref()])
-            .spawn();
+        self.open_text_file(&self.config.log_path);
     }
 
     fn tail_logs(&self) {
         let escaped = self.config.log_path.to_string_lossy().replace('\'', "''");
         let command = format!("Get-Content -Path '{}' -Tail 80 -Wait", escaped);
-        let _ = Command::new("powershell")
+        if let Err(error) = Command::new("powershell")
             .args(["-NoExit", "-Command", &command])
-            .spawn();
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+        {
+            self.append_log(&format!("failed to tail logs: {error}"));
+        }
     }
 
     fn append_log(&self, message: &str) {
