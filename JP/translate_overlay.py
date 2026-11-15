@@ -12,8 +12,9 @@ modes:
 - ``words``: a short gloss under every content word, word by word.
 
 The mode hotkey cycles the mode (re-rendering the same read, no new OCR). The
-mode and the languages to read live in ``data/translate_overlay.toml``, shared
-with the tray daemon, so the tray menu and the hotkey stay in sync.
+mode and the languages to read are the ``overlay.*`` settings in the catalog
+database, shared with the tray daemon and the web UI, so the tray menu, the
+settings page and the hotkey stay in sync.
 
 The window is click-through, always on top and excluded from screen capture,
 so the passive capture never OCRs it. Press the hotkey again (or Esc) to clear

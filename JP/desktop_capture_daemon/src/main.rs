@@ -1099,7 +1099,7 @@ impl Controller {
         self.stop_overlay();
     }
 
-    /// Keeps `translate_overlay.py` running while the state file says it is enabled.
+    /// Keeps `translate_overlay.py` running while the `overlay.enabled` setting is on.
     ///
     /// The overlay owns its hotkeys and its window; the daemon only starts it,
     /// restarts it when it dies (with the web server's backoff) and stops it

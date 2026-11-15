@@ -1,6 +1,12 @@
 # Settings hub: plan and design
 
-(After approval this file is copied to `JP/settings_hub_plan.md`.)
+**Status: implemented.** `JP/README.md` ("Settings") describes the result. What changed from this plan while building it:
+
+- **No TOML fallback for the moved keys.** The plan had the daemon fall back to `capture_daemon.toml` for the interval, cadence and hotkeys. The page cannot see that file, so it would have shown a default the daemon was not using. Those keys are ignored in the TOML (and reported in the log); the database is the only source.
+- **No import of `translate_overlay.toml`.** An import "once" cannot tell a reset from a first run when only non-default values are stored. The file is simply no longer read.
+- **Form fields are not live.** They stay static, like every other form in the UI. Each section has a live summary of the values in use instead, and a save writes only the fields that were changed, so it cannot undo a change made from the tray after the page was rendered.
+- **`ocr.meikiocr_min_char_confidence` is not an engine setting.** It is applied per read, so changing it does not reload the model.
+- **No `step` in the registry.** Whole numbers step by 1 and decimals take any step, so a value set elsewhere (an overlay scale of 1.32) never blocks the form.
 
 ## Context
 
