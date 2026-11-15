@@ -208,7 +208,6 @@ REGISTRY: tuple[Setting, ...] = (
         "ocr",
         "Confianca minima por caractere (meikiocr)",
         "Caracteres lidos abaixo disso sao descartados da linha.",
-        applies=APPLIES_ENGINES,
         minimum=0.0,
         maximum=1.0,
         step=0.05,

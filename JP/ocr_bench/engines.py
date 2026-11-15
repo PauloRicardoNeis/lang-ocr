@@ -171,10 +171,10 @@ def easy_adapter():
 
 def run_baseline(path: Path) -> list[str]:
     """capture_worker as shipped: 1600px downscale, region grouping, second OCR pass per region."""
-    import capture_worker
+    from settings import Settings
 
-    capture_worker.DEFAULT_OCR_MAX_SIDE = 1600
-    blocks = easy_adapter().extract_blocks(path)
+    shipped = Settings.defaults({}).replace(ocr__backend="easyocr", ocr__max_side=1600)
+    blocks = easy_adapter().extract_blocks(path, settings=shipped)
     return [line for block in blocks for line in block.text.splitlines()]
 
 

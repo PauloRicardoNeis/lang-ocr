@@ -143,20 +143,16 @@ def parse_csv_env(
 
 
 def resolve_easyocr_languages(value: str | None = None) -> tuple[str, ...]:
-    raw_value = value
-    if raw_value is None:
-        raw_value = os.environ.get("LANG_JP_EASYOCR_LANGS")
-    return parse_csv_env(raw_value, fallback=DEFAULT_EASYOCR_LANGUAGES)
+    """Language packs of the legacy single-reader EasyOCR flow, from a CSV value."""
+    return parse_csv_env(value, fallback=DEFAULT_EASYOCR_LANGUAGES)
 
 
 def resolve_capture_ocr_backend(value: str | None = None) -> str:
-    raw_value = value
-    if raw_value is None:
-        raw_value = os.environ.get("LANG_JP_OCR_BACKEND", DEFAULT_CAPTURE_OCR_BACKEND)
-    normalized = str(raw_value).strip().lower() or DEFAULT_CAPTURE_OCR_BACKEND
+    """Validate a backend name; nothing (or blank) means the default."""
+    normalized = str(value or "").strip().lower() or DEFAULT_CAPTURE_OCR_BACKEND
     if normalized not in CAPTURE_OCR_BACKEND_CHOICES:
         raise ValueError(
-            f"Unsupported LANG_JP_OCR_BACKEND={raw_value!r}; "
+            f"Unsupported OCR backend {value!r}; "
             f"expected one of {', '.join(CAPTURE_OCR_BACKEND_CHOICES)}."
         )
     return normalized
@@ -295,10 +291,8 @@ def torch_cuda_is_available() -> bool:
 
 
 def resolve_easyocr_use_gpu(value: str | None = None) -> bool:
-    raw_value = value
-    if raw_value is None:
-        raw_value = os.environ.get("LANG_JP_EASYOCR_GPU", DEFAULT_EASYOCR_GPU_MODE)
-    normalized = str(raw_value).strip().lower()
+    """Whether EasyOCR runs on the GPU for a mode of gpu / cpu / auto (the default)."""
+    normalized = str(value or DEFAULT_EASYOCR_GPU_MODE).strip().lower()
     if normalized in {"1", "true", "yes", "on", "gpu", "cuda"}:
         return True
     if normalized in {"0", "false", "no", "off", "cpu"}:
@@ -1229,7 +1223,12 @@ class MangaOcrBackend:
 class EasyOcrBackend:
     name = "easyocr"
 
-    def __init__(self, languages_list: Iterable[str] | None = None) -> None:
+    def __init__(
+        self,
+        languages_list: Iterable[str] | None = None,
+        *,
+        gpu_mode: str | None = None,
+    ) -> None:
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
         easyocr_cache = ensure_repo_cache_dir("easyocr")
         user_network_dir = ensure_repo_cache_dir("easyocr", "user_network")
@@ -1245,7 +1244,7 @@ class EasyOcrBackend:
         self.languages = (
             tuple(languages_list) if languages_list is not None else resolve_easyocr_languages()
         )
-        self.gpu_mode = os.environ.get("LANG_JP_EASYOCR_GPU", DEFAULT_EASYOCR_GPU_MODE)
+        self.gpu_mode = str(gpu_mode or DEFAULT_EASYOCR_GPU_MODE)
         self.gpu_enabled = resolve_easyocr_use_gpu(self.gpu_mode)
         self._reader = easyocr.Reader(
             list(self.languages),
@@ -1360,8 +1359,19 @@ class MeikiOcrBackend:
         self._engine = MeikiOCR()
         self.provider = getattr(self._engine, "active_provider", None)
 
-    def read_line_boxes(self, source: Image.Image | str | Path) -> list[OcrLineBox]:
-        """One box per detected line, after dropping low-confidence characters."""
+    def read_line_boxes(
+        self,
+        source: Image.Image | str | Path,
+        *,
+        min_char_confidence: float | None = None,
+    ) -> list[OcrLineBox]:
+        """One box per detected line, after dropping low-confidence characters.
+
+        ``min_char_confidence`` overrides the backend's threshold for this read,
+        so a caller can change it without reloading the model.
+        """
+        if min_char_confidence is None:
+            min_char_confidence = self.min_char_confidence
         np = _numpy()
         if isinstance(source, Image.Image):
             rgb = np.array(source.convert("RGB"))
@@ -1370,7 +1380,7 @@ class MeikiOcrBackend:
                 rgb = np.array(image.convert("RGB"))
         boxes: list[OcrLineBox] = []
         for line in self._engine.run_ocr(rgb[:, :, ::-1].copy()):  # meikiocr expects BGR
-            box = meikiocr_line_to_box(line, min_char_confidence=self.min_char_confidence)
+            box = meikiocr_line_to_box(line, min_char_confidence=min_char_confidence)
             if box is not None:
                 boxes.append(box)
         return boxes
@@ -1397,16 +1407,20 @@ def build_ocr_backend(name: str) -> OcrBackend:
 # Reader cache: models load once per process, whatever the capture set does
 # ---------------------------------------------------------------------------
 
-_EASYOCR_BACKENDS: dict[tuple[str, ...], EasyOcrBackend] = {}
+_EASYOCR_BACKENDS: dict[tuple[tuple[str, ...], str], EasyOcrBackend] = {}
 _MEIKIOCR_BACKEND: MeikiOcrBackend | None = None
 
 
-def get_easyocr_backend(languages_list: Iterable[str]) -> EasyOcrBackend:
-    """One EasyOCR reader per language group, built on first use and reused after."""
-    key = tuple(languages_list)
+def get_easyocr_backend(
+    languages_list: Iterable[str],
+    *,
+    gpu_mode: str | None = None,
+) -> EasyOcrBackend:
+    """One EasyOCR reader per language group and GPU mode, built on first use and reused after."""
+    key = (tuple(languages_list), str(gpu_mode or DEFAULT_EASYOCR_GPU_MODE))
     backend = _EASYOCR_BACKENDS.get(key)
     if backend is None:
-        backend = EasyOcrBackend(key)
+        backend = EasyOcrBackend(key[0], gpu_mode=key[1])
         _EASYOCR_BACKENDS[key] = backend
     return backend
 

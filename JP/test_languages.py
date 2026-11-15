@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import argparse
 import sqlite3
 import sys
@@ -292,7 +293,7 @@ class CaptureConfigTest(unittest.TestCase):
             ).fetchall()
         finally:
             connection.close()
-        gloss = lang_jp.DEFAULT_TERM_TRANSLATION_TARGET
+        gloss = lang_jp.gloss_language_code()
         self.assertEqual(set(codes), set(languages.BUILTIN_LANGUAGES) - {gloss})
         self.assertEqual(codes[0], "ja")
         self.assertTrue(all(row["enabled"] for row in rows))
@@ -433,8 +434,9 @@ class CatalogLanguageTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "lang_test.sqlite3"
-        self._auto_translate = lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = False
+        # No network: term meanings are not machine-translated in these tests.
+        self._settings_env = patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "0"})
+        self._settings_env.start()
         connection = db_connect(self.db_path)
         try:
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -443,7 +445,7 @@ class CatalogLanguageTest(unittest.TestCase):
             connection.close()
 
     def tearDown(self) -> None:
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = self._auto_translate
+        self._settings_env.stop()
         self.temp_dir.cleanup()
 
     def test_canonical_key_is_language_scoped(self) -> None:
@@ -825,8 +827,9 @@ class WebLanguageTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "web.sqlite3"
-        self._auto_translate = lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = False
+        # No network: term meanings are not machine-translated in these tests.
+        self._settings_env = patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "0"})
+        self._settings_env.start()
         connection = db_connect(self.db_path)
         try:
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -847,7 +850,7 @@ class WebLanguageTest(unittest.TestCase):
             connection.close()
 
     def tearDown(self) -> None:
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = self._auto_translate
+        self._settings_env.stop()
         self.temp_dir.cleanup()
 
     def test_terms_page_filters_by_language(self) -> None:

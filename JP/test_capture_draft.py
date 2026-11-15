@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import struct
 import tempfile
 import sys
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 import zlib
 
 TESTS_ROOT = Path(__file__).resolve().parent
@@ -88,10 +89,9 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "lang_jp_test.sqlite3"
-        self._original_auto_translate_terms = (
-            lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS
-        )
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = False
+        # No network: term meanings are not machine-translated in these tests.
+        self._settings_env = patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "0"})
+        self._settings_env.start()
         schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
         connection = db_connect(self.db_path)
         try:
@@ -100,9 +100,7 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
             connection.close()
 
     def tearDown(self) -> None:
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = (
-            self._original_auto_translate_terms
-        )
+        self._settings_env.stop()
         self.temp_dir.cleanup()
 
     def test_approve_source_analysis_promotes_terms_without_deleting_source(self) -> None:
@@ -653,11 +651,7 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
         connection = db_connect(self.db_path)
         try:
             with (
-                patch.object(
-                    lang_jp,
-                    "DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS",
-                    True,
-                ),
+                patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "1"}),
                 patch.object(
                     lang_jp,
                     "auto_translate_term_meaning_pt",
@@ -684,6 +678,7 @@ class CaptureDraftWorkflowTest(unittest.TestCase):
                 reading="かいふくアイテム",
                 pos="名詞",
                 language_code="ja",
+                settings=ANY,
             )
         finally:
             connection.close()

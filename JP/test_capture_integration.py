@@ -9,6 +9,7 @@ suite stays fast and offline.
 from __future__ import annotations
 
 import os
+from unittest.mock import patch
 import sys
 import tempfile
 import unittest
@@ -70,8 +71,9 @@ class CaptureIntegrationTest(unittest.TestCase):
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temp_dir.name)
         cls.db_path = cls.root / "integration.sqlite3"
-        cls._auto_translate = lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = False
+        # No network: term meanings are not machine-translated in these tests.
+        cls._settings_env = patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "0"})
+        cls._settings_env.start()
         cls._capture_dir = capture_worker.DEFAULT_CAPTURE_DIR
         cls._log_path = capture_worker.DEFAULT_LOG_PATH
         capture_worker.DEFAULT_CAPTURE_DIR = cls.root / "captures"
@@ -125,7 +127,7 @@ class CaptureIntegrationTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = cls._auto_translate
+        cls._settings_env.stop()
         capture_worker.DEFAULT_CAPTURE_DIR = cls._capture_dir
         capture_worker.DEFAULT_LOG_PATH = cls._log_path
         cls.temp_dir.cleanup()

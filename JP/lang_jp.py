@@ -21,8 +21,9 @@ from urllib.request import Request, urlopen
 
 import jmdict
 import languages
-import settings
+import settings as app_settings
 from catalog_changes import ensure_catalog_change_log
+from settings import Settings, load_settings
 from languages import (
     ALL_LANGUAGES_CODE,
     AUTO_LANGUAGE_CODE,
@@ -43,16 +44,6 @@ DEFAULT_UI_PORT = 8766
 DEFAULT_ANKI_CONNECT_HOST = "127.0.0.1"
 DEFAULT_ANKI_CONNECT_PORT = 8765
 ANKI_CONNECT_VERSION = 6
-DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = (
-    os.environ.get("LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS", "1") != "0"
-)
-DEFAULT_TERM_TRANSLATION_TARGET = os.environ.get(
-    "LANG_JP_TERM_TRANSLATION_TARGET",
-    "pt",
-)
-DEFAULT_TERM_TRANSLATION_TIMEOUT_SECONDS = float(
-    os.environ.get("LANG_JP_TERM_TRANSLATION_TIMEOUT_SECONDS", "10")
-)
 JMDICT_DB_PATH = Path(
     os.environ.get("LANG_JP_JMDICT_DB_PATH", str(jmdict.DEFAULT_JMDICT_DB_PATH))
 )
@@ -601,9 +592,9 @@ def resolve_language_code(
     return guess.code, guess.confidence
 
 
-def is_gloss_language(code: str | None) -> bool:
+def is_gloss_language(code: str | None, settings: Settings | None = None) -> bool:
     """True for the language term meanings are translated into (``pt`` by default)."""
-    return bool(code) and languages.base_language_code(code) == gloss_language_code()
+    return bool(code) and languages.base_language_code(code) == gloss_language_code(settings)
 
 
 def ensure_language_row(
@@ -619,7 +610,7 @@ def ensure_language_row(
 
     New rows are enabled for capture by default, so a fresh install captures
     every registered language until the user turns some off. The gloss language
-    (``LANG_JP_TERM_TRANSLATION_TARGET``) is the exception: it is the language
+    (setting ``translation.meaning_language``) is the exception: it is the language
     meanings are written in, so its screens are not study material.
     """
     profile = get_language(code)
@@ -629,7 +620,7 @@ def ensure_language_row(
     ).fetchone()
     if existing is None:
         if capture_enabled is None:
-            capture_enabled = not is_gloss_language(profile.code)
+            capture_enabled = not is_gloss_language(profile.code, load_settings(connection))
         connection.execute(
             """
             INSERT INTO languages (
@@ -878,25 +869,25 @@ def list_capture_skip_rules_command(args: argparse.Namespace) -> None:
 def list_settings_command(args: argparse.Namespace) -> None:
     connection = db_connect(args.db)
     try:
-        snapshot = settings.load_settings(connection)
+        snapshot = load_settings(connection)
     finally:
         connection.close()
-    for setting in settings.REGISTRY:
+    for setting in app_settings.REGISTRY:
         source = snapshot.source(setting.key)
-        note = f"env {setting.env}" if source == settings.SOURCE_ENV else source
+        note = f"env {setting.env}" if source == app_settings.SOURCE_ENV else source
         print(f"{setting.key}	{snapshot.text(setting.key)}	({note})")
 
 
 def set_setting_command(args: argparse.Namespace) -> None:
     connection = db_connect(args.db)
     try:
-        value = settings.set_setting(connection, args.key, args.value)
+        value = app_settings.set_setting(connection, args.key, args.value)
         connection.commit()
-        snapshot = settings.load_settings(connection)
+        snapshot = load_settings(connection)
     finally:
         connection.close()
-    setting = settings.setting_for(args.key)
-    print(f"{args.key} = {settings.serialize_value(setting, value)}")
+    setting = app_settings.setting_for(args.key)
+    print(f"{args.key} = {app_settings.serialize_value(setting, value)}")
     if snapshot.is_pinned(args.key):
         print(
             f"Note: {setting.env} is set and pins this setting to "
@@ -907,12 +898,12 @@ def set_setting_command(args: argparse.Namespace) -> None:
 def reset_setting_command(args: argparse.Namespace) -> None:
     connection = db_connect(args.db)
     try:
-        settings.reset_settings(connection, [args.key])
+        app_settings.reset_settings(connection, [args.key])
         connection.commit()
     finally:
         connection.close()
-    setting = settings.setting_for(args.key)
-    print(f"{args.key} = {settings.serialize_value(setting, setting.default)} (default)")
+    setting = app_settings.setting_for(args.key)
+    print(f"{args.key} = {app_settings.serialize_value(setting, setting.default)} (default)")
 
 
 # ---------------------------------------------------------------------------
@@ -1370,7 +1361,7 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
         )
     connection.executescript(CAPTURE_PROFILE_SCHEMA_SQL)
     connection.executescript(CAPTURE_SKIP_RULE_SCHEMA_SQL)
-    connection.executescript(settings.SETTINGS_SCHEMA_SQL)
+    connection.executescript(app_settings.SETTINGS_SCHEMA_SQL)
     if table_exists(connection, "flashcards"):
         flashcard_columns = table_columns(connection, "flashcards")
         if "anki_note_id" not in flashcard_columns:
@@ -1618,12 +1609,19 @@ def format_source_resolution(
     return f"{width}x{height}"
 
 
+# The timeout of a caller that has no settings snapshot (the registry default).
+TERM_TRANSLATION_TIMEOUT_SECONDS = float(
+    app_settings.setting_for("translation.term_timeout_seconds").default  # type: ignore[arg-type]
+)
+
+
 @lru_cache(maxsize=512)
 def google_gtx_translate_text(
     text: str,
     *,
     source_language: str,
     target_language: str,
+    timeout_seconds: float = TERM_TRANSLATION_TIMEOUT_SECONDS,
 ) -> str | None:
     normalized = normalize_token(text)
     if not normalized:
@@ -1644,7 +1642,7 @@ def google_gtx_translate_text(
             "Accept": "application/json",
         },
     )
-    with urlopen(request, timeout=DEFAULT_TERM_TRANSLATION_TIMEOUT_SECONDS) as response:
+    with urlopen(request, timeout=timeout_seconds) as response:
         payload = json.loads(response.read().decode("utf-8"))
     segments = payload[0] if isinstance(payload, list) and payload else []
     translated = normalize_token(
@@ -1859,20 +1857,22 @@ def split_top_level_list(value: str) -> list[str]:
     return parts
 
 
-def translate_jmdict_glosses(glosses: list[str]) -> str:
-    """Translate English JMdict glosses into the term translation target.
+def translate_jmdict_glosses(glosses: list[str], settings: Settings | None = None) -> str:
+    """Translate English JMdict glosses into the meaning language.
 
     The glosses go out as one comma-separated list because the shared context
     picks better senses than separate items do (kind -> gentil, not tipo).
     """
+    settings = settings or Settings.defaults()
     gloss_text = "; ".join(glosses)
-    target_language = DEFAULT_TERM_TRANSLATION_TARGET
+    target_language = str(settings["translation.meaning_language"])
     if target_language.lower().startswith("en"):
         return gloss_text
     translated = google_gtx_translate_text(
         ", ".join(glosses),
         source_language="en",
         target_language=target_language,
+        timeout_seconds=float(settings["translation.term_timeout_seconds"]),  # type: ignore[arg-type]
     )
     if translated is None:
         # Google returns the input unchanged when the gloss reads the same in the
@@ -1887,6 +1887,7 @@ def auto_translate_term_meaning_pt(
     reading: str | None = None,
     pos: str | None = None,
     language_code: str | None = DEFAULT_LANGUAGE_CODE,
+    settings: Settings | None = None,
 ) -> str | None:
     """Fill a missing term meaning for any language.
 
@@ -1896,23 +1897,29 @@ def auto_translate_term_meaning_pt(
     words (ます is the auxiliary, not 鱒). Every other language, and Japanese
     lemmas JMdict does not know, are machine-translated from their own language.
     A term already written in the gloss language keeps the lemma as meaning.
+
+    ``settings`` decides whether meanings are translated at all, into which
+    language and with which timeout; a caller with a connection passes
+    ``load_settings(connection)``, one without gets the defaults.
     """
-    if not DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS:
+    settings = settings or Settings.defaults()
+    if not settings["translation.auto_term_meanings"]:
         return None
     profile = get_language(language_code)
     source_language = languages.base_language_code(profile.code) or DEFAULT_LANGUAGE_CODE
-    target_language = DEFAULT_TERM_TRANSLATION_TARGET
+    target_language = str(settings["translation.meaning_language"])
     if source_language == languages.base_language_code(target_language):
         return normalize_token(lemma) or None
     try:
         if profile.dictionary == "jmdict":
             match = lookup_jmdict_term(lemma, reading=reading, pos=pos)
             if match is not None:
-                return translate_jmdict_glosses(match.gloss_list())
+                return translate_jmdict_glosses(match.gloss_list(), settings)
         return google_gtx_translate_text(
             lemma,
             source_language=source_language,
             target_language=target_language,
+            timeout_seconds=float(settings["translation.term_timeout_seconds"]),  # type: ignore[arg-type]
         )
     except (OSError, TimeoutError, URLError, ValueError):
         return None
@@ -3080,6 +3087,7 @@ def upsert_term_record(
             reading=reading or None,
             pos=pos,
             language_code=language_code,
+            settings=load_settings(connection),
         )
     if existing is None:
         ensure_language_row(connection, language_code)
@@ -5481,9 +5489,10 @@ def excluded_generation_language_codes(connection: sqlite3.Connection) -> list[s
     return excluded
 
 
-def gloss_language_code() -> str:
+def gloss_language_code(settings: Settings | None = None) -> str:
     """Base code of the meaning language (``pt``): its own terms would be glossed as themselves."""
-    return languages.base_language_code(DEFAULT_TERM_TRANSLATION_TARGET) or ""
+    settings = settings or Settings.defaults()
+    return languages.base_language_code(str(settings["translation.meaning_language"])) or ""
 
 
 def build_flashcard_payload(
@@ -5759,7 +5768,7 @@ def flashcard_candidates(
                 f"{language_expression} NOT IN ({', '.join('?' for _ in excluded)})"
             )
             params.extend(excluded)
-        gloss_code = gloss_language_code()
+        gloss_code = gloss_language_code(load_settings(connection) if connection else None)
         if gloss_code:
             filters.append(
                 f"NOT ({language_expression} = ? OR {language_expression} LIKE ?)"

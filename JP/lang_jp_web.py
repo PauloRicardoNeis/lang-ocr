@@ -42,6 +42,7 @@ from languages import (
     normalize_language_code,
 )
 from ocr_backends import plan_ocr_engines
+from settings import Settings, load_settings
 from web_views import LiveRegions, PageView, fragments_payload
 
 
@@ -4346,6 +4347,7 @@ def capture_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
     with db_connect(db_path) as connection:
         language_rows = list_language_rows(connection)
         capture_codes = lang_jp.capture_language_codes(connection)
+        catalog_settings = load_settings(connection)
         profiles = lang_jp.list_capture_profiles(connection)
         skip_rules = lang_jp.list_capture_skip_rules(connection)
         recent_jobs = connection.execute(
@@ -4374,9 +4376,9 @@ def capture_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
             "SELECT COUNT(*) FROM capture_jobs WHERE status = 'pending'"
         ).fetchone()[0]
     override = os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV, "").strip()
-    plan = plan_ocr_engines(capture_codes)
+    plan = plan_ocr_engines(capture_codes, backend=str(catalog_settings["ocr.backend"]))
 
-    gloss_language = languages.base_language_code(lang_jp.DEFAULT_TERM_TRANSLATION_TARGET)
+    gloss_language = lang_jp.gloss_language_code(catalog_settings)
     checkboxes = []
     for row in language_rows:
         code = str(row["code"])
@@ -4542,7 +4544,8 @@ def api_capture_payload(db_path: Path) -> dict[str, object]:
         capture_codes = lang_jp.capture_language_codes(connection)
         profiles = lang_jp.list_capture_profiles(connection)
         skip_patterns = lang_jp.capture_skip_patterns(connection)
-    plan = plan_ocr_engines(capture_codes)
+        catalog_settings = load_settings(connection)
+    plan = plan_ocr_engines(capture_codes, backend=str(catalog_settings["ocr.backend"]))
     return {
         "capture_languages": list(capture_codes),
         "override_env": os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV) or None,
