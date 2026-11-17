@@ -101,15 +101,27 @@ END;
 """
 
 
-def ensure_schema(connection: sqlite3.Connection) -> None:
-    connection.executescript(SCHEMA_SQL)
-    existing_tables = {
+def ensure_schema(connection: sqlite3.Connection) -> bool:
+    """Create the tables and the delete triggers; True when anything was missing.
+
+    Runs on every connection, so an up-to-date database costs one read. A
+    parent table created later gets its trigger on the next connection.
+    """
+    existing = {
         str(row[0])
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')"
+        )
     }
+    changed = False
+    if not {"knowledge_evidence", "knowledge"} <= existing:
+        connection.executescript(SCHEMA_SQL)
+        changed = True
     for kind, table in ITEM_TABLES.items():
-        if table in existing_tables:
+        if table in existing and f"trg_knowledge_{table}_delete" not in existing:
             connection.executescript(ITEM_DELETE_TRIGGER_SQL.format(table=table, kind=kind))
+            changed = True
+    return changed
 
 
 def strength_score(stability_days: float | None) -> float:
@@ -246,9 +258,23 @@ def consolidate(
     item_filter = ""
     params: tuple[object, ...] = ()
     if item is not None:
-        item_filter = "WHERE item_kind = ? AND item_id = ?"
+        item_filter = "AND item_kind = ? AND item_id = ?"
         params = item
-    connection.execute(f"DELETE FROM knowledge {item_filter}", params)
+    connection.execute(
+        f"""
+        DELETE FROM knowledge
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM knowledge_evidence AS evidence
+            WHERE evidence.item_kind = knowledge.item_kind
+                AND evidence.item_id = knowledge.item_id
+        )
+        {item_filter}
+        """,
+        params,
+    )
+    # Rows are only written when they differ, so a refresh that changes nothing
+    # leaves no trace for the change log (and the pages) to react to.
     connection.execute(
         f"""
         INSERT INTO knowledge (
@@ -266,9 +292,23 @@ def consolidate(
                     ORDER BY weight DESC, score DESC, id ASC
                 ) AS evidence_rank
             FROM knowledge_evidence
-            {item_filter}
+            WHERE 1 = 1 {item_filter}
         )
         WHERE evidence_rank = 1
+        ON CONFLICT(item_kind, item_id) DO UPDATE SET
+            status = excluded.status,
+            score = excluded.score,
+            confidence = excluded.confidence,
+            provider = excluded.provider,
+            last_reviewed_at = excluded.last_reviewed_at,
+            due_at = excluded.due_at,
+            updated_at = excluded.updated_at
+        WHERE status IS NOT excluded.status
+            OR score IS NOT excluded.score
+            OR confidence IS NOT excluded.confidence
+            OR provider IS NOT excluded.provider
+            OR last_reviewed_at IS NOT excluded.last_reviewed_at
+            OR due_at IS NOT excluded.due_at
         """,
         params,
     )
@@ -329,6 +369,21 @@ def clear_mark(connection: sqlite3.Connection, item_kind: str, item_id: int) -> 
     )
     consolidate(connection, (item_kind, item_id))
     return cursor.rowcount > 0
+
+
+def load_status(
+    connection: sqlite3.Connection,
+    item_kind: str,
+    item_id: int,
+) -> tuple[str, float]:
+    """The consolidated status and score of one item; unknown and 0 without evidence."""
+    row = connection.execute(
+        "SELECT status, score FROM knowledge WHERE item_kind = ? AND item_id = ?",
+        (item_kind, item_id),
+    ).fetchone()
+    if row is None:
+        return STATUS_UNKNOWN, 0.0
+    return str(row[0]), float(row[1])
 
 
 def load_evidence(

@@ -22,9 +22,11 @@ from urllib.request import Request, urlopen
 
 import anki_connect
 import jmdict
+import knowledge
 import languages
 import settings as app_settings
 from catalog_changes import ensure_catalog_change_log
+from knowledge_anki import AnkiKnowledgeProvider
 from settings import Settings, load_settings
 from languages import (
     ALL_LANGUAGES_CODE,
@@ -184,10 +186,15 @@ SELECT
     ks.first_seen_at,
     ks.last_seen_at,
     k.created_at,
-    k.updated_at
+    k.updated_at,
+    COALESCE(kn.status, 'unknown') AS knowledge_status,
+    COALESCE(kn.score, 0) AS knowledge_score
 FROM kanji AS k
 LEFT JOIN kanji_stats AS ks
-    ON ks.kanji_id = k.id;
+    ON ks.kanji_id = k.id
+LEFT JOIN knowledge AS kn
+    ON kn.item_kind = 'kanji'
+    AND kn.item_id = k.id;
 """
 
 SOURCE_SEGMENT_SCHEMA_SQL = """
@@ -355,10 +362,15 @@ SELECT
     COALESCE(ts.distinct_forms, 0) AS distinct_forms,
     COALESCE(ts.priority_score, 0) AS priority_score,
     ts.first_seen_at,
-    ts.last_seen_at
+    ts.last_seen_at,
+    COALESCE(kn.status, 'unknown') AS knowledge_status,
+    COALESCE(kn.score, 0) AS knowledge_score
 FROM terms AS t
 LEFT JOIN term_stats AS ts
-    ON ts.term_id = t.id;
+    ON ts.term_id = t.id
+LEFT JOIN knowledge AS kn
+    ON kn.item_kind = 'term'
+    AND kn.item_id = t.id;
 """
 
 FLASHCARD_VIEW_SQL = """
@@ -1465,6 +1477,8 @@ def ensure_runtime_schema(connection: sqlite3.Connection) -> None:
             )
             changed = True
     changed = ensure_language_columns(connection) or changed
+    # The overview views join the knowledge table, so it has to exist first.
+    changed = knowledge.ensure_schema(connection) or changed
     changed = ensure_view_definition(connection, "v_terms_overview", TERM_VIEW_SQL) or changed
     changed = ensure_view_definition(connection, "v_kanji_overview", KANJI_VIEW_SQL) or changed
     changed = (
@@ -4262,7 +4276,11 @@ def list_terms(args: argparse.Namespace) -> None:
         "lemma": "lemma ASC, id ASC",
     }[args.order]
     language_sql, params = language_filter_clause("language_code", args.language)
-    where_clause = f"WHERE {language_sql}" if language_sql else ""
+    filters = [language_sql] if language_sql else []
+    if args.knowledge:
+        filters.append("knowledge_status = ?")
+        params = [*params, args.knowledge]
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
     query = f"""
         SELECT
             id,
@@ -4273,7 +4291,8 @@ def list_terms(args: argparse.Namespace) -> None:
             pos,
             total_occurrences,
             distinct_sources,
-            priority_score
+            priority_score,
+            knowledge_status
         FROM v_terms_overview
         {where_clause}
         ORDER BY {order_clause}
@@ -4293,6 +4312,7 @@ def list_terms(args: argparse.Namespace) -> None:
             "total_occurrences",
             "distinct_sources",
             "priority_score",
+            "knowledge_status",
         ),
     )
 
@@ -4769,13 +4789,16 @@ def list_kanji(args: argparse.Namespace) -> None:
             total_occurrences,
             distinct_sources,
             distinct_terms,
-            priority_score
+            priority_score,
+            knowledge_status
         FROM v_kanji_overview
+        {"WHERE knowledge_status = ?" if args.knowledge else ""}
         ORDER BY {order_clause}
         LIMIT ?
     """
+    params = [args.knowledge, args.limit] if args.knowledge else [args.limit]
     with db_connect(args.db) as connection:
-        rows = connection.execute(query, (args.limit,)).fetchall()
+        rows = connection.execute(query, params).fetchall()
     print_rows(
         rows,
         (
@@ -4786,6 +4809,7 @@ def list_kanji(args: argparse.Namespace) -> None:
             "distinct_sources",
             "distinct_terms",
             "priority_score",
+            "knowledge_status",
         ),
     )
 
@@ -7687,6 +7711,47 @@ def sync_anki_kanji(args: argparse.Namespace) -> None:
         print(reprioritization_warning)
 
 
+# ---------------------------------------------------------------------------
+# Knowledge
+#
+# How well each term and character is known lives in ``knowledge``; this is
+# only its command line. A new source of fluency data is a provider module
+# plus one entry in ``knowledge_providers``.
+# ---------------------------------------------------------------------------
+
+
+def knowledge_providers(args: argparse.Namespace) -> list[knowledge.KnowledgeProvider]:
+    return [AnkiKnowledgeProvider(host=args.host, port=args.port)]
+
+
+def sync_knowledge_command(args: argparse.Namespace) -> None:
+    with db_connect(args.db) as connection:
+        for provider in knowledge_providers(args):
+            report = knowledge.refresh_provider(connection, provider)
+            print(f"Knowledge from {report.summary()}")
+
+
+def mark_known_command(args: argparse.Namespace) -> None:
+    if args.term_id is not None:
+        item_kind, item_id = knowledge.ITEM_TERM, args.term_id
+    else:
+        item_kind, item_id = knowledge.ITEM_KANJI, args.kanji_id
+    with db_connect(args.db) as connection:
+        if args.clear:
+            cleared = knowledge.clear_mark(connection, item_kind, item_id)
+            print(
+                f"Cleared the manual mark on {item_kind} {item_id}."
+                if cleared
+                else f"{item_kind.capitalize()} {item_id} had no manual mark."
+            )
+            return
+        try:
+            knowledge.mark_known(connection, item_kind, item_id)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        print(f"Marked {item_kind} {item_id} as known.")
+
+
 def browse_catalog(args: argparse.Namespace) -> None:
     from lang_jp_web import serve_catalog_ui
 
@@ -7969,6 +8034,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=ALL_LANGUAGES_CODE,
         help="Only show terms of one language (default: all).",
     )
+    list_terms_parser.add_argument(
+        "--knowledge",
+        choices=knowledge.STATUSES,
+        help="Only show items in one knowledge status ('unknown' = next to learn).",
+    )
     list_terms_parser.set_defaults(func=list_terms)
 
     list_languages_parser = subparsers.add_parser(
@@ -8205,7 +8275,34 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("priority", "recent", "literal"),
         default="priority",
     )
+    list_kanji_parser.add_argument(
+        "--knowledge",
+        choices=knowledge.STATUSES,
+        help="Only show items in one knowledge status ('unknown' = next to learn).",
+    )
     list_kanji_parser.set_defaults(func=list_kanji)
+
+    sync_knowledge_parser = subparsers.add_parser(
+        "sync-knowledge",
+        help="Read how well each term and kanji is known from Anki's review state (read-only).",
+    )
+    sync_knowledge_parser.add_argument("--host", default=anki_connect.DEFAULT_HOST)
+    sync_knowledge_parser.add_argument("--port", type=int, default=anki_connect.DEFAULT_PORT)
+    sync_knowledge_parser.set_defaults(func=sync_knowledge_command)
+
+    mark_known_parser = subparsers.add_parser(
+        "mark-known",
+        help="Declare a term or kanji known, whatever the other sources say.",
+    )
+    mark_known_item = mark_known_parser.add_mutually_exclusive_group(required=True)
+    mark_known_item.add_argument("--term-id", type=int)
+    mark_known_item.add_argument("--kanji-id", type=int)
+    mark_known_parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Withdraw the mark and go back to what the other sources say.",
+    )
+    mark_known_parser.set_defaults(func=mark_known_command)
 
     refresh_kanji_metadata_parser = subparsers.add_parser(
         "refresh-kanji-metadata",

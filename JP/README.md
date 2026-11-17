@@ -371,6 +371,10 @@ py -3.12 .\single_image_ocr.py `
 - `sync-anki` also repositions existing Anki new cards by the current score when AnkiConnect exposes the custom `repositionNewCards` action.
 - `sync-anki` creates decks on demand and keeps track of the linked Anki note id.
 - `sync-anki` reads what the target decks already hold in a few requests, then sends only what differs (new notes, changed fields, misplaced cards, tag differences), about 100 changes per AnkiConnect `multi` request. A card Anki already has as the catalog wants it costs no request and is reported as `unchanged`.
+- `sync-knowledge` reads back how well each term and kanji is known from the review state of the exported cards (read-only; new cards are never fetched). It fills `knowledge_evidence` (one row per item and source) and `knowledge` (the consolidated status: `learning`, `young`, `mature`, `known`; no row means `unknown`). The web "Sincronizar com o Anki" action runs it as its last step.
+- `mark-known --term-id N` / `--kanji-id N` declares an item known whatever Anki says; `--clear` withdraws it. The term and kanji pages have the same button.
+- `list-terms --knowledge unknown` (also `list-kanji`, `/terms?knowledge=`, `/kanji?knowledge=`, `/api/terms?knowledge=`) lists what is next to learn, highest score first.
+- A new source of fluency data is a provider: a module implementing `knowledge.KnowledgeProvider` (see `knowledge_anki.py`) plus one entry in `knowledge_providers` in `lang_jp.py`. Pages and the API only read the consolidated `knowledge` table.
 - `sync-anki-words` regenerates vocabulary flashcards before syncing, so missing term cards are created and existing ones are refreshed in one step.
 - `generate-kanji-flashcards` and `sync-anki-kanji` use the word deck of the character's language (`Lang::Japanese` for kanji), so kanji and vocabulary share the same new-card queue. Both accept `--language`.
 - `refresh-kanji-metadata` fetches canonical kanji meanings plus `on/kun` readings from `kanjiapi.dev`.

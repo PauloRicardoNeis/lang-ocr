@@ -101,6 +101,14 @@ CHANGE_SPECS: tuple[ChangeSpec, ...] = (
     ),
     ChangeSpec("source_kanji", (("source", "{row}.source_id"), ("kanji", "{row}.kanji_id"))),
     ChangeSpec("flashcards", (("flashcard", "{row}.id"), ("term", "{row}.term_id"))),
+    # One table for both kinds of item: each row logs the key of its own kind.
+    ChangeSpec(
+        "knowledge",
+        (
+            ("term", "(CASE WHEN {row}.item_kind = 'term' THEN {row}.item_id END)"),
+            ("kanji", "(CASE WHEN {row}.item_kind = 'kanji' THEN {row}.item_id END)"),
+        ),
+    ),
     ChangeSpec("languages", (("language", None),)),
     ChangeSpec("settings", (("setting", None),)),
     ChangeSpec("capture_jobs", (("job", "{row}.id"),)),

@@ -24,9 +24,11 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
 import catalog_changes
+import knowledge
 import lang_jp
 import languages
 import settings as app_settings
+import web_knowledge
 import web_settings
 from catalog_changes import Watch
 from lang_jp import (
@@ -728,6 +730,14 @@ PAGE_STYLE = """
   .setting-label { font-weight: 600; }
   .setting-chips .chip { min-height: 22px; padding: 0 8px; margin-left: 6px; font-size: 0.76rem; }
   .chip.is-cool { background: rgba(51, 92, 103, 0.14); color: #27474f; }
+  .chip.knowledge-chip { min-height: 24px; font-size: 0.8rem; }
+  .chip.knowledge-unknown { background: rgba(90, 90, 90, 0.1); color: #5c5c5c; }
+  .chip.knowledge-learning { background: rgba(196, 121, 0, 0.16); color: #7a4b00; }
+  .chip.knowledge-young { background: rgba(51, 92, 103, 0.14); color: #27474f; }
+  .chip.knowledge-mature { background: rgba(46, 125, 50, 0.16); color: #1f5a23; }
+  .chip.knowledge-known { background: rgba(46, 125, 50, 0.3); color: #174a1b; }
+  .knowledge-panel .chips { margin-bottom: 12px; }
+  .knowledge-panel form.inline-action { margin-top: 12px; }
   .panel .setting-help { margin: 4px 0 0; font-size: 0.9rem; line-height: 1.45; }
 
   .setting-control input[type="number"],
@@ -1463,8 +1473,12 @@ def sync_result_message(lines: list[str], fallback: str) -> str:
     )
 
 
-def sync_failure_message(lines: list[str], fallback: str) -> str:
+def last_output_line(lines: list[str], fallback: str) -> str:
     return lines[-1] if lines else fallback
+
+
+def sync_failure_message(lines: list[str], fallback: str) -> str:
+    return last_output_line(lines, fallback)
 
 
 def prune_sync_jobs(*, now: float | None = None) -> None:
@@ -1620,7 +1634,34 @@ def run_sync_anki_job(db_path: Path, job_id: str) -> None:
             return
 
         kanji_message = sync_result_message(kanji_lines, "Kanji sincronizados.")
-        final_message = f"{term_message} {kanji_message}"
+        advance_sync_job(
+            job_id,
+            progress=97,
+            step="sync_knowledge",
+            message=f"{kanji_message} Lendo o progresso de estudo...",
+        )
+        knowledge_returncode, knowledge_lines = stream_catalog_command_for_db(
+            db_path,
+            "sync-knowledge",
+        )
+        if knowledge_returncode != 0:
+            message = sync_failure_message(
+                knowledge_lines,
+                "Falha ao ler o progresso de estudo do Anki.",
+            )
+            advance_sync_job(
+                job_id,
+                progress=100,
+                status="failed",
+                step="failed",
+                message=message,
+                notice_message=message,
+                notice_level="error",
+            )
+            return
+
+        knowledge_message = last_output_line(knowledge_lines, "Progresso de estudo lido.")
+        final_message = f"{term_message} {kanji_message} {knowledge_message}"
         advance_sync_job(
             job_id,
             progress=100,
@@ -2427,7 +2468,7 @@ def sync_anki_action(*, next_path: str = "/") -> str:
           <input type="hidden" name="next" value="{safe_next}">
           <button type="submit" data-anki-sync-submit>Sincronizar com o Anki</button>
         </form>
-        <span class="muted">A acao sincroniza termos e kanji com o Anki, atualizando os decks e a prioridade dos cards novos.</span>
+        <span class="muted">A acao sincroniza termos e kanji com o Anki, atualizando os decks e a prioridade dos cards novos, e le de volta o seu progresso de estudo.</span>
       </div>
       <div
         class="anki-sync-progress"
@@ -2822,6 +2863,26 @@ def dashboard_view(db_path: Path, params: dict[str, list[str]] | None = None) ->
     )
 
 
+def knowledge_panel(
+    connection: sqlite3.Connection,
+    item_kind: str,
+    item_id: int,
+    *,
+    next_path: str,
+) -> str:
+    status, score = knowledge.load_status(connection, item_kind, item_id)
+    return web_knowledge.panel_html(
+        item_kind=item_kind,
+        item_id=item_id,
+        status=status,
+        score=score,
+        evidence=knowledge.load_evidence(connection, item_kind, item_id),
+        next_path=next_path,
+        format_datetime=format_datetime_display,
+        render_table=table_html,
+    )
+
+
 def results_markup(summary_html: str, pagination_markup: str, table_markup: str) -> str:
     """A listing's live part: the count, the pager and the table, swapped together."""
     return f"""
@@ -2854,6 +2915,11 @@ def terms_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
         search_sql, search_params = folded_like_filter(("lemma", "reading", "meaning_pt"), q)
         filters.append(search_sql)
         sql_params.extend(search_params)
+    knowledge_status = web_knowledge.filter_value(first_value(params, web_knowledge.FILTER_PARAM))
+    knowledge_sql, knowledge_params = web_knowledge.filter_clause(knowledge_status)
+    if knowledge_sql:
+        filters.append(knowledge_sql)
+        sql_params.extend(knowledge_params)
 
     where_clause = ""
     if filters:
@@ -2880,6 +2946,8 @@ def terms_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
                 total_occurrences,
                 distinct_sources,
                 priority_score,
+                knowledge_status,
+                knowledge_score,
                 COALESCE(last_seen_at, '-') AS last_seen_at
             FROM v_terms_overview
             {where_clause}
@@ -2893,6 +2961,7 @@ def terms_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
         "q": q.strip() or None,
         "order": order if order != "priority" else None,
         "limit": limit if limit != 50 else None,
+        web_knowledge.FILTER_PARAM: knowledge_status,
         "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
@@ -2913,6 +2982,7 @@ def terms_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
           <option value="recent" {"selected" if order == "recent" else ""}>Mais recentes</option>
           <option value="lemma" {"selected" if order == "lemma" else ""}>Lemma</option>
         </select>
+        {web_knowledge.filter_select(knowledge_status)}
         <input type="number" name="limit" value="{limit}" min="1" max="200">
       </div>
     """
@@ -2926,6 +2996,7 @@ def terms_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
             escape(format_score(row["priority_score"])),
+            web_knowledge.status_cell(row["knowledge_status"], row["knowledge_score"]),
             datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
@@ -2938,6 +3009,7 @@ def terms_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
         "Ocorrencias",
         "Fontes",
         "Score",
+        "Conhecimento",
         "Ultima vez",
     ]
     live = LiveRegions()
@@ -2993,6 +3065,11 @@ def kanji_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
         search_sql, search_params = folded_like_filter(("literal", "meaning_pt", "canonical_meanings"), q)
         filters.append(search_sql)
         sql_params.extend(search_params)
+    knowledge_status = web_knowledge.filter_value(first_value(params, web_knowledge.FILTER_PARAM))
+    knowledge_sql, knowledge_params = web_knowledge.filter_clause(knowledge_status)
+    if knowledge_sql:
+        filters.append(knowledge_sql)
+        sql_params.extend(knowledge_params)
 
     where_clause = ""
     if filters:
@@ -3019,6 +3096,8 @@ def kanji_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
                 distinct_sources,
                 distinct_terms,
                 priority_score,
+                knowledge_status,
+                knowledge_score,
                 COALESCE(last_seen_at, '-') AS last_seen_at
             FROM v_kanji_overview
             {where_clause}
@@ -3032,6 +3111,7 @@ def kanji_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
         "q": q.strip() or None,
         "order": order if order != "priority" else None,
         "limit": limit if limit != 50 else None,
+        web_knowledge.FILTER_PARAM: knowledge_status,
         "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
@@ -3051,6 +3131,7 @@ def kanji_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
           <option value="recent" {"selected" if order == "recent" else ""}>Mais recentes</option>
           <option value="literal" {"selected" if order == "literal" else ""}>Literal</option>
         </select>
+        {web_knowledge.filter_select(knowledge_status)}
         <input type="number" name="limit" value="{limit}" min="1" max="200">
       </div>
     """
@@ -3062,6 +3143,7 @@ def kanji_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
             escape(format_score(row["priority_score"])),
+            web_knowledge.status_cell(row["knowledge_status"], row["knowledge_score"]),
             datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
@@ -3079,7 +3161,7 @@ def kanji_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
     results = results_markup(
         f"{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.",
         pagination_markup,
-        table_html([characters, "Significado", "Palavras", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows),
+        table_html([characters, "Significado", "Palavras", "Ocorrencias", "Fontes", "Score", "Conhecimento", "Ultima vez"], table_rows),
     )
     body = f"""
     <div class="grid">
@@ -3140,6 +3222,12 @@ def kanji_detail_view(
         ).fetchone()
         if kanji is None:
             return None
+        knowledge_html = knowledge_panel(
+            connection,
+            knowledge.ITEM_KANJI,
+            kanji_id,
+            next_path=language_href(f"/kanji/{kanji_id}", lang),
+        )
 
         term_rows = connection.execute(
             """
@@ -3274,6 +3362,9 @@ def kanji_detail_view(
         </div>
       </section>
 
+      {notice_banner(params or {})}
+      {live.region("kanji-knowledge", knowledge_html)}
+
       <section class="panel panel-wide">
         <h3>Termos relacionados</h3>
         {live.region("related-terms", truncation_note(len(term_rows), related_terms_total) + table_html(["Termo", "Idioma", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], related_term_rows))}
@@ -3336,6 +3427,12 @@ def term_detail_view(
         ).fetchone()
         if term is None:
             return None
+        knowledge_html = knowledge_panel(
+            connection,
+            knowledge.ITEM_TERM,
+            term_id,
+            next_path=language_href(f"/terms/{term_id}", lang),
+        )
 
         forms = connection.execute(
             """
@@ -3588,6 +3685,9 @@ def term_detail_view(
       {live.region("term-header", header_html)}
 
       {live.region("term-summary", summary_html)}
+
+      {notice_banner(params or {})}
+      {live.region("term-knowledge", knowledge_html)}
 
       <section class="panel panel-wide">
         <h3>Onde apareceu</h3>
@@ -4777,7 +4877,7 @@ def api_page_meta(pagination: PaginationState, lang: str, **extra: object) -> di
 
 
 def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
-    """Terms as JSON: ``?lang=``, ``?q=``, ``?order=priority|recent|lemma``, ``?limit=``, ``?page=``."""
+    """Terms as JSON: ``?lang=``, ``?q=``, ``?knowledge=<status>``, ``?order=priority|recent|lemma``, ``?limit=``, ``?page=``."""
     q = first_value(params, "q")
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"), maximum=500)
@@ -4798,6 +4898,11 @@ def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, 
         search_sql, search_params = folded_like_filter(("lemma", "reading", "meaning_pt"), q)
         filters.append(search_sql)
         sql_params.extend(search_params)
+    knowledge_status = web_knowledge.filter_value(first_value(params, web_knowledge.FILTER_PARAM))
+    knowledge_sql, knowledge_params = web_knowledge.filter_clause(knowledge_status)
+    if knowledge_sql:
+        filters.append(knowledge_sql)
+        sql_params.extend(knowledge_params)
     where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
     with db_connect(db_path) as connection:
         total_count = connection.execute(
@@ -4810,7 +4915,8 @@ def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, 
             SELECT
                 id, language_code, lemma, reading, meaning_pt, pos,
                 total_occurrences, distinct_sources, distinct_forms,
-                priority_score, first_seen_at, last_seen_at
+                priority_score, first_seen_at, last_seen_at,
+                knowledge_status, knowledge_score
             FROM v_terms_overview
             {where_clause}
             ORDER BY {order_clause}
@@ -4819,7 +4925,7 @@ def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, 
             [*sql_params, pagination.limit, pagination.offset],
         ).fetchall()
     return {
-        "meta": api_page_meta(pagination, lang, q=q, order=order),
+        "meta": api_page_meta(pagination, lang, q=q, order=order, knowledge=knowledge_status),
         "terms": [dict(row) for row in rows],
     }
 
@@ -4831,7 +4937,8 @@ def api_term_detail_payload(db_path: Path, term_id: int) -> dict[str, object] | 
             SELECT
                 v.id, v.language_code, v.lemma, v.reading, v.meaning_pt, v.pos, t.notes,
                 v.total_occurrences, v.distinct_sources, v.distinct_forms,
-                v.priority_score, v.first_seen_at, v.last_seen_at
+                v.priority_score, v.first_seen_at, v.last_seen_at,
+                v.knowledge_status, v.knowledge_score
             FROM v_terms_overview AS v
             JOIN terms AS t ON t.id = v.id
             WHERE v.id = ?
@@ -4867,7 +4974,11 @@ def api_term_detail_payload(db_path: Path, term_id: int) -> dict[str, object] | 
             """,
             (term_id,),
         ).fetchall()
+        evidence = knowledge.load_evidence(connection, knowledge.ITEM_TERM, term_id)
     payload = dict(term)
+    payload["knowledge"] = web_knowledge.api_entry(
+        payload.pop("knowledge_status"), payload.pop("knowledge_score"), evidence
+    )
     payload["language"] = api_language_entry_from_profile(str(term["language_code"]))
     payload["forms"] = [dict(row) for row in forms]
     payload["occurrences"] = [dict(row) for row in occurrences]
@@ -5183,6 +5294,9 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/actions/sync-kanji-anki":
             self.run_sync_anki_action()
             return
+        if path == web_knowledge.ACTION_PATH:
+            self.run_knowledge_action()
+            return
         if path == "/actions/capture-languages":
             self.run_capture_languages_action()
             return
@@ -5414,6 +5528,39 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             return
         self.redirect(self.append_notice("/capture", message=message, level="info"))
 
+    def run_knowledge_action(self) -> None:
+        form_data = self.read_form_data()
+        item_kind = first_value(form_data, "kind")
+        operation = first_value(form_data, "op")
+        next_path = first_value(form_data, "next", "/") or "/"
+        try:
+            item_id = int(first_value(form_data, "id"))
+        except ValueError:
+            self.respond_not_found("Item invalido.")
+            return
+        if item_kind not in knowledge.ITEM_TABLES or operation not in (
+            web_knowledge.ACTION_MARK,
+            web_knowledge.ACTION_CLEAR,
+        ):
+            self.respond_not_found("Acao de conhecimento invalida.")
+            return
+        try:
+            with db_connect(self.db_path) as connection:
+                if operation == web_knowledge.ACTION_MARK:
+                    knowledge.mark_known(connection, item_kind, item_id)
+                    message = "Marcado como conhecido."
+                else:
+                    knowledge.clear_mark(connection, item_kind, item_id)
+                    message = "Marcacao removida."
+                status, score = knowledge.load_status(connection, item_kind, item_id)
+        except ValueError as exc:
+            self.respond_not_found(str(exc))
+            return
+        if self.prefers_json_response():
+            self.respond_json({"message": message, "status": status, "score": score})
+            return
+        self.redirect(self.append_notice(next_path, message=message, level="info"))
+
     def run_source_language_action(self, source_id: int) -> None:
         form_data = self.read_form_data()
         language = first_value(form_data, "language", AUTO_LANGUAGE_CODE) or AUTO_LANGUAGE_CODE
@@ -5581,9 +5728,23 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             self.redirect(self.append_notice(next_path, message=message, level="error"))
             return
 
+        knowledge_result = self.run_catalog_command("sync-knowledge")
+        knowledge_lines = command_output_lines(
+            stdout=knowledge_result.stdout,
+            stderr=knowledge_result.stderr,
+        )
+        if knowledge_result.returncode != 0:
+            message = sync_failure_message(
+                knowledge_lines,
+                "Falha ao ler o progresso de estudo do Anki.",
+            )
+            self.redirect(self.append_notice(next_path, message=message, level="error"))
+            return
+
         term_message = sync_result_message(term_lines, "Termos sincronizados.")
         kanji_message = sync_result_message(kanji_lines, "Kanji sincronizados.")
-        message = f"{term_message} {kanji_message}"
+        knowledge_message = last_output_line(knowledge_lines, "Progresso de estudo lido.")
+        message = f"{term_message} {kanji_message} {knowledge_message}"
         self.redirect(self.append_notice(next_path, message=message, level="info"))
 
 

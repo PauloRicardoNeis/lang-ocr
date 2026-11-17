@@ -395,6 +395,61 @@ CREATE INDEX IF NOT EXISTS idx_kanji_flashcards_export_status
 CREATE INDEX IF NOT EXISTS idx_kanji_flashcards_anki_note_id
     ON kanji_flashcards(anki_note_id);
 
+CREATE TABLE IF NOT EXISTS knowledge_evidence (
+    id INTEGER PRIMARY KEY,
+    item_kind TEXT NOT NULL CHECK (item_kind IN ('term', 'kanji')),
+    item_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('learning', 'young', 'mature', 'known')
+    ),
+    score REAL NOT NULL CHECK (score >= 0 AND score <= 1),
+    weight REAL NOT NULL CHECK (weight >= 0 AND weight <= 1),
+    stability_days REAL,
+    reviews INTEGER NOT NULL DEFAULT 0,
+    lapses INTEGER NOT NULL DEFAULT 0,
+    last_reviewed_at TEXT,
+    due_at TEXT,
+    detail TEXT,
+    observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(item_kind, item_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_evidence_provider
+    ON knowledge_evidence(provider);
+
+CREATE TABLE IF NOT EXISTS knowledge (
+    item_kind TEXT NOT NULL CHECK (item_kind IN ('term', 'kanji')),
+    item_id INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('learning', 'young', 'mature', 'known')
+    ),
+    score REAL NOT NULL,
+    confidence REAL NOT NULL,
+    provider TEXT NOT NULL,
+    last_reviewed_at TEXT,
+    due_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (item_kind, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_kind_status
+    ON knowledge(item_kind, status);
+
+CREATE TRIGGER IF NOT EXISTS trg_knowledge_terms_delete
+AFTER DELETE ON terms
+BEGIN
+    DELETE FROM knowledge_evidence WHERE item_kind = 'term' AND item_id = OLD.id;
+    DELETE FROM knowledge WHERE item_kind = 'term' AND item_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_knowledge_kanji_delete
+AFTER DELETE ON kanji
+BEGIN
+    DELETE FROM knowledge_evidence WHERE item_kind = 'kanji' AND item_id = OLD.id;
+    DELETE FROM knowledge WHERE item_kind = 'kanji' AND item_id = OLD.id;
+END;
+
 CREATE VIEW IF NOT EXISTS v_terms_overview AS
 SELECT
     t.id,
@@ -408,10 +463,15 @@ SELECT
     COALESCE(ts.distinct_forms, 0) AS distinct_forms,
     COALESCE(ts.priority_score, 0) AS priority_score,
     ts.first_seen_at,
-    ts.last_seen_at
+    ts.last_seen_at,
+    COALESCE(kn.status, 'unknown') AS knowledge_status,
+    COALESCE(kn.score, 0) AS knowledge_score
 FROM terms AS t
 LEFT JOIN term_stats AS ts
-    ON ts.term_id = t.id;
+    ON ts.term_id = t.id
+LEFT JOIN knowledge AS kn
+    ON kn.item_kind = 'term'
+    AND kn.item_id = t.id;
 
 CREATE VIEW IF NOT EXISTS v_kanji_overview AS
 SELECT
@@ -431,10 +491,15 @@ SELECT
     ks.first_seen_at,
     ks.last_seen_at,
     k.created_at,
-    k.updated_at
+    k.updated_at,
+    COALESCE(kn.status, 'unknown') AS knowledge_status,
+    COALESCE(kn.score, 0) AS knowledge_score
 FROM kanji AS k
 LEFT JOIN kanji_stats AS ks
-    ON ks.kanji_id = k.id;
+    ON ks.kanji_id = k.id
+LEFT JOIN knowledge AS kn
+    ON kn.item_kind = 'kanji'
+    AND kn.item_id = k.id;
 
 CREATE VIEW IF NOT EXISTS v_flashcards_overview AS
 SELECT
