@@ -205,17 +205,15 @@ class CatalogWebPaginationTest(unittest.TestCase):
         self.assertIn("Pagina 3 de 3", page)
         self.assertIn('href="/kanji?limit=4&amp;page=2"', page)
 
-    def test_sources_live_payload_includes_pagination_markup(self) -> None:
+    def test_sources_live_region_includes_count_and_pagination(self) -> None:
         self.seed_sources(11)
 
-        payload = lang_jp_web.sources_live_payload(
-            self.db_path,
-            {"limit": ["5"], "page": ["2"]},
-        )
+        view = lang_jp_web.sources_view(self.db_path, {"limit": ["5"], "page": ["2"]})
+        results = view.regions["results"]
 
-        self.assertEqual(payload["count_label"], "Mostrando 6 a 10 de 11 resultados.")
-        self.assertIn("Pagina 2 de 3", payload["pagination_html"])
-        self.assertIn('href="/sources?limit=5&amp;page=3"', payload["pagination_html"])
+        self.assertIn("Mostrando 6 a 10 de 11 resultados.", results)
+        self.assertIn("Pagina 2 de 3", results)
+        self.assertIn('href="/sources?limit=5&amp;page=3"', results)
 
     def test_flashcards_page_counts_filtered_results(self) -> None:
         self.seed_flashcards(pending_count=7, exported_count=3)
@@ -576,8 +574,8 @@ class MultilingualPagesTest(unittest.TestCase):
         self.assertIn('class="secondary-link" href="/flashcards?lang=es"', cards)
         self.assertNotIn(">Leitura<", cards)
 
-        sources = lang_jp_web.sources_live_payload(self.db_path, {"lang": ["es"]})
-        self.assertIn(f'href="/sources/{self.mixed_source}?lang=es"', sources["table_html"])
+        sources = lang_jp_web.sources_view(self.db_path, {"lang": ["es"]})
+        self.assertIn(f'href="/sources/{self.mixed_source}?lang=es"', sources.regions["results"])
 
     def test_term_and_source_search_ignore_case_outside_ascii(self) -> None:
         russian = lang_jp_web.terms_page(self.db_path, {"q": ["привет"]})
@@ -693,6 +691,7 @@ class MultilingualPagesTest(unittest.TestCase):
             "sources": lang_jp_web.sources_page(self.db_path, {"lang": ["ja"]}),
             "flashcards": lang_jp_web.flashcards_page(self.db_path, {}),
             "capture": lang_jp_web.capture_page(self.db_path, {}),
+            "settings": lang_jp_web.settings_page(self.db_path, {}),
             "kanji_detail": lang_jp_web.kanji_detail_page(self.db_path, self.kanji_id, {}),
         }
         for name, page in pages.items():
@@ -960,6 +959,172 @@ class MultilingualPagesTest(unittest.TestCase):
             self.assertEqual(removed["orphaned_terms"], [self.es_water])
         finally:
             inside.unlink(missing_ok=True)
+
+
+    # -- live updates -------------------------------------------------------
+
+    def live_views(self) -> dict[str, object]:
+        empty: dict[str, list[str]] = {}
+        return {
+            "dashboard": lang_jp_web.dashboard_view(self.db_path, empty),
+            "terms": lang_jp_web.terms_view(self.db_path, empty),
+            "kanji": lang_jp_web.kanji_view(self.db_path, {"lang": ["ja"]}),
+            "sources": lang_jp_web.sources_view(self.db_path, empty),
+            "flashcards": lang_jp_web.flashcards_view(self.db_path, empty),
+            "capture": lang_jp_web.capture_view(self.db_path, empty),
+            "settings": lang_jp_web.settings_view(self.db_path, empty),
+            "term": lang_jp_web.term_detail_view(self.db_path, self.ja_term, empty),
+            "kanji_detail": lang_jp_web.kanji_detail_view(self.db_path, self.kanji_id, empty),
+            "source": lang_jp_web.source_detail_view(self.db_path, self.mixed_source, empty),
+        }
+
+    def test_every_live_page_embeds_exactly_its_regions(self) -> None:
+        from web_views import fragments_payload, region_hash
+
+        for name, view in self.live_views().items():
+            with self.subTest(page=name):
+                self.assertTrue(view.regions, name)
+                self.assertTrue(view.watch, name)
+                page = lang_jp_web.render_page(view, revision=7)
+                self.assertIn(f'data-live-watch="{view.watch.encode()}"', page)
+                self.assertIn('data-live-revision="7"', page)
+                self.assertEqual(page.count("data-live-region="), len(view.live_regions()))
+                if view.language_bar:
+                    self.assertIn("language-bar", view.live_regions())
+                payload = fragments_payload(view, 7)
+                for key, region in payload["regions"].items():
+                    # The swapped markup is exactly what a reload would show.
+                    wrapper = f'data-live-region="{key}" data-live-hash="{region["hash"]}">{region["html"]}</div>'
+                    self.assertIn(wrapper, page)
+                    self.assertEqual(region["hash"], region_hash(region["html"]))
+
+    def test_fields_and_notices_stay_out_of_live_regions(self) -> None:
+        # One-click button forms (the capture page's "Ignorar app") may live in a
+        # region; anything a user types into or picks from may not.
+        views = self.live_views()
+        source = lang_jp_web.source_detail_view(self.db_path, self.mixed_source, {"notice": ["Salvo"]})
+        typed_fields = ('type="text"', 'type="search"', 'type="number"', 'type="checkbox"', "<select", "<textarea")
+        for name, view in [*views.items(), ("source+notice", source)]:
+            with self.subTest(page=name):
+                for markup in view.regions.values():
+                    for field in typed_fields:
+                        self.assertNotIn(field, markup)
+                    self.assertNotIn("notice-banner", markup)
+                    self.assertNotIn("data-anki-sync-root", markup)
+        self.assertIn("Salvo", source.body)
+
+    def test_source_page_watches_its_linked_terms_and_characters(self) -> None:
+        watch = lang_jp_web.source_detail_view(self.db_path, self.mixed_source, {}).watch
+        self.assertIn(("source", self.mixed_source), watch.ids)
+        self.assertIn(("term", self.es_term), watch.ids)
+        self.assertIn(("term", self.ja_term), watch.ids)
+        self.assertIn(("kanji", self.kanji_id), watch.ids)
+        self.assertNotIn(("term", self.es_water), watch.ids)
+
+    def test_live_changes_reports_only_watched_entities(self) -> None:
+        start = lang_jp_web.catalog_revision_at(self.db_path)
+        watch_term = f"term:{self.es_water}"
+        unchanged = lang_jp_web.live_changes_payload(self.db_path, {"since": [str(start)], "watch": [watch_term]})
+        self.assertEqual(unchanged, {"revision": start, "changed": False, "reset": False})
+
+        connection = db_connect(self.db_path)
+        try:
+            connection.execute("UPDATE terms SET meaning_pt = 'água' WHERE id = ?", (self.es_water,))
+            lang_jp.create_capture_job(
+                connection,
+                captured_at="2026-11-14T10:00:00-03:00",
+                temp_image_path="x.png",
+                image_sha256="sha",
+                image_phash=None,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        def poll(watch: str) -> dict[str, object]:
+            return lang_jp_web.live_changes_payload(self.db_path, {"since": [str(start)], "watch": [watch]})
+
+        self.assertTrue(poll(watch_term)["changed"])
+        self.assertTrue(poll("term")["changed"])
+        self.assertFalse(poll(f"term:{self.es_term}")["changed"])
+        # A capture job alone never wakes a catalog page.
+        self.assertFalse(poll("source,kanji,flashcard,language")["changed"])
+        self.assertTrue(poll("job")["changed"])
+        self.assertGreater(poll("job")["revision"], start)
+        for bad in ({"since": ["x"]}, {"since": ["-1"]}, {"since": ["0"], "watch": ["term:abc"]}):
+            with self.assertRaises(ValueError):
+                lang_jp_web.live_changes_payload(self.db_path, bad)
+
+    def test_capture_page_shows_the_running_job_and_its_stage(self) -> None:
+        idle = lang_jp_web.capture_view(self.db_path, {}).regions["capture-progress"]
+        self.assertIn("Nenhuma captura sendo processada", idle)
+        connection = db_connect(self.db_path)
+        try:
+            for name in ("a", "b"):
+                lang_jp.create_capture_job(
+                    connection,
+                    captured_at="2026-11-14T10:00:00-03:00",
+                    temp_image_path=f"{name}.png",
+                    image_sha256=name,
+                    image_phash=None,
+                    window_title="Dragon Quest",
+                    process_name="dq.exe",
+                )
+            connection.commit()
+            job = lang_jp.claim_next_capture_job(connection)
+            lang_jp.set_capture_job_progress(connection, job_id=int(job["id"]), step="ocr")
+            connection.commit()
+        finally:
+            connection.close()
+        running = lang_jp_web.capture_view(self.db_path, {}).regions["capture-progress"]
+        self.assertIn(f"#{job['id']}", running)
+        self.assertIn("Lendo o texto (OCR)", running)
+        self.assertIn("Dragon Quest", running)
+        self.assertIn("Na fila: 1", running)
+        self.assertRegex(running, r'data-elapsed-since="\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"')
+
+    def test_http_serves_fragments_and_live_changes(self) -> None:
+        import json
+
+        handler = type("TestHandler", (lang_jp_web.CatalogRequestHandler,), {"db_path": self.db_path})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def get(path: str, accept: str = "text/html") -> tuple[int, str]:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=30)
+            try:
+                connection.request("GET", path, headers={"Accept": accept})
+                response = connection.getresponse()
+                return response.status, response.read().decode("utf-8")
+            finally:
+                connection.close()
+
+        try:
+            status, page = get(f"/terms/{self.ja_term}")
+            self.assertEqual(status, 200)
+            self.assertIn("data-live-watch=", page)
+
+            status, raw = get(f"/terms/{self.ja_term}", accept=lang_jp_web.FRAGMENTS_MEDIA_TYPE)
+            self.assertEqual(status, 200)
+            payload = json.loads(raw)
+            self.assertIn("occurrences", payload["regions"])
+            self.assertIn(f"term:{self.ja_term}", payload["watch"])
+
+            self.assertEqual(get("/terms/999999", accept=lang_jp_web.FRAGMENTS_MEDIA_TYPE)[0], 404)
+            status, page = get("/terms/abc")
+            self.assertEqual(status, 404)
+            self.assertIn("Termo invalido.", page)
+            self.assertEqual(get("/nowhere")[0], 404)
+
+            status, raw = get("/live/changes?since=0&watch=term")
+            self.assertEqual(status, 200)
+            self.assertEqual(set(json.loads(raw)), {"revision", "changed", "reset"})
+            self.assertEqual(get("/live/changes?since=x")[0], 400)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 class DisplayFormattingTest(unittest.TestCase):

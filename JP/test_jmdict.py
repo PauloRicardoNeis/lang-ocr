@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import argparse
 import contextlib
 import gzip
@@ -537,8 +538,13 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
 
         self.patches = [
             patch.object(lang_jp, "JMDICT_DB_PATH", self.jmdict_path),
-            patch.object(lang_jp, "DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS", True),
-            patch.object(lang_jp, "DEFAULT_TERM_TRANSLATION_TARGET", "pt"),
+            patch.dict(
+                os.environ,
+                {
+                    "LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "1",
+                    "LANG_JP_TERM_TRANSLATION_TARGET": "pt",
+                },
+            ),
         ]
         for active_patch in self.patches:
             active_patch.start()
@@ -561,6 +567,7 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
             "tender, kind, gentle",
             source_language="en",
             target_language="pt",
+            timeout_seconds=10.0,
         )
 
     def test_translation_split_keeps_commas_inside_parentheses(self) -> None:
@@ -585,7 +592,7 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
 
     def test_english_target_skips_translation(self) -> None:
         with (
-            patch.object(lang_jp, "DEFAULT_TERM_TRANSLATION_TARGET", "en"),
+            patch.dict(os.environ, {"LANG_JP_TERM_TRANSLATION_TARGET": "en"}),
             patch.object(lang_jp, "google_gtx_translate_text") as translate_mock,
         ):
             meaning = lang_jp.auto_translate_term_meaning_pt("売れる", reading="ウレ")
@@ -593,7 +600,7 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
         translate_mock.assert_not_called()
 
     def test_part_of_speech_picks_the_dictionary_entry(self) -> None:
-        with patch.object(lang_jp, "DEFAULT_TERM_TRANSLATION_TARGET", "en"):
+        with patch.dict(os.environ, {"LANG_JP_TERM_TRANSLATION_TARGET": "en"}):
             self.assertEqual(
                 lang_jp.auto_translate_term_meaning_pt("ます", reading="マス", pos="助動詞 *"),
                 "expresses politeness towards the listener (or reader)",
@@ -615,6 +622,7 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
             "体用",
             source_language="ja",
             target_language="pt",
+            timeout_seconds=10.0,
         )
 
     def test_falls_back_when_dictionary_is_missing(self) -> None:
@@ -627,6 +635,7 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
             "やさしい",
             source_language="ja",
             target_language="pt",
+            timeout_seconds=10.0,
         )
 
     def test_network_error_leaves_meaning_empty(self) -> None:
@@ -639,7 +648,7 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
 
     def test_disabled_auto_translate_does_nothing(self) -> None:
         with (
-            patch.object(lang_jp, "DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS", False),
+            patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "0"}),
             patch.object(lang_jp, "google_gtx_translate_text") as translate_mock,
         ):
             self.assertIsNone(lang_jp.auto_translate_term_meaning_pt("優しい"))
@@ -695,6 +704,7 @@ class TermMeaningFromJMdictTest(unittest.TestCase):
             "to be (of animate objects), to exist",
             source_language="en",
             target_language="pt",
+            timeout_seconds=10.0,
         )
         self.assertEqual(row["meaning_pt"], "estar; existir")
 

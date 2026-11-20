@@ -1,18 +1,25 @@
-interval_seconds = 60
-capture_after_source_ready = false
-manual_capture_hotkey = "Alt+Q"
-ocr_max_side = 1600
+# This file holds what the daemon must know before it can open the database:
+# paths, how to spawn the worker and the web server, dedupe.
+#
+# The capture interval, the cadence, the OCR size, the debug log, the hotkeys
+# and the reading overlay's options are NOT here: they are settings, stored in
+# the database and edited from /settings in the web UI, the tray menu or
+# `lang_jp.py set-setting`. The keys interval_seconds, capture_after_source_ready,
+# ocr_max_side, manual_capture_hotkey, overlay_hotkey, overlay_mode_hotkey and
+# overlay_state_path are ignored if they appear in this file.
+
 dedupe_window = 12
 perceptual_dedupe_enabled = false
 phash_distance_threshold = 6
 auto_start_worker = false
 auto_process_jobs = true
 
-# When capture_after_source_ready = true, the daemon waits until the current
-# OCR/source pipeline is idle before taking the next capture. This works best
-# with auto_start_worker = false and auto_process_jobs = true.
-# manual_capture_hotkey is a global shortcut for "Capture now". Supported keys
-# include A-Z, 0-9, F1-F24, arrows, Insert/Delete/Home/End/PageUp/PageDown,
+# With the cadence "After source ready" (setting capture.after_source_ready) the
+# daemon waits until the current OCR/source pipeline is idle before taking the
+# next capture. This works best with auto_start_worker = false and
+# auto_process_jobs = true.
+# The "Capture now" shortcut is the setting hotkeys.manual_capture. Supported
+# keys include A-Z, 0-9, F1-F24, arrows, Insert/Delete/Home/End/PageUp/PageDown,
 # Space, Tab, Enter, Escape, Backspace, and PrintScreen.
 # perceptual_dedupe_enabled compares each new frame with the recent capture
 # window using pHash. Leave it off unless you explicitly want to discard
@@ -54,12 +61,8 @@ auto_process_jobs = true
 # record_foreground_window = true
 
 # Reading overlay (JP/translate_overlay.py), started and kept running by the
-# daemon. overlay_hotkey shows/hides it, overlay_mode_hotkey cycles translation
-# -> furigana -> word by word ("" disables it). On/off, mode and languages are
-# set from the tray ("Reading overlay") and stored in overlay_state_path.
+# daemon. Its hotkeys (hotkeys.overlay_toggle, hotkeys.overlay_mode), on/off,
+# mode and languages (overlay.*) are settings.
 #
-# overlay_hotkey = "Ctrl+Alt+Q"
-# overlay_mode_hotkey = "Ctrl+Alt+W"
 # overlay_script = "translate_overlay.py"
-# overlay_state_path = "data/translate_overlay.toml"
 # overlay_log_path = "data/translate_overlay.log"

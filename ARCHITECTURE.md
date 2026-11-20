@@ -103,7 +103,7 @@ Words that recur across *different* sources dominate; proper names (detected fro
 
 The daemon also owns process lifecycle: it spawns the worker (`loop`, `once` or `drain` mode), supervises `lang_jp.py browse` on port 8766 with restart backoff (or reuses a server already on the port), holds a named single-instance guard (a second launch just opens the catalog), and exposes the *Capture languages* menu that writes `languages.capture_enabled` directly.
 
-Configuration comes from `capture_daemon.toml` (template: `capture_daemon.toml.example`), patched from the tray menu.
+Paths and process options come from `capture_daemon.toml` (template: `capture_daemon.toml.example`). Everything the user tunes (capture interval and cadence, OCR size, debug log, hotkeys, overlay state) is a setting: `JP/settings.py` declares it, the `settings` table stores it, and the daemon, the worker, the overlay and the web UI (`/settings`) all read the same rows. The tray writes them and re-reads them every few seconds.
 
 ### 4.2 Worker: from job to source
 
@@ -122,7 +122,7 @@ Configuration comes from `capture_daemon.toml` (template: `capture_daemon.toml.e
 6. **Tokenize.** Per-language analyzer: `SudachiAnalyzer` (ja), `HanAnalyzer` (zh, jieba when installed), `ThaiAnalyzer`, `GenericAnalyzer` (space-delimited, simplemma lemmas). Junk rules drop URLs, handles, digit-glued tokens, odd casing, vowel-less lemmas.
 7. **Store.** Image moved to `data/captures/…`, a `pending` source created under the dominant captured language, analysis segments and candidates written, job `accepted`. A job with no candidates is rejected.
 8. **Auto-promote.** Candidates the language's simplemma dictionary knows (or any candidate for ja/ko/zh/th/vi, which have no such dictionary) become terms; unknown words stay pending for review.
-9. **After commit.** Meanings of new terms are filled (JMdict for Japanese, machine translation otherwise) **one short write per term after the source transaction**, so the daemon is never blocked on the database lock. Source translations are not queued by default: the web UI translates one source on demand (`translate_source_on_demand`, batched lines). The old background queue (`process_pending_translation_once`) only runs with `LANG_JP_ENABLE_SOURCE_TRANSLATION=1`; per-capture translation kept the free endpoint answering HTTP 429.
+9. **After commit.** Meanings of new terms are filled (JMdict for Japanese, machine translation otherwise) **one short write per term after the source transaction**, so the daemon is never blocked on the database lock. Source translations are not queued by default: the web UI translates one source on demand (`translate_source_on_demand`, batched lines). The old background queue (`process_pending_translation_once`) only runs with the setting `translation.translate_every_capture` on; per-capture translation kept the free endpoint answering HTTP 429.
 
 ### 4.3 Concurrency model
 
@@ -134,7 +134,7 @@ All processes share one SQLite file. Writers keep transactions short: the job cl
 
 - **Detection is offline** — no models, no network; script histograms plus weighted stop-word/hint tables. This keeps capture deterministic and fast and was tuned against real screens (Portuguese chat being misfiled as Spanish/English/Polish led to the screen prior, tie-break by language order, and weaker two-letter stop words).
 - **Readings**: kana from Sudachi + romaji (ja), pinyin via optional `pypinyin` (zh), Revised Romanization (ko) and BGN-style transliteration (ru, uk) built in.
-- **Meanings** come from machine translation (Google's public `gtx` endpoint, `google_gtx_translate_text`) and are written in the *gloss language* (`LANG_JP_TERM_TRANSLATION_TARGET`, default `pt`). That language is off for capture and for `--language all` card generation by default, because its cards would show the same word on both sides. Kanji meanings stay canonical English (`kanjiapi.dev`).
+- **Meanings** come from machine translation (Google's public `gtx` endpoint, `google_gtx_translate_text`) and are written in the *gloss language* (setting `translation.meaning_language`, default `pt`). That language is off for capture and for `--language all` card generation by default, because its cards would show the same word on both sides. Kanji meanings stay canonical English (`kanjiapi.dev`).
 - **Japanese meanings** come from a local JMdict import: the first 1–3 English glosses of the best sense (part of speech from Sudachi used as a preference) translated to Portuguese; bare-lemma translation only as a fallback.
 
 ## 6. Surfaces

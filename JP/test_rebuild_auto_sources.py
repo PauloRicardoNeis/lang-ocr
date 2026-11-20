@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -96,14 +97,15 @@ class RebuildSelectionTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.db_path = self.root / "catalog.sqlite3"
-        self._original_auto_translate = lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = False
+        # No network: term meanings are not machine-translated in these tests.
+        self._settings_env = patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "0"})
+        self._settings_env.start()
         self.connection = db_connect(self.db_path)
         self.connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
 
     def tearDown(self) -> None:
         self.connection.close()
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = self._original_auto_translate
+        self._settings_env.stop()
         self.temp_dir.cleanup()
 
     def add_source(

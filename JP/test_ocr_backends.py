@@ -54,54 +54,56 @@ RUBY_ABOVE_BODY = box("ゆうしゃ", 100, 180, 160, 196)
 
 class EasyOcrConfigTest(unittest.TestCase):
     def test_auto_gpu_uses_torch_visibility(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
+        for mode in (None, "auto"):
             with patch("ocr_backends.torch_cuda_is_available", return_value=True):
-                self.assertTrue(resolve_easyocr_use_gpu())
+                self.assertTrue(resolve_easyocr_use_gpu(mode))
             with patch("ocr_backends.torch_cuda_is_available", return_value=False):
-                self.assertFalse(resolve_easyocr_use_gpu())
+                self.assertFalse(resolve_easyocr_use_gpu(mode))
 
-    def test_explicit_gpu_override_enables_gpu(self) -> None:
-        with patch.dict(os.environ, {"LANG_JP_EASYOCR_GPU": "1"}, clear=True):
-            with patch("ocr_backends.torch_cuda_is_available", return_value=False):
-                self.assertTrue(resolve_easyocr_use_gpu())
+    def test_explicit_gpu_mode_enables_gpu(self) -> None:
+        with patch("ocr_backends.torch_cuda_is_available", return_value=False):
+            self.assertTrue(resolve_easyocr_use_gpu("gpu"))
+            self.assertTrue(resolve_easyocr_use_gpu("1"))
 
-    def test_explicit_cpu_override_disables_gpu(self) -> None:
-        with patch.dict(os.environ, {"LANG_JP_EASYOCR_GPU": "false"}, clear=True):
-            with patch("ocr_backends.torch_cuda_is_available", return_value=True):
-                self.assertFalse(resolve_easyocr_use_gpu())
+    def test_explicit_cpu_mode_disables_gpu(self) -> None:
+        with patch("ocr_backends.torch_cuda_is_available", return_value=True):
+            self.assertFalse(resolve_easyocr_use_gpu("cpu"))
+            self.assertFalse(resolve_easyocr_use_gpu("false"))
 
     def test_languages_default_when_missing(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(resolve_easyocr_languages(), DEFAULT_EASYOCR_LANGUAGES)
+        self.assertEqual(resolve_easyocr_languages(), DEFAULT_EASYOCR_LANGUAGES)
 
     def test_languages_can_be_overridden(self) -> None:
-        with patch.dict(os.environ, {"LANG_JP_EASYOCR_LANGS": "ja"}, clear=True):
-            self.assertEqual(resolve_easyocr_languages(), ("ja",))
+        self.assertEqual(resolve_easyocr_languages("ja"), ("ja",))
 
     def test_empty_languages_fall_back_to_default(self) -> None:
-        with patch.dict(os.environ, {"LANG_JP_EASYOCR_LANGS": " , "}, clear=True):
-            self.assertEqual(resolve_easyocr_languages(), DEFAULT_EASYOCR_LANGUAGES)
+        self.assertEqual(resolve_easyocr_languages(" , "), DEFAULT_EASYOCR_LANGUAGES)
 
+    def test_environment_is_not_consulted(self) -> None:
+        # The LANG_JP_* variables are settings pins now (settings.py), read by the callers.
+        with patch.dict(
+            os.environ,
+            {"LANG_JP_EASYOCR_LANGS": "ko", "LANG_JP_OCR_BACKEND": "easyocr", "LANG_JP_EASYOCR_GPU": "1"},
+        ):
+            self.assertEqual(resolve_easyocr_languages(), DEFAULT_EASYOCR_LANGUAGES)
+            self.assertEqual(resolve_capture_ocr_backend(), "auto")
+            with patch("ocr_backends.torch_cuda_is_available", return_value=False):
+                self.assertFalse(resolve_easyocr_use_gpu())
 
 class CaptureOcrBackendConfigTest(unittest.TestCase):
     def test_defaults_to_auto_routing(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(resolve_capture_ocr_backend(), "auto")
+        self.assertEqual(resolve_capture_ocr_backend(), "auto")
         self.assertEqual(DEFAULT_CAPTURE_OCR_BACKEND, "auto")
 
-    def test_env_selects_easyocr(self) -> None:
-        with patch.dict(os.environ, {"LANG_JP_OCR_BACKEND": " EasyOCR "}, clear=True):
-            self.assertEqual(resolve_capture_ocr_backend(), "easyocr")
+    def test_name_selects_easyocr(self) -> None:
+        self.assertEqual(resolve_capture_ocr_backend(" EasyOCR "), "easyocr")
 
-    def test_blank_env_falls_back_to_default(self) -> None:
-        with patch.dict(os.environ, {"LANG_JP_OCR_BACKEND": "  "}, clear=True):
-            self.assertEqual(resolve_capture_ocr_backend(), "auto")
+    def test_blank_name_falls_back_to_default(self) -> None:
+        self.assertEqual(resolve_capture_ocr_backend("  "), "auto")
 
     def test_unknown_backend_is_rejected(self) -> None:
-        with patch.dict(os.environ, {"LANG_JP_OCR_BACKEND": "paddle"}, clear=True):
-            with self.assertRaises(ValueError):
-                resolve_capture_ocr_backend()
-
+        with self.assertRaises(ValueError):
+            resolve_capture_ocr_backend("paddle")
 
 class EngineRoutingTest(unittest.TestCase):
     def test_japanese_only_uses_meikiocr_alone(self) -> None:
@@ -154,20 +156,25 @@ class EngineRoutingTest(unittest.TestCase):
         self.assertEqual(easy.easyocr_groups, (("en",), ("ja", "en")))
 
     def test_reader_cache_builds_each_group_once(self) -> None:
-        built: list[tuple[str, ...]] = []
+        built: list[tuple[tuple[str, ...], str]] = []
 
         class StubBackend:
-            def __init__(self, languages_list):
-                built.append(tuple(languages_list))
+            def __init__(self, languages_list, *, gpu_mode=None):
+                built.append((tuple(languages_list), gpu_mode))
 
         clear_backend_cache()
         with patch("ocr_backends.EasyOcrBackend", StubBackend):
             first = get_easyocr_backend(("en", "es"))
             second = get_easyocr_backend(("en", "es"))
             get_easyocr_backend(("ko", "en"))
+            on_cpu = get_easyocr_backend(("en", "es"), gpu_mode="cpu")
         clear_backend_cache()
         self.assertIs(first, second)
-        self.assertEqual(built, [("en", "es"), ("ko", "en")])
+        self.assertIsNot(first, on_cpu)
+        self.assertEqual(
+            built,
+            [(("en", "es"), "auto"), (("ko", "en"), "auto"), (("en", "es"), "cpu")],
+        )
 
 
 class LanguageAwareLineFilterTest(unittest.TestCase):

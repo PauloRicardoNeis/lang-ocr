@@ -12,8 +12,9 @@ modes:
 - ``words``: a short gloss under every content word, word by word.
 
 The mode hotkey cycles the mode (re-rendering the same read, no new OCR). The
-mode and the languages to read live in ``data/translate_overlay.toml``, shared
-with the tray daemon, so the tray menu and the hotkey stay in sync.
+mode and the languages to read are the ``overlay.*`` settings in the catalog
+database, shared with the tray daemon and the web UI, so the tray menu, the
+settings page and the hotkey stay in sync.
 
 The window is click-through, always on top and excluded from screen capture,
 so the passive capture never OCRs it. Press the hotkey again (or Esc) to clear
@@ -27,14 +28,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import os
 import queue
 import re
 import sys
 import tempfile
 import threading
 import time
-import tomllib
 import unicodedata
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -43,20 +42,21 @@ from typing import Callable, Iterable
 
 import languages
 from ocr_backends import OcrBlock, OcrTextLine, bbox_bounds, sort_ocr_blocks_reading_order
+from settings import Settings, load_settings, set_settings, setting_for
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_STATE_PATH = ROOT / "data" / "translate_overlay.toml"
-DEFAULT_HOTKEY = os.environ.get("LANG_OVERLAY_HOTKEY", "Ctrl+Alt+Q")
-DEFAULT_MODE_HOTKEY = os.environ.get("LANG_OVERLAY_MODE_HOTKEY", "Ctrl+Alt+W")
-DEFAULT_TARGET_LANGUAGE = os.environ.get("LANG_OVERLAY_TARGET", "en")
+# The hotkeys and the translation target are settings (hotkeys.overlay_toggle,
+# hotkeys.overlay_mode, translation.overlay_language); the command-line flags
+# override them for one run. This is only the default of the pure functions below.
+DEFAULT_TARGET_LANGUAGE = str(setting_for("translation.overlay_language").default)
 
-MODES = ("translation", "furigana", "words")
+MODES = setting_for("overlay.mode").choice_values()
 MODE_LABELS = {
     "translation": "Tradução",
     "furigana": "Furigana",
     "words": "Palavra por palavra",
 }
-LANGUAGE_CHOICES = ("ja", "capture")
+LANGUAGE_CHOICES = setting_for("overlay.languages").choice_values()
 
 MIN_FONT_PX = 12
 MAX_FONT_PX = 72
@@ -93,8 +93,8 @@ class OverlayState:
     scale: float = 1.0
 
 
-MIN_SCALE = 0.5
-MAX_SCALE = 3.0
+MIN_SCALE = float(setting_for("overlay.scale").minimum or 0.5)
+MAX_SCALE = float(setting_for("overlay.scale").maximum or 3.0)
 SCALE_STEP = 1.15
 
 
@@ -109,34 +109,44 @@ def zoom_scale(scale: float, steps: int) -> float:
     return clamp_scale(scale * SCALE_STEP**steps)
 
 
-def load_overlay_state(path: Path) -> OverlayState:
-    try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
-        return OverlayState()
-    state = OverlayState()
-    if raw.get("mode") in MODES:
-        state.mode = raw["mode"]
-    if raw.get("languages") in LANGUAGE_CHOICES:
-        state.languages = raw["languages"]
-    if isinstance(raw.get("enabled"), bool):
-        state.enabled = raw["enabled"]
-    scale = raw.get("scale")
-    if isinstance(scale, (int, float)) and not isinstance(scale, bool):
-        state.scale = clamp_scale(float(scale))
-    return state
-
-
-def save_overlay_state(path: Path, state: OverlayState) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    temp.write_text(
-        f'mode = "{state.mode}"\nlanguages = "{state.languages}"\n'
-        f"enabled = {'true' if state.enabled else 'false'}\n"
-        f"scale = {clamp_scale(state.scale):.2f}\n",
-        encoding="utf-8",
+def overlay_state(settings: Settings) -> OverlayState:
+    """The overlay's part of a settings snapshot (the ``overlay.*`` settings)."""
+    return OverlayState(
+        mode=str(settings["overlay.mode"]),
+        languages=str(settings["overlay.languages"]),
+        enabled=bool(settings["overlay.enabled"]),
+        scale=clamp_scale(float(settings["overlay.scale"])),  # type: ignore[arg-type]
     )
-    os.replace(temp, path)
+
+
+def load_overlay_state(db_path: Path) -> OverlayState:
+    from lang_jp import db_connect
+
+    connection = db_connect(db_path)
+    try:
+        return overlay_state(load_settings(connection))
+    finally:
+        connection.close()
+
+
+def save_overlay_state(db_path: Path, state: OverlayState) -> None:
+    """Store the state in the settings table, where the tray and the web UI read it."""
+    from lang_jp import db_connect
+
+    connection = db_connect(db_path)
+    try:
+        set_settings(
+            connection,
+            {
+                "overlay.mode": state.mode,
+                "overlay.languages": state.languages,
+                "overlay.enabled": state.enabled,
+                "overlay.scale": f"{clamp_scale(state.scale):.2f}",
+            },
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def next_mode(mode: str) -> str:
@@ -1126,9 +1136,8 @@ class ScreenReader:
         self,
         *,
         db_path: Path,
-        target_language: str,
+        target_override: str | None = None,
         languages_override: tuple[str, ...] | None,
-        state_path: Path = DEFAULT_STATE_PATH,
     ) -> None:
         # Imported here: the worker pulls in the OCR stack, which tests do not need.
         from capture_worker import CapturePipeline, GoogleGtxSourceTranslator, resolve_capture_languages
@@ -1136,15 +1145,41 @@ class ScreenReader:
         from lang_jp import db_connect, katakana_to_hiragana, romanize_kana
 
         self.db_path = db_path
-        self.state_path = state_path
-        self.target_language = target_language
+        # A target given on the command line wins over the setting for this run.
+        self.target_override = target_override
         self.languages_override = languages_override
         self._resolve_capture_languages = resolve_capture_languages
         self._db_connect = db_connect
+        self._new_translator = GoogleGtxSourceTranslator
         self.romanize_kana = romanize_kana
         self.to_hiragana = katakana_to_hiragana
         self.pipeline = CapturePipeline()
-        translator = GoogleGtxSourceTranslator(target_language=target_language)
+        self._open_jmdict = JMdict.open
+        self.target_language = ""
+        self.settings = self.refresh_settings()
+        self.codes = self.current_languages()
+        self.pipeline.ocr_for(self.codes, self.settings)
+
+    def state(self) -> OverlayState:
+        """Mode, languages and label size as they are in the database right now."""
+        return overlay_state(self.refresh_settings())
+
+    def refresh_settings(self) -> Settings:
+        """Read the settings for this read; a new target language gets a new translator."""
+        connection = self._db_connect(self.db_path)
+        try:
+            self.settings = load_settings(connection)
+        finally:
+            connection.close()
+        target = self.target_override or str(self.settings["translation.overlay_language"])
+        if target != self.target_language:
+            self.set_target_language(target)
+        return self.settings
+
+    def set_target_language(self, target_language: str) -> None:
+        """Point the translator, its cache and the glosses at ``target_language``."""
+        self.target_language = target_language
+        translator = self._new_translator(target_language=target_language)
         self.translate = TranslationCache(
             batch_by_newlines(
                 lambda text, code: translator.translate_text(
@@ -1152,13 +1187,7 @@ class ScreenReader:
                 )
             )
         )
-        self._open_jmdict = JMdict.open
         self.gloss = dictionary_then_translate(self.dictionary_meaning, self.translate)
-        self.codes = self.current_languages()
-        self.pipeline.ocr_for(self.codes)
-
-    def state(self) -> OverlayState:
-        return load_overlay_state(self.state_path)
 
     def current_languages(self) -> tuple[str, ...]:
         if self.languages_override:
@@ -1212,9 +1241,12 @@ class ScreenReader:
 
     def read(self, image_path: Path) -> Snapshot:
         started = time.perf_counter()
+        settings = self.refresh_settings()
         self.codes = self.current_languages()
-        adapter = self.pipeline.ocr_for(self.codes)
-        blocks = adapter.extract_blocks(image_path, progress_label="overlay step=ocr")
+        adapter = self.pipeline.ocr_for(self.codes, settings)
+        blocks = adapter.extract_blocks(
+            image_path, progress_label="overlay step=ocr", settings=settings
+        )
         lines = analyze_lines(blocks, candidates=self.codes)
         return Snapshot(lines=lines, codes=self.codes, ocr_seconds=time.perf_counter() - started)
 
@@ -1360,7 +1392,7 @@ class OverlayApp:
                 return
             state = self.reader.state()
             state.mode = next_mode(state.mode)
-            save_overlay_state(self.reader.state_path, state)
+            save_overlay_state(self.reader.db_path, state)
             print(f"overlay mode {state.mode}", flush=True)
             if self.visible and self.snapshot is not None:
                 self.start_render(self.snapshot, state.mode)
@@ -1444,7 +1476,7 @@ class OverlayApp:
         if scale == self.scale and steps:
             return
         self.scale = state.scale = scale
-        save_overlay_state(self.reader.state_path, state)
+        save_overlay_state(self.reader.db_path, state)
         if self.visible and self.shown is not None and not self.busy:
             self.canvas.delete("all")
             self._draw_rendered(*self.shown)
@@ -1644,19 +1676,26 @@ def build_parser() -> argparse.ArgumentParser:
     from lang_jp import DEFAULT_DB_PATH
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="Show/hide hotkey (default Ctrl+Alt+Q).")
+    parser.add_argument(
+        "--hotkey",
+        help="Show/hide hotkey (default: the hotkeys.overlay_toggle setting, Ctrl+Alt+Q).",
+    )
     parser.add_argument(
         "--mode-hotkey",
-        default=DEFAULT_MODE_HOTKEY,
-        help="Hotkey that cycles translation -> furigana -> words (default Ctrl+Alt+W; '' to disable).",
+        help=(
+            "Hotkey that cycles translation -> furigana -> words "
+            "(default: the hotkeys.overlay_mode setting, Ctrl+Alt+W; '' to disable)."
+        ),
     )
-    parser.add_argument("--mode", choices=MODES, help="Set the mode in the state file before starting.")
-    parser.add_argument("--target", default=DEFAULT_TARGET_LANGUAGE, help="Translation target language (default en).")
+    parser.add_argument("--mode", choices=MODES, help="Set the mode (the overlay.mode setting) before starting.")
+    parser.add_argument(
+        "--target",
+        help="Translation target language (default: the translation.overlay_language setting, en).",
+    )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="Catalog database.")
-    parser.add_argument("--state", type=Path, default=DEFAULT_STATE_PATH, help="Mode/languages file shared with the tray.")
     parser.add_argument(
         "--languages",
-        help="Comma-separated languages to read, overriding the state file, e.g. ja,en.",
+        help="Comma-separated languages to read, overriding the overlay.languages setting, e.g. ja,en.",
     )
     parser.add_argument("--trigger-now", action="store_true", help="Read the screen once right after start.")
     parser.add_argument("--exit-after", type=float, help="Quit after this many seconds (testing).")
@@ -1694,28 +1733,33 @@ def main() -> None:
     if args.languages:
         override = tuple(code.strip() for code in args.languages.split(",") if code.strip())
     if args.mode:
-        state = load_overlay_state(args.state)
+        state = load_overlay_state(args.db)
         state.mode = args.mode
-        save_overlay_state(args.state, state)
+        save_overlay_state(args.db, state)
 
     if args.image is None:
         # Before anything opens a window or reads a screen size.
         set_dpi_awareness()
-        toggle = parse_hotkey(args.hotkey)
-        mode_key = parse_hotkey(args.mode_hotkey) if args.mode_hotkey.strip() else None
 
     print("loading OCR engines…", flush=True)
     reader = ScreenReader(
         db_path=args.db,
-        target_language=args.target,
+        target_override=args.target,
         languages_override=override,
-        state_path=args.state,
     )
     state = reader.state()
     print(
-        f"ready: languages={','.join(reader.codes)} target={args.target} mode={state.mode}",
+        f"ready: languages={','.join(reader.codes)} target={reader.target_language} mode={state.mode}",
         flush=True,
     )
+
+    if args.image is None:
+        if args.hotkey is None:
+            args.hotkey = str(reader.settings["hotkeys.overlay_toggle"])
+        if args.mode_hotkey is None:
+            args.mode_hotkey = str(reader.settings["hotkeys.overlay_mode"])
+        toggle = parse_hotkey(args.hotkey)
+        mode_key = parse_hotkey(args.mode_hotkey) if args.mode_hotkey.strip() else None
 
     if args.image is not None:
         snapshot = reader.read(args.image)

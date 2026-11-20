@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -18,7 +18,7 @@ use image::codecs::png::PngEncoder;
 use img_hash::image::{ImageBuffer, Rgba, RgbaImage};
 use img_hash::{HasherConfig, ImageHash};
 use rusqlite::{Connection, params};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use trayicon::{Icon, MenuBuilder, TrayIcon, TrayIconBuilder};
@@ -47,6 +47,8 @@ use winit::window::Window;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UserEvent {
     Start,
+    /// The delayed start after the daemon opens (`capture.autostart`).
+    AutoStart,
     Pause,
     Resume,
     CaptureNow,
@@ -64,6 +66,7 @@ enum UserEvent {
     ToggleDebug,
     OpenCatalog,
     OpenCaptureSettings,
+    OpenSettings,
     ToggleCaptureLanguage(String),
     /// Add or remove one capture skip rule: (kind, pattern).
     ToggleSkipRule(String, String),
@@ -99,15 +102,17 @@ enum CaptureLoopMode {
     ManualBurst { restore_state: ServiceState },
 }
 
+/// Where things are and how processes are spawned: what the daemon must know
+/// before it can open the database. `capture_daemon.toml` overrides these.
+///
+/// User-tunable behaviour (capture interval and cadence, OCR size, debug log,
+/// hotkeys) is not here: it lives in the `settings` table shared with the
+/// Python side, see `DaemonSettings`. The three hotkey fields are filled from
+/// that table when the daemon starts.
 #[derive(Clone, Debug, Deserialize)]
 struct DaemonConfig {
-    interval_seconds: u64,
-    #[serde(default)]
-    capture_after_source_ready: bool,
     #[serde(default)]
     manual_capture_hotkey: Option<String>,
-    #[serde(default = "default_ocr_max_side")]
-    ocr_max_side: u64,
     dedupe_window: usize,
     #[serde(default)]
     perceptual_dedupe_enabled: bool,
@@ -132,16 +137,11 @@ struct DaemonConfig {
     overlay_hotkey: String,
     overlay_mode_hotkey: String,
     overlay_script: PathBuf,
-    overlay_state_path: PathBuf,
     overlay_log_path: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct DaemonConfigPatch {
-    interval_seconds: Option<u64>,
-    capture_after_source_ready: Option<bool>,
-    manual_capture_hotkey: Option<String>,
-    ocr_max_side: Option<u64>,
     dedupe_window: Option<usize>,
     perceptual_dedupe_enabled: Option<bool>,
     phash_distance_threshold: Option<u32>,
@@ -159,10 +159,7 @@ struct DaemonConfigPatch {
     web_python_args: Option<Vec<String>>,
     web_log_path: Option<PathBuf>,
     record_foreground_window: Option<bool>,
-    overlay_hotkey: Option<String>,
-    overlay_mode_hotkey: Option<String>,
     overlay_script: Option<PathBuf>,
-    overlay_state_path: Option<PathBuf>,
     overlay_log_path: Option<PathBuf>,
 }
 
@@ -213,11 +210,9 @@ impl Default for DaemonConfig {
         } else {
             ("py".to_string(), vec!["-3.12".to_string()])
         };
+        let settings = DaemonSettings::default();
         Self {
-            interval_seconds: 60,
-            capture_after_source_ready: false,
-            manual_capture_hotkey: None,
-            ocr_max_side: default_ocr_max_side(),
+            manual_capture_hotkey: settings.manual_capture_hotkey_option(),
             dedupe_window: 12,
             perceptual_dedupe_enabled: false,
             phash_distance_threshold: 6,
@@ -235,10 +230,9 @@ impl Default for DaemonConfig {
             web_python_args: None,
             web_log_path: jp_root.join("data").join("catalog_web.log"),
             record_foreground_window: true,
-            overlay_hotkey: DEFAULT_OVERLAY_HOTKEY.to_string(),
-            overlay_mode_hotkey: DEFAULT_OVERLAY_MODE_HOTKEY.to_string(),
+            overlay_hotkey: settings.overlay_hotkey,
+            overlay_mode_hotkey: settings.overlay_mode_hotkey,
             overlay_script: jp_root.join("translate_overlay.py"),
-            overlay_state_path: jp_root.join("data").join("translate_overlay.toml"),
             overlay_log_path: jp_root.join("data").join("translate_overlay.log"),
         }
     }
@@ -248,15 +242,21 @@ fn default_true() -> bool {
     true
 }
 
-fn default_ocr_max_side() -> u64 {
-    1600
-}
-
 const DEFAULT_WEB_PORT: u16 = 8766;
-const DEFAULT_OVERLAY_HOTKEY: &str = "Ctrl+Alt+Q";
-const DEFAULT_OVERLAY_MODE_HOTKEY: &str = "Ctrl+Alt+W";
+/// Keys that used to be read from `capture_daemon.toml` and are settings now.
+const MOVED_TOML_KEYS: &[(&str, &str)] = &[
+    ("interval_seconds", SETTING_INTERVAL_SECONDS),
+    ("capture_after_source_ready", SETTING_AFTER_SOURCE_READY),
+    ("ocr_max_side", SETTING_OCR_MAX_SIDE),
+    ("manual_capture_hotkey", SETTING_MANUAL_CAPTURE_HOTKEY),
+    ("overlay_hotkey", SETTING_OVERLAY_HOTKEY),
+    ("overlay_mode_hotkey", SETTING_OVERLAY_MODE_HOTKEY),
+];
 const OVERLAY_HEALTHY_RUN: Duration = Duration::from_secs(30);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// The daemon is launched hidden, so a console child would inherit that invisible
+/// console; this flag gives it a visible one of its own.
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const WEB_SERVER_HEALTHY_RUN: Duration = Duration::from_secs(30);
 const CATALOG_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const INSTANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -269,18 +269,6 @@ impl DaemonConfig {
     }
 
     fn apply_patch(mut self, patch: DaemonConfigPatch) -> Self {
-        if let Some(value) = patch.interval_seconds {
-            self.interval_seconds = value;
-        }
-        if let Some(value) = patch.capture_after_source_ready {
-            self.capture_after_source_ready = value;
-        }
-        if let Some(value) = patch.manual_capture_hotkey {
-            self.manual_capture_hotkey = Some(value);
-        }
-        if let Some(value) = patch.ocr_max_side {
-            self.ocr_max_side = value;
-        }
         if let Some(value) = patch.dedupe_window {
             self.dedupe_window = value;
         }
@@ -332,17 +320,8 @@ impl DaemonConfig {
         if let Some(value) = patch.record_foreground_window {
             self.record_foreground_window = value;
         }
-        if let Some(value) = patch.overlay_hotkey {
-            self.overlay_hotkey = value;
-        }
-        if let Some(value) = patch.overlay_mode_hotkey {
-            self.overlay_mode_hotkey = value;
-        }
         if let Some(value) = patch.overlay_script {
             self.overlay_script = resolve_jp_config_path(value);
-        }
-        if let Some(value) = patch.overlay_state_path {
-            self.overlay_state_path = resolve_jp_config_path(value);
         }
         if let Some(value) = patch.overlay_log_path {
             self.overlay_log_path = resolve_jp_config_path(value);
@@ -354,6 +333,18 @@ impl DaemonConfig {
         format!("{}capture", self.catalog_url())
     }
 
+    fn settings_url(&self) -> String {
+        format!("{}settings", self.catalog_url())
+    }
+
+    /// The hotkeys are registered once, when the daemon starts.
+    fn with_hotkeys(mut self, settings: &DaemonSettings) -> Self {
+        self.manual_capture_hotkey = settings.manual_capture_hotkey_option();
+        self.overlay_hotkey = settings.overlay_hotkey.clone();
+        self.overlay_mode_hotkey = settings.overlay_mode_hotkey.clone();
+        self
+    }
+
     fn catalog_url(&self) -> String {
         format!("http://127.0.0.1:{}/", self.web_port)
     }
@@ -362,10 +353,24 @@ impl DaemonConfig {
         let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture_daemon.toml");
         let default = Self::default();
         let Ok(raw) = fs::read_to_string(&config_path) else {
-            return default;
+            return default.with_stored_hotkeys();
         };
         match Self::from_toml(&raw) {
-            Ok(config) => config,
+            Ok(config) => {
+                for (toml_key, setting_key) in moved_toml_keys(&raw) {
+                    append_log_file(
+                        &config.log_path,
+                        &format!(
+                            "{} in {} is ignored: it is the setting {} now (web UI /settings, or `lang_jp.py set-setting {} <value>`)",
+                            toml_key,
+                            config_path.display(),
+                            setting_key,
+                            setting_key
+                        ),
+                    );
+                }
+                config.with_stored_hotkeys()
+            }
             Err(error) => {
                 append_log_file(
                     &default.log_path,
@@ -374,8 +379,203 @@ impl DaemonConfig {
                         config_path.display()
                     ),
                 );
-                default
+                default.with_stored_hotkeys()
             }
+        }
+    }
+
+    fn with_stored_hotkeys(self) -> Self {
+        let settings = DaemonSettings::load(&self.db_path).unwrap_or_default();
+        self.with_hotkeys(&settings)
+    }
+}
+
+/// The legacy keys present in a `capture_daemon.toml`, with the setting each became.
+fn moved_toml_keys(raw: &str) -> Vec<(&'static str, &'static str)> {
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    MOVED_TOML_KEYS
+        .iter()
+        .filter(|(toml_key, _)| table.contains_key(*toml_key))
+        .copied()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Settings shared with the Python side.
+//
+// settings.py declares every setting (type, default, range); the `settings`
+// table stores the values that differ from the default. The daemon consumes
+// the capture interval, the cadence and the hotkeys itself, and its tray edits
+// the OCR size and the debug log, which the worker reads per job. All of them
+// are also edited from /settings in the web UI and the `set-setting` CLI
+// command, so the daemon re-reads the table every few seconds.
+//
+// The environment pins of settings.py (LANG_JP_OCR_MAX_SIDE, ...) are a
+// Python-side feature for one-off runs; the daemon does not look at them.
+// ---------------------------------------------------------------------------
+
+const SETTING_INTERVAL_SECONDS: &str = "capture.interval_seconds";
+const SETTING_AFTER_SOURCE_READY: &str = "capture.after_source_ready";
+const SETTING_OCR_MAX_SIDE: &str = "ocr.max_side";
+const SETTING_DEBUG_LOG: &str = "capture.debug_log";
+const SETTING_AUTOSTART: &str = "capture.autostart";
+const SETTING_AUTOSTART_DELAY_SECONDS: &str = "capture.autostart_delay_seconds";
+const SETTING_MANUAL_CAPTURE_HOTKEY: &str = "hotkeys.manual_capture";
+const SETTING_OVERLAY_HOTKEY: &str = "hotkeys.overlay_toggle";
+const SETTING_OVERLAY_MODE_HOTKEY: &str = "hotkeys.overlay_mode";
+const SETTING_OVERLAY_ENABLED: &str = "overlay.enabled";
+const SETTING_OVERLAY_MODE: &str = "overlay.mode";
+const SETTING_OVERLAY_LANGUAGES: &str = "overlay.languages";
+
+/// Default of every setting the daemon touches, as stored text.
+/// JP/test_settings.py checks this list against the registry in settings.py.
+const DAEMON_SETTING_DEFAULTS: &[(&str, &str)] = &[
+    ("capture.interval_seconds", "60"),
+    ("capture.after_source_ready", "0"),
+    ("ocr.max_side", "1600"),
+    ("capture.debug_log", "0"),
+    ("capture.autostart", "1"),
+    ("capture.autostart_delay_seconds", "20"),
+    ("hotkeys.manual_capture", ""),
+    ("hotkeys.overlay_toggle", "Ctrl+Alt+Q"),
+    ("hotkeys.overlay_mode", "Ctrl+Alt+W"),
+    ("overlay.enabled", "1"),
+    ("overlay.mode", "translation"),
+    ("overlay.languages", "ja"),
+];
+
+const SETTINGS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)";
+
+fn setting_default(key: &str) -> &'static str {
+    DAEMON_SETTING_DEFAULTS
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, value)| *value)
+        .unwrap_or("")
+}
+
+/// The stored rows, or `None` when the database could not be read (busy,
+/// missing): the caller then keeps what it has. A database without the table
+/// yet has no rows, so everything is at its default.
+fn load_setting_rows(db_path: &Path) -> Option<HashMap<String, String>> {
+    let connection = open_db(db_path).ok()?;
+    let mut statement = match connection.prepare("SELECT key, value FROM settings") {
+        Ok(statement) => statement,
+        Err(error) if error.to_string().contains("no such table") => return Some(HashMap::new()),
+        Err(_) => return None,
+    };
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .ok()?;
+    let mut values = HashMap::new();
+    for row in rows {
+        let (key, value) = row.ok()?;
+        values.insert(key, value);
+    }
+    Some(values)
+}
+
+/// Stores one setting the way settings.py does: a value equal to the default
+/// removes the row, so only overrides are stored.
+fn store_setting(db_path: &Path, key: &str, value: &str) -> Result<()> {
+    let connection = open_db(db_path)?;
+    connection.execute(SETTINGS_TABLE_SQL, [])?;
+    if value == setting_default(key) {
+        connection.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    } else {
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+             WHERE settings.value IS NOT excluded.value",
+            params![key, value],
+        )?;
+    }
+    Ok(())
+}
+
+fn setting_flag_text(enabled: bool) -> &'static str {
+    if enabled { "1" } else { "0" }
+}
+
+/// The value of `key` in `rows`, or its default.
+fn setting_text(rows: &HashMap<String, String>, key: &str) -> String {
+    rows.get(key)
+        .map(String::as_str)
+        .unwrap_or_else(|| setting_default(key))
+        .trim()
+        .to_string()
+}
+
+/// An on/off setting; text that is neither reads as the default, as in settings.py.
+fn setting_flag(rows: &HashMap<String, String>, key: &str) -> bool {
+    match setting_text(rows, key).to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => setting_default(key) == "1",
+    }
+}
+
+/// The settings the daemon consumes or shows, typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DaemonSettings {
+    interval_seconds: u64,
+    capture_after_source_ready: bool,
+    ocr_max_side: u64,
+    debug_log: bool,
+    /// Start the capture service by itself when the daemon opens.
+    autostart: bool,
+    autostart_delay_seconds: u64,
+    manual_capture_hotkey: String,
+    overlay_hotkey: String,
+    overlay_mode_hotkey: String,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self::from_rows(&HashMap::new())
+    }
+}
+
+impl DaemonSettings {
+    fn from_rows(rows: &HashMap<String, String>) -> Self {
+        let text = |key: &str| setting_text(rows, key);
+        // A stored value that does not parse falls back to the default, as in settings.py.
+        let number = |key: &str| -> u64 {
+            text(key)
+                .parse::<u64>()
+                .ok()
+                .or_else(|| setting_default(key).parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let flag = |key: &str| setting_flag(rows, key);
+        Self {
+            interval_seconds: number(SETTING_INTERVAL_SECONDS).max(1),
+            capture_after_source_ready: flag(SETTING_AFTER_SOURCE_READY),
+            ocr_max_side: number(SETTING_OCR_MAX_SIDE),
+            debug_log: flag(SETTING_DEBUG_LOG),
+            autostart: flag(SETTING_AUTOSTART),
+            autostart_delay_seconds: number(SETTING_AUTOSTART_DELAY_SECONDS),
+            manual_capture_hotkey: text(SETTING_MANUAL_CAPTURE_HOTKEY),
+            overlay_hotkey: text(SETTING_OVERLAY_HOTKEY),
+            overlay_mode_hotkey: text(SETTING_OVERLAY_MODE_HOTKEY),
+        }
+    }
+
+    fn load(db_path: &Path) -> Option<Self> {
+        load_setting_rows(db_path).map(|rows| Self::from_rows(&rows))
+    }
+
+    fn manual_capture_hotkey_option(&self) -> Option<String> {
+        if self.manual_capture_hotkey.is_empty() {
+            None
+        } else {
+            Some(self.manual_capture_hotkey.clone())
         }
     }
 }
@@ -573,22 +773,20 @@ struct Controller {
 
 impl Controller {
     fn new(config: DaemonConfig) -> Result<Self> {
-        let initial_interval = config.interval_seconds;
-        let initial_capture_after_source_ready = config.capture_after_source_ready;
-        let initial_ocr_max_side = config.ocr_max_side;
+        let settings = DaemonSettings::load(&config.db_path).unwrap_or_default();
         Ok(Self {
             runtime: Runtime::new().context("failed to create tokio runtime")?,
             config,
-            interval_seconds: Arc::new(AtomicU64::new(initial_interval)),
+            interval_seconds: Arc::new(AtomicU64::new(settings.interval_seconds)),
             capture_after_source_ready: Arc::new(AtomicBool::new(
-                initial_capture_after_source_ready,
+                settings.capture_after_source_ready,
             )),
-            ocr_max_side: Arc::new(AtomicU64::new(initial_ocr_max_side)),
+            ocr_max_side: Arc::new(AtomicU64::new(settings.ocr_max_side)),
             state: Arc::new(Mutex::new(SharedState {
                 state: ServiceState::Idle,
                 worker_child: None,
                 worker_mode: None,
-                debug_enabled: false,
+                debug_enabled: settings.debug_log,
                 capture_in_progress: false,
                 next_capture_at: None,
                 pending_manual_capture: false,
@@ -596,7 +794,7 @@ impl Controller {
             })),
             stop_flag: Arc::new(AtomicBool::new(false)),
             pause_flag: Arc::new(AtomicBool::new(false)),
-            debug_flag: Arc::new(AtomicBool::new(false)),
+            debug_flag: Arc::new(AtomicBool::new(settings.debug_log)),
             web_child: Arc::new(Mutex::new(None)),
             web_stop_flag: Arc::new(AtomicBool::new(false)),
             overlay_child: Arc::new(Mutex::new(None)),
@@ -716,12 +914,41 @@ impl Controller {
         self.debug_flag.load(Ordering::Relaxed)
     }
 
-    fn toggle_debug(&self) {
-        let enabled = !self.debug_flag.load(Ordering::Relaxed);
+    fn set_debug(&self, enabled: bool) {
         self.debug_flag.store(enabled, Ordering::Relaxed);
         self.state.lock().unwrap().debug_enabled = enabled;
         let mode = if enabled { "enabled" } else { "disabled" };
         self.append_log(&format!("debug mode {mode}"));
+    }
+
+    /// A tray choice: store the setting, then apply it like any other change.
+    fn change_setting(&self, key: &str, value: &str) {
+        if let Err(error) = store_setting(&self.config.db_path, key, value) {
+            self.append_log(&format!("failed to store setting {key}={value}: {error}"));
+            return;
+        }
+        self.sync_settings();
+    }
+
+    /// Bring the running service in line with the `settings` table. Called
+    /// after a tray choice and every few seconds, so changes made from the web
+    /// UI or the CLI apply too. An unreadable database changes nothing.
+    fn sync_settings(&self) {
+        let Some(settings) = DaemonSettings::load(&self.config.db_path) else {
+            return;
+        };
+        if settings.interval_seconds != self.current_interval_seconds() {
+            self.set_interval_seconds(settings.interval_seconds);
+        }
+        if settings.capture_after_source_ready != self.capture_after_source_ready_enabled() {
+            self.set_capture_after_source_ready(settings.capture_after_source_ready);
+        }
+        if settings.ocr_max_side != self.current_ocr_max_side() {
+            self.set_ocr_max_side(settings.ocr_max_side);
+        }
+        if settings.debug_log != self.debug_enabled() {
+            self.set_debug(settings.debug_log);
+        }
     }
 
     fn start(&self, proxy: EventLoopProxy<UserEvent>) {
@@ -756,6 +983,17 @@ impl Controller {
             self.append_log("automatic OCR worker disabled; capture jobs will stay pending until processed manually");
         }
         self.spawn_capture_loop(proxy, CaptureLoopMode::Continuous);
+    }
+
+    /// The automatic start only takes an idle service: if the capture was
+    /// started, paused or stopped by hand during the delay, that choice stands.
+    fn auto_start(&self, proxy: EventLoopProxy<UserEvent>) {
+        if self.state() != ServiceState::Idle {
+            self.append_log("automatic capture start skipped: the service was already handled");
+            return;
+        }
+        self.append_log("automatic capture start");
+        self.start(proxy);
     }
 
     fn pause(&self) {
@@ -886,7 +1124,7 @@ impl Controller {
         self.stop_overlay();
     }
 
-    /// Keeps `translate_overlay.py` running while the state file says it is enabled.
+    /// Keeps `translate_overlay.py` running while the `overlay.enabled` setting is on.
     ///
     /// The overlay owns its hotkeys and its window; the daemon only starts it,
     /// restarts it when it dies (with the web server's backoff) and stops it
@@ -910,13 +1148,17 @@ impl Controller {
             let mut consecutive_failures: u32 = 0;
             let mut started_at: Option<Instant> = None;
             let mut next_attempt_at = Instant::now();
+            let mut enabled = OverlayState::default().enabled;
             loop {
                 {
                     let mut guard = child_slot.lock().unwrap();
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    let enabled = load_overlay_state(&config.overlay_state_path).enabled;
+                    // An unreadable database keeps the overlay as it is.
+                    if let Some(state) = load_overlay_state(&config.db_path) {
+                        enabled = state.enabled;
+                    }
                     if !enabled {
                         if let Some(mut child) = guard.take() {
                             kill_process_tree(&mut child);
@@ -996,10 +1238,13 @@ impl Controller {
         }
     }
 
-    fn update_overlay_state(&self, change: impl FnOnce(&mut OverlayFileState)) {
-        let mut state = load_overlay_state(&self.config.overlay_state_path);
+    fn update_overlay_state(&self, change: impl FnOnce(&mut OverlayState)) {
+        let Some(mut state) = load_overlay_state(&self.config.db_path) else {
+            self.append_log("overlay state not changed: the database could not be read");
+            return;
+        };
         change(&mut state);
-        match save_overlay_state(&self.config.overlay_state_path, &state) {
+        match save_overlay_state(&self.config.db_path, &state) {
             Ok(()) => self.append_log(&format!(
                 "reading overlay enabled={} mode={} languages={}",
                 state.enabled, state.mode, state.languages
@@ -1009,10 +1254,15 @@ impl Controller {
     }
 
     fn open_overlay_log(&self) {
-        let log_path = self.config.overlay_log_path.clone();
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", log_path.to_string_lossy().as_ref()])
-            .spawn();
+        self.open_text_file(&self.config.overlay_log_path);
+    }
+
+    /// Opens a log in Notepad. `.log` often has no file association on Windows, so
+    /// `start <file>` fails silently; naming the viewer always works.
+    fn open_text_file(&self, path: &Path) {
+        if let Err(error) = Command::new("notepad.exe").arg(path).spawn() {
+            self.append_log(&format!("failed to open {}: {error}", path.display()));
+        }
     }
 
     fn open_catalog(&self) {
@@ -1023,6 +1273,11 @@ impl Controller {
     fn open_capture_settings(&self) {
         let config = self.config.clone();
         std::thread::spawn(move || open_url_when_ready(&config, &config.capture_settings_url()));
+    }
+
+    fn open_settings(&self) {
+        let config = self.config.clone();
+        std::thread::spawn(move || open_url_when_ready(&config, &config.settings_url()));
     }
 
     /// Flips one language's capture flag in the database (the worker reads it per job).
@@ -1184,18 +1439,19 @@ impl Controller {
     }
 
     fn open_logs(&self) {
-        let log_path = self.config.log_path.clone();
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", log_path.to_string_lossy().as_ref()])
-            .spawn();
+        self.open_text_file(&self.config.log_path);
     }
 
     fn tail_logs(&self) {
         let escaped = self.config.log_path.to_string_lossy().replace('\'', "''");
         let command = format!("Get-Content -Path '{}' -Tail 80 -Wait", escaped);
-        let _ = Command::new("powershell")
+        if let Err(error) = Command::new("powershell")
             .args(["-NoExit", "-Command", &command])
-            .spawn();
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+        {
+            self.append_log(&format!("failed to tail logs: {error}"));
+        }
     }
 
     fn append_log(&self, message: &str) {
@@ -1222,18 +1478,14 @@ impl Controller {
         command.arg(&self.config.worker_script);
         command.arg("--db");
         command.arg(&self.config.db_path);
-        command.env(
-            "LANG_JP_OCR_MAX_SIDE",
-            self.current_ocr_max_side().to_string(),
-        );
+        // The OCR size and the debug log are settings the worker reads from the
+        // database for every job; passing them as environment variables would
+        // pin them and lock those rows on the settings page.
         command.arg(match mode {
             WorkerLaunchMode::Loop => "loop",
             WorkerLaunchMode::Once => "once",
             WorkerLaunchMode::Drain => "drain",
         });
-        if self.debug_enabled() {
-            command.env("LANG_JP_CAPTURE_DEBUG", "1");
-        }
         // Send worker tracebacks to the daemon log; otherwise a crash only shows up
         // as "exited ... exit code: 1" with no reason.
         command.env("PYTHONIOENCODING", "utf-8");
@@ -1729,7 +1981,7 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     menu_languages: Vec<CaptureLanguage>,
     menu_skip_rules: Vec<SkipRule>,
-    menu_overlay: OverlayFileState,
+    menu_overlay: OverlayState,
     tick_count: u64,
 }
 
@@ -2003,36 +2255,21 @@ fn capture_languages_menu(languages: &[CaptureLanguage]) -> MenuBuilder<UserEven
     menu
 }
 
-/// `data/translate_overlay.toml`, shared with `translate_overlay.py`: the tray
-/// writes it, the overlay reads it on every press and writes the mode when its
-/// mode hotkey cycles it and the label size when it is zoomed.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-struct OverlayFileState {
-    #[serde(default = "default_overlay_mode")]
+/// The `overlay.*` settings, shared with `translate_overlay.py`: the tray
+/// writes them, the overlay reads them on every press and writes the mode when
+/// its mode hotkey cycles it. The label size (`overlay.scale`) is the overlay's
+/// own; the tray never touches it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverlayState {
     mode: String,
-    #[serde(default = "default_overlay_languages")]
     languages: String,
-    #[serde(default = "default_true")]
     enabled: bool,
-    /// Label size set from the overlay (Ctrl+wheel, Ctrl+=/-); the tray only
-    /// carries it through when it rewrites the file.
-    #[serde(default = "default_overlay_scale")]
-    scale: f64,
 }
 
-impl Default for OverlayFileState {
+impl Default for OverlayState {
     fn default() -> Self {
-        Self {
-            mode: default_overlay_mode(),
-            languages: default_overlay_languages(),
-            enabled: true,
-            scale: default_overlay_scale(),
-        }
+        Self::from_rows(&HashMap::new())
     }
-}
-
-fn default_overlay_scale() -> f64 {
-    1.0
 }
 
 const OVERLAY_MODES: [(&str, &str); 3] = [
@@ -2041,35 +2278,34 @@ const OVERLAY_MODES: [(&str, &str); 3] = [
     ("words", "Word by word (gloss under each word)"),
 ];
 
-fn default_overlay_mode() -> String {
-    "translation".to_string()
+impl OverlayState {
+    /// Values the overlay would not accept read as their default.
+    fn from_rows(rows: &HashMap<String, String>) -> Self {
+        let mut mode = setting_text(rows, SETTING_OVERLAY_MODE);
+        if !OVERLAY_MODES.iter().any(|(candidate, _)| *candidate == mode) {
+            mode = setting_default(SETTING_OVERLAY_MODE).to_string();
+        }
+        let mut languages = setting_text(rows, SETTING_OVERLAY_LANGUAGES);
+        if languages != "ja" && languages != "capture" {
+            languages = setting_default(SETTING_OVERLAY_LANGUAGES).to_string();
+        }
+        Self {
+            mode,
+            languages,
+            enabled: setting_flag(rows, SETTING_OVERLAY_ENABLED),
+        }
+    }
 }
 
-fn default_overlay_languages() -> String {
-    "ja".to_string()
+/// `None` when the database could not be read; the caller keeps what it has.
+fn load_overlay_state(db_path: &Path) -> Option<OverlayState> {
+    load_setting_rows(db_path).map(|rows| OverlayState::from_rows(&rows))
 }
 
-fn load_overlay_state(path: &Path) -> OverlayFileState {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return OverlayFileState::default();
-    };
-    let mut state: OverlayFileState = toml::from_str(&raw).unwrap_or_default();
-    if !OVERLAY_MODES.iter().any(|(mode, _)| *mode == state.mode) {
-        state.mode = default_overlay_mode();
-    }
-    if state.languages != "ja" && state.languages != "capture" {
-        state.languages = default_overlay_languages();
-    }
-    state
-}
-
-fn save_overlay_state(path: &Path, state: &OverlayFileState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, toml::to_string(state)?)?;
-    fs::rename(&temp, path)?;
+fn save_overlay_state(db_path: &Path, state: &OverlayState) -> Result<()> {
+    store_setting(db_path, SETTING_OVERLAY_MODE, &state.mode)?;
+    store_setting(db_path, SETTING_OVERLAY_LANGUAGES, &state.languages)?;
+    store_setting(db_path, SETTING_OVERLAY_ENABLED, setting_flag_text(state.enabled))?;
     Ok(())
 }
 
@@ -2082,7 +2318,7 @@ fn overlay_hotkeys_clash(config: &DaemonConfig) -> bool {
         .unwrap_or(false)
 }
 
-fn overlay_submenu_label(config: &DaemonConfig, overlay: &OverlayFileState) -> String {
+fn overlay_submenu_label(config: &DaemonConfig, overlay: &OverlayState) -> String {
     if overlay.enabled {
         format!("Reading overlay [{}]", config.overlay_hotkey)
     } else {
@@ -2090,7 +2326,7 @@ fn overlay_submenu_label(config: &DaemonConfig, overlay: &OverlayFileState) -> S
     }
 }
 
-fn overlay_menu(config: &DaemonConfig, overlay: &OverlayFileState) -> MenuBuilder<UserEvent> {
+fn overlay_menu(config: &DaemonConfig, overlay: &OverlayState) -> MenuBuilder<UserEvent> {
     let mut menu = MenuBuilder::new()
         .checkable(
             &format!("Enabled (show/hide: {})", config.overlay_hotkey),
@@ -2132,8 +2368,6 @@ fn overlay_command(config: &DaemonConfig) -> Command {
         .arg(&config.overlay_script)
         .arg("--db")
         .arg(&config.db_path)
-        .arg("--state")
-        .arg(&config.overlay_state_path)
         .arg("--hotkey")
         .arg(&config.overlay_hotkey)
         .arg("--mode-hotkey")
@@ -2183,8 +2417,9 @@ impl App {
     fn refresh_menu(&mut self, force: bool) {
         let languages = load_capture_languages(&self.controller.config.db_path);
         let skip_rules = load_skip_rules(&self.controller.config.db_path);
-        // The mode hotkey changes the overlay state too; pick that up here.
-        let overlay = load_overlay_state(&self.controller.config.overlay_state_path);
+        // The mode hotkey and the web UI change the overlay state too; pick that up here.
+        let overlay = load_overlay_state(&self.controller.config.db_path)
+            .unwrap_or_else(|| self.menu_overlay.clone());
         if !force
             && languages == self.menu_languages
             && skip_rules == self.menu_skip_rules
@@ -2240,17 +2475,22 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Start => self.controller.start(self.proxy.clone()),
+            UserEvent::AutoStart => self.controller.auto_start(self.proxy.clone()),
             UserEvent::Pause => self.controller.pause(),
             UserEvent::Resume => self.controller.resume(self.proxy.clone()),
             UserEvent::CaptureNow => self.controller.capture_now(self.proxy.clone()),
-            UserEvent::SetCadenceFixedInterval => {
-                self.controller.set_capture_after_source_ready(false)
-            }
-            UserEvent::SetCadenceAfterSourceReady => {
-                self.controller.set_capture_after_source_ready(true)
-            }
-            UserEvent::SetInterval(seconds) => self.controller.set_interval_seconds(seconds),
-            UserEvent::SetOcrMaxSide(value) => self.controller.set_ocr_max_side(value),
+            UserEvent::SetCadenceFixedInterval => self
+                .controller
+                .change_setting(SETTING_AFTER_SOURCE_READY, setting_flag_text(false)),
+            UserEvent::SetCadenceAfterSourceReady => self
+                .controller
+                .change_setting(SETTING_AFTER_SOURCE_READY, setting_flag_text(true)),
+            UserEvent::SetInterval(seconds) => self
+                .controller
+                .change_setting(SETTING_INTERVAL_SECONDS, &seconds.to_string()),
+            UserEvent::SetOcrMaxSide(value) => self
+                .controller
+                .change_setting(SETTING_OCR_MAX_SIDE, &value.to_string()),
             UserEvent::ProcessNextJob => self.controller.process_next_job(),
             UserEvent::ProcessPendingQueue => self.controller.process_pending_queue(),
             UserEvent::AutoProcessNextJob => self.controller.auto_process_next_job(),
@@ -2268,13 +2508,18 @@ impl ApplicationHandler<UserEvent> for App {
                 self.tick_count = self.tick_count.wrapping_add(1);
                 if self.tick_count % MENU_REFRESH_TICKS == 0 {
                     self.refresh_menu(false);
+                    self.controller.sync_settings();
                 }
             }
             UserEvent::OpenLogs => self.controller.open_logs(),
             UserEvent::TailLogs => self.controller.tail_logs(),
-            UserEvent::ToggleDebug => self.controller.toggle_debug(),
+            UserEvent::ToggleDebug => self.controller.change_setting(
+                SETTING_DEBUG_LOG,
+                setting_flag_text(!self.controller.debug_enabled()),
+            ),
             UserEvent::OpenCatalog => self.controller.open_catalog(),
             UserEvent::OpenCaptureSettings => self.controller.open_capture_settings(),
+            UserEvent::OpenSettings => self.controller.open_settings(),
             UserEvent::ToggleCaptureLanguage(code) => {
                 self.controller.toggle_capture_language(&code);
                 self.refresh_menu(true);
@@ -2344,10 +2589,11 @@ fn build_tray_menu(
     config: &DaemonConfig,
     languages: &[CaptureLanguage],
     skip_rules: &[SkipRule],
-    overlay: &OverlayFileState,
+    overlay: &OverlayState,
 ) -> MenuBuilder<UserEvent> {
     MenuBuilder::new()
         .item("Open Lang", UserEvent::OpenCatalog)
+        .item("Open settings (web)", UserEvent::OpenSettings)
         .submenu(&overlay_submenu_label(config, overlay), overlay_menu(config, overlay))
         .submenu("Capture languages", capture_languages_menu(languages))
         .submenu("Skip windows", skip_windows_menu(skip_rules))
@@ -2396,7 +2642,7 @@ fn build_tray_icon(
     config: &DaemonConfig,
     languages: &[CaptureLanguage],
     skip_rules: &[SkipRule],
-    overlay: &OverlayFileState,
+    overlay: &OverlayState,
 ) -> Result<TrayIcon<UserEvent>> {
     let icon = Icon::from_buffer(build_tray_icon_ico(), Some(16), Some(16))
         .map_err(|error| anyhow!("failed to create tray icon: {error}"))?;
@@ -2966,6 +3212,21 @@ impl LaunchOptions {
     }
 }
 
+/// Schedules the automatic capture start when `capture.autostart` is on. Read
+/// once here, so a change applies the next time the daemon opens, whether from
+/// open_lang.cmd, the shortcut or the logon task.
+fn spawn_capture_autostart(config: &DaemonConfig, proxy: EventLoopProxy<UserEvent>) {
+    let settings = DaemonSettings::load(&config.db_path).unwrap_or_default();
+    if !settings.autostart {
+        return;
+    }
+    let delay = Duration::from_secs(settings.autostart_delay_seconds);
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let _ = proxy.send_event(UserEvent::AutoStart);
+    });
+}
+
 fn main() -> Result<()> {
     let options = LaunchOptions::from_args(std::env::args().skip(1));
     let config = DaemonConfig::load();
@@ -2986,6 +3247,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     spawn_manual_capture_hotkey_listener(&tray_config, proxy.clone());
+    spawn_capture_autostart(&tray_config, proxy.clone());
     {
         let tick_proxy = proxy.clone();
         std::thread::spawn(move || {
@@ -2997,7 +3259,7 @@ fn main() -> Result<()> {
     }
     let menu_languages = load_capture_languages(&tray_config.db_path);
     let menu_skip_rules = load_skip_rules(&tray_config.db_path);
-    let menu_overlay = load_overlay_state(&tray_config.overlay_state_path);
+    let menu_overlay = load_overlay_state(&tray_config.db_path).unwrap_or_default();
     let tray_icon = build_tray_icon(
         proxy.clone(),
         &tray_config,
@@ -3076,18 +3338,23 @@ mod tests {
 
     #[test]
     fn daemon_config_from_toml_accepts_partial_overrides() {
-        let config = DaemonConfig::from_toml(
-            r#"
+        let raw = r#"
 manual_capture_hotkey = "Alt+Q"
 interval_seconds = 15
-"#,
-        )
-        .expect("partial config should parse");
+dedupe_window = 3
+"#;
+        let config = DaemonConfig::from_toml(raw).expect("partial config should parse");
 
-        assert_eq!(config.manual_capture_hotkey.as_deref(), Some("Alt+Q"));
-        assert_eq!(config.interval_seconds, 15);
-        assert_eq!(config.ocr_max_side, default_ocr_max_side());
-        assert_eq!(config.dedupe_window, 12);
+        // Keys that became settings are ignored (and reported), not applied.
+        assert_eq!(config.manual_capture_hotkey, None);
+        assert_eq!(
+            moved_toml_keys(raw),
+            vec![
+                ("interval_seconds", SETTING_INTERVAL_SECONDS),
+                ("manual_capture_hotkey", SETTING_MANUAL_CAPTURE_HOTKEY),
+            ]
+        );
+        assert_eq!(config.dedupe_window, 3);
         assert!(config.web_server_enabled);
         assert_eq!(config.web_port, DEFAULT_WEB_PORT);
         assert_eq!(config.web_python_executable, None);
@@ -3128,53 +3395,113 @@ web_log_path = "data/web.log"
         assert_eq!(config.overlay_hotkey, "Ctrl+Alt+Q");
         assert_eq!(config.overlay_mode_hotkey, "Ctrl+Alt+W");
         assert_eq!(config.overlay_script, jp_root().join("translate_overlay.py"));
-        assert_eq!(config.overlay_state_path, jp_root().join("data").join("translate_overlay.toml"));
 
         let config = DaemonConfig::from_toml(
             r#"
-overlay_hotkey = "Ctrl+Shift+F9"
-overlay_mode_hotkey = ""
-overlay_state_path = "data/overlay.toml"
+overlay_script = "tools/overlay.py"
 "#,
         )
         .expect("overlay config should parse");
+        assert_eq!(config.overlay_script, jp_root().join("tools/overlay.py"));
+
+        // The hotkeys come from the settings table.
+        let mut rows = HashMap::new();
+        rows.insert(SETTING_OVERLAY_HOTKEY.to_string(), "Ctrl+Shift+F9".to_string());
+        rows.insert(SETTING_OVERLAY_MODE_HOTKEY.to_string(), "".to_string());
+        rows.insert(SETTING_MANUAL_CAPTURE_HOTKEY.to_string(), " Alt+Q ".to_string());
+        let config = config.with_hotkeys(&DaemonSettings::from_rows(&rows));
         assert_eq!(config.overlay_hotkey, "Ctrl+Shift+F9");
         assert_eq!(config.overlay_mode_hotkey, "");
-        assert_eq!(config.overlay_state_path, jp_root().join("data/overlay.toml"));
+        assert_eq!(config.manual_capture_hotkey.as_deref(), Some("Alt+Q"));
+    }
+
+    #[test]
+    fn daemon_settings_default_parse_and_fall_back() {
+        let defaults = DaemonSettings::default();
+        assert_eq!(defaults.interval_seconds, 60);
+        assert!(!defaults.capture_after_source_ready);
+        assert_eq!(defaults.ocr_max_side, 1600);
+        assert!(!defaults.debug_log);
+        assert!(defaults.autostart);
+        assert_eq!(defaults.autostart_delay_seconds, 20);
+        assert_eq!(defaults.manual_capture_hotkey_option(), None);
+
+        let mut rows = HashMap::new();
+        rows.insert(SETTING_INTERVAL_SECONDS.to_string(), "15".to_string());
+        rows.insert(SETTING_AFTER_SOURCE_READY.to_string(), "1".to_string());
+        rows.insert(SETTING_OCR_MAX_SIDE.to_string(), "0".to_string());
+        rows.insert(SETTING_DEBUG_LOG.to_string(), "garbage".to_string());
+        rows.insert(SETTING_AUTOSTART.to_string(), "0".to_string());
+        rows.insert(SETTING_AUTOSTART_DELAY_SECONDS.to_string(), "0".to_string());
+        let settings = DaemonSettings::from_rows(&rows);
+        assert!(!settings.autostart);
+        assert_eq!(settings.autostart_delay_seconds, 0);
+        assert_eq!(settings.interval_seconds, 15);
+        assert!(settings.capture_after_source_ready);
+        assert_eq!(settings.ocr_max_side, 0);
+        assert!(!settings.debug_log);
+
+        rows.insert(SETTING_INTERVAL_SECONDS.to_string(), "soon".to_string());
+        assert_eq!(DaemonSettings::from_rows(&rows).interval_seconds, 60);
+        rows.insert(SETTING_INTERVAL_SECONDS.to_string(), "0".to_string());
+        assert_eq!(DaemonSettings::from_rows(&rows).interval_seconds, 1);
+    }
+
+    #[test]
+    fn store_setting_keeps_only_overrides() {
+        let dir = std::env::temp_dir().join(format!("daemon-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("settings.sqlite3");
+        let _ = std::fs::remove_file(&db);
+        // No table yet: everything is at its default.
+        assert_eq!(DaemonSettings::load(&db), Some(DaemonSettings::default()));
+
+        store_setting(&db, SETTING_OCR_MAX_SIDE, "1920").unwrap();
+        store_setting(&db, SETTING_DEBUG_LOG, setting_flag_text(true)).unwrap();
+        let settings = DaemonSettings::load(&db).unwrap();
+        assert_eq!(settings.ocr_max_side, 1920);
+        assert!(settings.debug_log);
+        assert_eq!(load_setting_rows(&db).unwrap().len(), 2);
+
+        store_setting(&db, SETTING_OCR_MAX_SIDE, "1600").unwrap();
+        store_setting(&db, SETTING_DEBUG_LOG, setting_flag_text(false)).unwrap();
+        assert!(load_setting_rows(&db).unwrap().is_empty());
+        assert_eq!(DaemonSettings::load(&db), Some(DaemonSettings::default()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn overlay_state_round_trips_and_repairs_bad_values() {
-        let temp = std::env::temp_dir().join(format!("overlay-state-{}", std::process::id()));
-        let path = temp.join("translate_overlay.toml");
-        assert_eq!(load_overlay_state(&path), OverlayFileState::default());
+        let dir = std::env::temp_dir().join(format!("overlay-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("overlay.sqlite3");
+        let _ = std::fs::remove_file(&db);
+        assert_eq!(load_overlay_state(&db), Some(OverlayState::default()));
+        assert_eq!(OverlayState::default().mode, "translation");
+        assert_eq!(OverlayState::default().languages, "ja");
+        assert!(OverlayState::default().enabled);
 
-        let state = OverlayFileState {
+        let state = OverlayState {
             mode: "words".to_string(),
             languages: "capture".to_string(),
             enabled: false,
-            scale: 1.5,
         };
-        save_overlay_state(&path, &state).expect("save");
-        assert_eq!(load_overlay_state(&path), state);
+        save_overlay_state(&db, &state).expect("save");
+        assert_eq!(load_overlay_state(&db), Some(state));
 
-        // The Python side writes the same keys; the tray keeps the label scale it set.
-        fs::write(&path, "mode = \"furigana\"\nlanguages = \"ja\"\nenabled = true\nscale = 1.32\n").unwrap();
-        let mut from_python = load_overlay_state(&path);
-        assert_eq!(from_python.mode, "furigana");
-        from_python.enabled = false;
-        save_overlay_state(&path, &from_python).expect("save");
-        assert_eq!(load_overlay_state(&path).scale, 1.32);
-        // Older files without a scale read as 1.0.
-        fs::write(&path, "mode = \"words\"\n").unwrap();
-        assert_eq!(load_overlay_state(&path).scale, 1.0);
+        // The overlay keeps its label size in the same table; the tray leaves it alone.
+        store_setting(&db, "overlay.scale", "1.32").unwrap();
+        save_overlay_state(&db, &OverlayState::default()).expect("save");
+        let rows = load_setting_rows(&db).unwrap();
+        assert_eq!(rows.get("overlay.scale").map(String::as_str), Some("1.32"));
+        assert_eq!(rows.len(), 1);
 
-        fs::write(&path, "mode = \"bogus\"\nlanguages = \"xx\"\n").unwrap();
-        let repaired = load_overlay_state(&path);
-        assert_eq!(repaired.mode, "translation");
-        assert_eq!(repaired.languages, "ja");
-        assert!(repaired.enabled);
-        let _ = fs::remove_dir_all(&temp);
+        let mut rows = HashMap::new();
+        rows.insert(SETTING_OVERLAY_MODE.to_string(), "bogus".to_string());
+        rows.insert(SETTING_OVERLAY_LANGUAGES.to_string(), "xx".to_string());
+        rows.insert(SETTING_OVERLAY_ENABLED.to_string(), "maybe".to_string());
+        assert_eq!(OverlayState::from_rows(&rows), OverlayState::default());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3199,12 +3526,11 @@ overlay_state_path = "data/overlay.toml"
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        let tail = &args[args.len() - 9..];
+        let tail = &args[args.len() - 7..];
         assert_eq!(tail[0], config.overlay_script.to_string_lossy());
         assert_eq!(tail[1], "--db");
-        assert_eq!(tail[3], "--state");
-        assert_eq!(tail[4], config.overlay_state_path.to_string_lossy());
-        assert_eq!(&tail[5..], ["--hotkey", "Ctrl+Alt+Q", "--mode-hotkey", "Ctrl+Alt+W"]);
+        assert_eq!(tail[2], config.db_path.to_string_lossy());
+        assert_eq!(&tail[3..], ["--hotkey", "Ctrl+Alt+Q", "--mode-hotkey", "Ctrl+Alt+W"]);
     }
 
     #[test]
@@ -3214,6 +3540,7 @@ overlay_state_path = "data/overlay.toml"
         assert!(!config.record_foreground_window);
         assert!(DaemonConfig::default().record_foreground_window);
         assert_eq!(config.capture_settings_url(), "http://127.0.0.1:8766/capture");
+        assert_eq!(config.settings_url(), "http://127.0.0.1:8766/settings");
     }
 
     #[test]

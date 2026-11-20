@@ -16,14 +16,21 @@ import time
 import unicodedata
 import webbrowser
 from collections.abc import Callable, Iterable
+from contextlib import closing
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
+import catalog_changes
+import knowledge
 import lang_jp
 import languages
+import settings as app_settings
+import web_knowledge
+import web_settings
+from catalog_changes import Watch
 from lang_jp import (
     ensure_runtime_schema,
     ensure_source_image_dimensions,
@@ -39,6 +46,8 @@ from languages import (
     normalize_language_code,
 )
 from ocr_backends import plan_ocr_engines
+from settings import Settings, load_settings
+from web_views import LiveRegions, PageView, fragments_payload
 
 
 ROOT = Path(__file__).resolve().parent
@@ -678,10 +687,341 @@ PAGE_STYLE = """
     to { transform: translateX(100%); }
   }
 
+  /* Live regions wrap parts of a page the live updater swaps in place; the
+     wrapper takes no box of its own, so the grid layout is unchanged. */
+  .live-region { display: contents; }
+
+  @keyframes live-region-arrived {
+    from { box-shadow: 0 0 0 3px rgba(91, 140, 115, 0.55); }
+    to { box-shadow: 0 0 0 3px rgba(91, 140, 115, 0); }
+  }
+
+  .live-region.is-updated > * {
+    animation: live-region-arrived 1.6s ease-out;
+    border-radius: 12px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .live-region.is-updated > * { animation: none; }
+  }
+
+  /* Settings page: one form per section, a row per setting. */
+  .section-index {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .section-index .muted { margin-left: auto; font-size: 0.92rem; }
+  .settings-section { scroll-margin-top: 16px; }
+  .setting-summary { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 4px; }
+  .setting-summary .chip { min-height: 26px; font-size: 0.82rem; font-weight: 600; }
+
+  .setting-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(190px, 280px);
+    gap: 16px;
+    align-items: center;
+    padding: 12px 0;
+    border-bottom: 1px solid rgba(215, 195, 161, 0.7);
+  }
+
+  .setting-label { font-weight: 600; }
+  .setting-chips .chip { min-height: 22px; padding: 0 8px; margin-left: 6px; font-size: 0.76rem; }
+  .chip.is-cool { background: rgba(51, 92, 103, 0.14); color: #27474f; }
+  .chip.knowledge-chip { min-height: 24px; font-size: 0.8rem; }
+  .chip.knowledge-unknown { background: rgba(90, 90, 90, 0.1); color: #5c5c5c; }
+  .chip.knowledge-learning { background: rgba(196, 121, 0, 0.16); color: #7a4b00; }
+  .chip.knowledge-young { background: rgba(51, 92, 103, 0.14); color: #27474f; }
+  .chip.knowledge-mature { background: rgba(46, 125, 50, 0.16); color: #1f5a23; }
+  .chip.knowledge-known { background: rgba(46, 125, 50, 0.3); color: #174a1b; }
+  .knowledge-panel .chips { margin-bottom: 12px; }
+  .knowledge-panel form.inline-action { margin-top: 12px; }
+  .panel .setting-help { margin: 4px 0 0; font-size: 0.9rem; line-height: 1.45; }
+
+  .setting-control input[type="number"],
+  .setting-control input[type="text"],
+  .setting-control select {
+    width: 100%;
+    min-height: 38px;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(51, 92, 103, 0.24);
+    background: rgba(255, 253, 249, 0.9);
+    padding: 0 12px;
+  }
+
+  .setting-control.is-switch { text-align: right; }
+
+  .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+
+  .switch span {
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: rgba(95, 101, 95, 0.35);
+    transition: background 0.15s ease;
+    pointer-events: none;
+  }
+
+  .switch span::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: white;
+    transition: transform 0.15s ease;
+  }
+
+  .switch input:checked + span { background: var(--accent-cool); }
+  .switch input:checked + span::after { transform: translateX(20px); }
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .setting-lock {
+    padding: 8px 10px;
+    border-radius: var(--radius-md);
+    border: 1px dashed rgba(95, 101, 95, 0.5);
+    background: rgba(255, 252, 247, 0.8);
+    color: var(--muted);
+    font-size: 0.86rem;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  .setting-advanced summary {
+    padding: 12px 0;
+    color: var(--accent-cool);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .setting-advanced[open] summary { border-bottom: 1px solid rgba(215, 195, 161, 0.7); }
+
+  button.button-quiet {
+    border: 1px solid rgba(51, 92, 103, 0.16);
+    background: rgba(255, 252, 247, 0.92);
+    color: var(--accent-cool);
+    box-shadow: none;
+    font-weight: 600;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .switch span, .switch span::after { transition: none; }
+  }
+
   @media (max-width: 900px) {
     .panel-wide, .panel-side { grid-column: span 12; }
   }
+
+  @media (max-width: 700px) {
+    .setting-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+    .setting-control.is-switch { text-align: left; }
+  }
 </style>
+"""
+
+# The live updater. A page that watches catalog entities carries them in
+# <body data-live-watch data-live-revision>. The script polls /live/changes and,
+# when something it watches changed, fetches the same URL's live regions
+# (FRAGMENTS_MEDIA_TYPE) and swaps the ones whose hash differs. A region holding
+# the focused field, or any region while the Anki sync runs, waits until focus
+# leaves it; sort order and inner scroll of its tables survive the swap.
+LIVE_SCRIPT = """
+<script>
+  (() => {
+    const body = document.body;
+    let watch = body.dataset.liveWatch || "";
+    if (!watch) {
+      return;
+    }
+    const fragmentsType = "application/vnd.lang.fragments+json";
+    const baseDelayMs = 2500;
+    const maxDelayMs = 30000;
+    let revision = Number(body.dataset.liveRevision || "0");
+    let delayMs = baseDelayMs;
+    let timer = 0;
+    let inFlight = false;
+    let pending = null;
+
+    function catalogApi() {
+      return window.jpCatalog || {};
+    }
+
+    function syncingAnki() {
+      const api = catalogApi();
+      return typeof api.isSyncingAnki === "function" && api.isSyncingAnki();
+    }
+
+    function holdsFocus(region) {
+      const active = document.activeElement;
+      return Boolean(
+        active
+        && active !== document.body
+        && region.contains(active)
+        && active.matches("input, textarea, select, button, [contenteditable]")
+      );
+    }
+
+    function scrollBoxes(region) {
+      return Array.from(region.querySelectorAll("div")).filter(
+        (node) => node.style.overflow === "auto"
+      );
+    }
+
+    function swapRegion(region, next) {
+      const api = catalogApi();
+      const tables = Array.from(region.querySelectorAll("table.sortable-table"));
+      const sortStates = tables.map((table) =>
+        typeof api.readSortState === "function" ? api.readSortState(table) : null
+      );
+      const scrolls = scrollBoxes(region).map((node) => [node.scrollLeft, node.scrollTop]);
+      region.innerHTML = next.html;
+      region.dataset.liveHash = next.hash;
+      if (typeof api.initSortableTables === "function") {
+        api.initSortableTables(region);
+      }
+      const nextTables = Array.from(region.querySelectorAll("table.sortable-table"));
+      sortStates.forEach((state, index) => {
+        if (state && nextTables[index] && typeof api.applySortState === "function") {
+          api.applySortState(nextTables[index], state);
+        }
+      });
+      scrollBoxes(region).forEach((node, index) => {
+        if (scrolls[index]) {
+          [node.scrollLeft, node.scrollTop] = scrolls[index];
+        }
+      });
+      region.classList.remove("is-updated");
+      void region.offsetWidth;
+      region.classList.add("is-updated");
+    }
+
+    // Swaps what it can; returns false when some region has to wait.
+    function applyRegions(regions) {
+      const nodes = Array.from(document.querySelectorAll("[data-live-region]"));
+      const keys = nodes.map((node) => node.dataset.liveRegion);
+      if (keys.length !== Object.keys(regions).length || keys.some((key) => !(key in regions))) {
+        // The page's shape changed (a region came or went): only a reload fits.
+        if (!document.activeElement || document.activeElement === body) {
+          window.location.reload();
+        }
+        return false;
+      }
+      let complete = true;
+      nodes.forEach((node) => {
+        const next = regions[node.dataset.liveRegion];
+        if (next.hash === node.dataset.liveHash) {
+          return;
+        }
+        if (syncingAnki() || holdsFocus(node)) {
+          complete = false;
+          return;
+        }
+        swapRegion(node, next);
+      });
+      document.dispatchEvent(new Event("live-regions-swapped"));
+      return complete;
+    }
+
+    function applyPending() {
+      if (pending && applyRegions(pending)) {
+        pending = null;
+      }
+    }
+
+    async function fetchRegions() {
+      const response = await fetch(window.location.href, {
+        headers: { "Accept": fragmentsType },
+        cache: "no-store",
+      });
+      if (response.status === 404) {
+        // The entity this page shows is gone; the reload shows why.
+        window.location.reload();
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(`fragments ${response.status}`);
+      }
+      const payload = await response.json();
+      revision = Number(payload.revision || 0);
+      // A source page starts watching the terms linked to it since it rendered.
+      watch = payload.watch || watch;
+      pending = payload.regions || {};
+      applyPending();
+    }
+
+    async function poll() {
+      if (inFlight || document.hidden) {
+        return;
+      }
+      inFlight = true;
+      try {
+        applyPending();
+        const query = new URLSearchParams({ since: String(revision), watch });
+        const response = await fetch(`/live/changes?${query}`, {
+          headers: { "Accept": "application/json" },
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          throw new Error(`changes ${response.status}`);
+        }
+        const status = await response.json();
+        if (status.changed || status.reset) {
+          await fetchRegions();
+        } else {
+          // Nothing watched changed up to here, so later polls can start from it.
+          revision = Number(status.revision || revision);
+        }
+        delayMs = baseDelayMs;
+      } catch (_error) {
+        delayMs = Math.min(delayMs * 2, maxDelayMs);
+      } finally {
+        inFlight = false;
+        schedule(delayMs);
+      }
+    }
+
+    function schedule(ms) {
+      window.clearTimeout(timer);
+      if (!document.hidden) {
+        timer = window.setTimeout(poll, ms);
+      }
+    }
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        window.clearTimeout(timer);
+      } else {
+        schedule(0);
+      }
+    });
+    document.addEventListener("focusout", () => {
+      window.setTimeout(applyPending, 0);
+    });
+    schedule(baseDelayMs);
+
+    // Elapsed-time counters (the capture page's running job) tick between
+    // updates, which only arrive when the job enters a new stage.
+    function tickClocks() {
+      const now = Date.now();
+      document.querySelectorAll("[data-elapsed-since]").forEach((node) => {
+        const started = Date.parse(node.dataset.elapsedSince);
+        if (Number.isNaN(started)) {
+          return;
+        }
+        const seconds = Math.max(0, Math.round((now - started) / 1000));
+        node.textContent = seconds >= 60 ? `${Math.floor(seconds / 60)}min ${seconds % 60}s` : `${seconds}s`;
+      });
+    }
+    tickClocks();
+    window.setInterval(tickClocks, 1000);
+    document.addEventListener("live-regions-swapped", tickClocks);
+  })();
+</script>
 """
 
 PAGE_SCRIPT = """
@@ -1049,21 +1389,6 @@ def db_connect(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def database_revision_token(db_path: Path) -> str:
-    parts: list[str] = []
-    for candidate in (db_path, db_path.parent / f"{db_path.name}-wal"):
-        if not candidate.exists():
-            parts.append(f"{candidate.name}:missing")
-            continue
-        stat = candidate.stat()
-        parts.append(f"{candidate.name}:{stat.st_size}:{stat.st_mtime_ns}")
-    return "|".join(parts)
-
-
-def live_revision_payload(db_path: Path) -> dict[str, str]:
-    return {"revision": database_revision_token(db_path)}
-
-
 SYNC_JOB_TTL_SECONDS = 30 * 60
 SYNC_JOB_LOCK = threading.Lock()
 SYNC_JOB_STATES: dict[str, dict[str, object]] = {}
@@ -1148,8 +1473,12 @@ def sync_result_message(lines: list[str], fallback: str) -> str:
     )
 
 
-def sync_failure_message(lines: list[str], fallback: str) -> str:
+def last_output_line(lines: list[str], fallback: str) -> str:
     return lines[-1] if lines else fallback
+
+
+def sync_failure_message(lines: list[str], fallback: str) -> str:
+    return last_output_line(lines, fallback)
 
 
 def prune_sync_jobs(*, now: float | None = None) -> None:
@@ -1305,7 +1634,34 @@ def run_sync_anki_job(db_path: Path, job_id: str) -> None:
             return
 
         kanji_message = sync_result_message(kanji_lines, "Kanji sincronizados.")
-        final_message = f"{term_message} {kanji_message}"
+        advance_sync_job(
+            job_id,
+            progress=97,
+            step="sync_knowledge",
+            message=f"{kanji_message} Lendo o progresso de estudo...",
+        )
+        knowledge_returncode, knowledge_lines = stream_catalog_command_for_db(
+            db_path,
+            "sync-knowledge",
+        )
+        if knowledge_returncode != 0:
+            message = sync_failure_message(
+                knowledge_lines,
+                "Falha ao ler o progresso de estudo do Anki.",
+            )
+            advance_sync_job(
+                job_id,
+                progress=100,
+                status="failed",
+                step="failed",
+                message=message,
+                notice_message=message,
+                notice_level="error",
+            )
+            return
+
+        knowledge_message = last_output_line(knowledge_lines, "Progresso de estudo lido.")
+        final_message = f"{term_message} {kanji_message} {knowledge_message}"
         advance_sync_job(
             job_id,
             progress=100,
@@ -1977,7 +2333,15 @@ def layout(
     extra_scripts: str = "",
     lang: str = ALL_LANGUAGES_CODE,
     language_bar: str = "",
+    live_watch: Watch | None = None,
+    live_revision: int = 0,
 ) -> str:
+    live_attrs = (
+        f' data-live-watch="{html.escape(live_watch.encode(), quote=True)}"'
+        f' data-live-revision="{int(live_revision)}"'
+        if live_watch
+        else ""
+    )
     # Character pages only make sense for languages that have characters.
     show_kanji = language_has_characters(lang)
     nav = "".join(
@@ -1988,6 +2352,7 @@ def layout(
             nav_link("/sources", "Fontes", active_path, lang),
             nav_link("/flashcards", "Cards", active_path, lang),
             nav_link("/capture", "Captura", active_path),
+            nav_link("/settings", "Ajustes", active_path),
         )
     )
     return f"""<!doctype html>
@@ -1998,7 +2363,7 @@ def layout(
     <title>{html.escape(page_title(title))}</title>
     {PAGE_STYLE}
   </head>
-  <body>
+  <body{live_attrs}>
     <div class="shell">
       <section class="hero">
         <h1>Lang Catalog</h1>
@@ -2009,6 +2374,7 @@ def layout(
       {body}
     </div>
     {PAGE_SCRIPT}
+    {LIVE_SCRIPT if live_attrs else ""}
     {extra_scripts}
   </body>
 </html>
@@ -2102,7 +2468,7 @@ def sync_anki_action(*, next_path: str = "/") -> str:
           <input type="hidden" name="next" value="{safe_next}">
           <button type="submit" data-anki-sync-submit>Sincronizar com o Anki</button>
         </form>
-        <span class="muted">A acao sincroniza termos e kanji com o Anki, atualizando os decks e a prioridade dos cards novos.</span>
+        <span class="muted">A acao sincroniza termos e kanji com o Anki, atualizando os decks e a prioridade dos cards novos, e le de volta o seu progresso de estudo.</span>
       </div>
       <div
         class="anki-sync-progress"
@@ -2213,7 +2579,7 @@ def language_cards(
     return "".join(cards)
 
 
-def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) -> str:
+def dashboard_view(db_path: Path, params: dict[str, list[str]] | None = None) -> PageView:
     params = params or {}
     lang = current_language(params)
     lang_sql, lang_params = language_filter_clause("language_code", lang)
@@ -2422,17 +2788,20 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
         for row in language_rows
     ]
 
-    body = f"""
-    <div class="grid">
-      <section class="panel">
-        {notice_banner(params)}
+    live = LiveRegions()
+    stats_html = f"""
         <div class="stats">
           <div class="stat"><span class="label">Fontes</span><span class="value">{escape(stats["source_count"], "0")}</span></div>
           <div class="stat"><span class="label">Termos</span><span class="value">{escape(stats["term_count"], "0")}</span></div>
           {kanji_stat}
           <div class="stat"><span class="label">Ligacoes</span><span class="value">{escape(stats["link_count"], "0")}</span></div>
           <div class="stat"><span class="label">Cards pendentes</span><span class="value">{escape(stats["pending_flashcards"], "0")}</span></div>
-        </div>
+        </div>"""
+    body = f"""
+    <div class="grid">
+      <section class="panel">
+        {notice_banner(params)}
+        {live.region("stats", stats_html)}
         {sync_anki_action(next_path=language_href("/", lang))}
       </section>
 
@@ -2448,16 +2817,16 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
 
       <section class="panel panel-wide">
         <h2>Termos prioritarios</h2>
-        {table_html(term_headers, term_rows)}
+        {live.region("top-terms", table_html(term_headers, term_rows))}
       </section>
 
       <section class="panel panel-side">
         <h2>Idiomas</h2>
-        {table_html(["Idioma", "Termos", "Fontes", "Cards pendentes", "Deck"], language_table_rows)}
+        {live.region("languages", table_html(["Idioma", "Termos", "Fontes", "Cards pendentes", "Deck"], language_table_rows))}
         <p class="footer-note"><a href="/capture">Escolher quais idiomas a captura guarda</a></p>
       </section>
 
-      {language_cards_html}
+      {live.region("language-cards", language_cards_html)}
 
       <section class="panel panel-side">
         <h2>Acesso rapido</h2>
@@ -2472,28 +2841,59 @@ def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) ->
 
       <section class="panel panel-wide">
         <h2>Fontes recentes</h2>
-        {table_html(["ID", "Idioma", "Titulo", "Resolucao", "Cena", "Quando"], recent_source_rows)}
+        {live.region("recent-sources", table_html(["ID", "Idioma", "Titulo", "Resolucao", "Cena", "Quando"], recent_source_rows))}
       </section>
 
-      {kanji_panel}
+      {live.region("top-kanji", kanji_panel)}
 
       <section class="panel">
         <h2>Cards recentes</h2>
-        {table_html(["Termo", "Idioma", "Score", "Template", "Status", "Frente"], card_rows)}
+        {live.region("recent-cards", table_html(["Termo", "Idioma", "Score", "Template", "Status", "Frente"], card_rows))}
       </section>
     </div>
     """
-    return layout(
+    return PageView(
         title="Lang Catalog",
         body=body,
         active_path="/",
-        extra_scripts=auto_reload_script(db_path),
         lang=lang,
         language_bar=language_bar_html(db_path, active_path="/", lang=lang),
+        regions=live.regions,
+        watch=Watch.of("source", "term", "kanji", "flashcard", "language"),
     )
 
 
-def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
+def knowledge_panel(
+    connection: sqlite3.Connection,
+    item_kind: str,
+    item_id: int,
+    *,
+    next_path: str,
+) -> str:
+    status, score = knowledge.load_status(connection, item_kind, item_id)
+    return web_knowledge.panel_html(
+        item_kind=item_kind,
+        item_id=item_id,
+        status=status,
+        score=score,
+        evidence=knowledge.load_evidence(connection, item_kind, item_id),
+        next_path=next_path,
+        format_datetime=format_datetime_display,
+        render_table=table_html,
+    )
+
+
+def results_markup(summary_html: str, pagination_markup: str, table_markup: str) -> str:
+    """A listing's live part: the count, the pager and the table, swapped together."""
+    return f"""
+        <div class="results-toolbar">
+          <p class="results-summary">{summary_html}</p>
+          {pagination_markup}
+        </div>
+        {table_markup}"""
+
+
+def terms_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
     q = first_value(params, "q")
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
@@ -2515,6 +2915,11 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         search_sql, search_params = folded_like_filter(("lemma", "reading", "meaning_pt"), q)
         filters.append(search_sql)
         sql_params.extend(search_params)
+    knowledge_status = web_knowledge.filter_value(first_value(params, web_knowledge.FILTER_PARAM))
+    knowledge_sql, knowledge_params = web_knowledge.filter_clause(knowledge_status)
+    if knowledge_sql:
+        filters.append(knowledge_sql)
+        sql_params.extend(knowledge_params)
 
     where_clause = ""
     if filters:
@@ -2541,6 +2946,8 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 total_occurrences,
                 distinct_sources,
                 priority_score,
+                knowledge_status,
+                knowledge_score,
                 COALESCE(last_seen_at, '-') AS last_seen_at
             FROM v_terms_overview
             {where_clause}
@@ -2554,6 +2961,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "q": q.strip() or None,
         "order": order if order != "priority" else None,
         "limit": limit if limit != 50 else None,
+        web_knowledge.FILTER_PARAM: knowledge_status,
         "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
@@ -2574,6 +2982,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
           <option value="recent" {"selected" if order == "recent" else ""}>Mais recentes</option>
           <option value="lemma" {"selected" if order == "lemma" else ""}>Lemma</option>
         </select>
+        {web_knowledge.filter_select(knowledge_status)}
         <input type="number" name="limit" value="{limit}" min="1" max="200">
       </div>
     """
@@ -2587,6 +2996,7 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
             escape(format_score(row["priority_score"])),
+            web_knowledge.status_cell(row["knowledge_status"], row["knowledge_score"]),
             datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
@@ -2599,26 +3009,28 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "Ocorrencias",
         "Fontes",
         "Score",
+        "Conhecimento",
         "Ultima vez",
     ]
+    live = LiveRegions()
+    results = results_markup(
+        f"{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.",
+        pagination_markup,
+        table_html(headers, table_rows),
+    )
     body = f"""
     <div class="grid">
       <section class="panel">
         <h2>Termos</h2>
         {search_form(action="/terms", label="Buscar no catalogo", placeholder="Ex.: 回復, かいふく, cura, traicionar", q=q, extras=extras, reset_href=reset_href, lang=lang)}
-        <div class="results-toolbar">
-          <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
-          {pagination_markup}
-        </div>
-        {table_html(headers, table_rows)}
+        {live.region("results", results)}
       </section>
     </div>
     """
-    return layout(
+    return PageView(
         title="Termos",
         body=body,
         active_path="/terms",
-        extra_scripts=auto_reload_script(db_path),
         lang=lang,
         language_bar=language_bar_html(
             db_path,
@@ -2626,10 +3038,12 @@ def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
             lang=lang,
             extra_params={key: value for key, value in base_params.items() if key != "lang"},
         ),
+        regions=live.regions,
+        watch=Watch.of("term"),
     )
 
 
-def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
+def kanji_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
     q = first_value(params, "q")
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"))
@@ -2651,6 +3065,11 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         search_sql, search_params = folded_like_filter(("literal", "meaning_pt", "canonical_meanings"), q)
         filters.append(search_sql)
         sql_params.extend(search_params)
+    knowledge_status = web_knowledge.filter_value(first_value(params, web_knowledge.FILTER_PARAM))
+    knowledge_sql, knowledge_params = web_knowledge.filter_clause(knowledge_status)
+    if knowledge_sql:
+        filters.append(knowledge_sql)
+        sql_params.extend(knowledge_params)
 
     where_clause = ""
     if filters:
@@ -2677,6 +3096,8 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
                 distinct_sources,
                 distinct_terms,
                 priority_score,
+                knowledge_status,
+                knowledge_score,
                 COALESCE(last_seen_at, '-') AS last_seen_at
             FROM v_kanji_overview
             {where_clause}
@@ -2690,6 +3111,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "q": q.strip() or None,
         "order": order if order != "priority" else None,
         "limit": limit if limit != 50 else None,
+        web_knowledge.FILTER_PARAM: knowledge_status,
         "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
     pagination_markup = pagination_nav(
@@ -2709,6 +3131,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
           <option value="recent" {"selected" if order == "recent" else ""}>Mais recentes</option>
           <option value="literal" {"selected" if order == "literal" else ""}>Literal</option>
         </select>
+        {web_knowledge.filter_select(knowledge_status)}
         <input type="number" name="limit" value="{limit}" min="1" max="200">
       </div>
     """
@@ -2720,6 +3143,7 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
             escape(row["total_occurrences"]),
             escape(row["distinct_sources"]),
             escape(format_score(row["priority_score"])),
+            web_knowledge.status_cell(row["knowledge_status"], row["knowledge_score"]),
             datetime_cell(row["last_seen_at"]),
         ]
         for row in rows
@@ -2733,6 +3157,12 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
             "entao nao ha nada para listar aqui neste idioma.</div>"
         )
     )
+    live = LiveRegions()
+    results = results_markup(
+        f"{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.",
+        pagination_markup,
+        table_html([characters, "Significado", "Palavras", "Ocorrencias", "Fontes", "Score", "Conhecimento", "Ultima vez"], table_rows),
+    )
     body = f"""
     <div class="grid">
       <section class="panel">
@@ -2741,15 +3171,11 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
         {no_characters_note}
         {sync_anki_action(next_path=language_href("/kanji", lang))}
         {search_form(action="/kanji", label="Buscar no catalogo", placeholder="Ex.: 魔, 学, river", q=q, extras=extras, reset_href=reset_href, lang=lang)}
-        <div class="results-toolbar">
-          <p class="results-summary">{results_summary_text(pagination)} Ordenacao atual: <strong>{html.escape(order)}</strong>.</p>
-          {pagination_markup}
-        </div>
-        {table_html([characters, "Significado", "Palavras", "Ocorrencias", "Fontes", "Score", "Ultima vez"], table_rows)}
+        {live.region("results", results)}
       </section>
     </div>
     """
-    return layout(
+    return PageView(
         title=characters,
         body=body,
         active_path="/kanji",
@@ -2760,15 +3186,16 @@ def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
             lang=lang,
             extra_params={key: value for key, value in base_params.items() if key != "lang"},
         ),
-        extra_scripts=auto_reload_script(db_path),
+        regions=live.regions,
+        watch=Watch.of("kanji"),
     )
 
 
-def kanji_detail_page(
+def kanji_detail_view(
     db_path: Path,
     kanji_id: int,
     params: dict[str, list[str]] | None = None,
-) -> str | None:
+) -> PageView | None:
     lang = current_language(params)
     with db_connect(db_path) as connection:
         kanji = connection.execute(
@@ -2795,6 +3222,12 @@ def kanji_detail_page(
         ).fetchone()
         if kanji is None:
             return None
+        knowledge_html = knowledge_panel(
+            connection,
+            knowledge.ITEM_KANJI,
+            kanji_id,
+            next_path=language_href(f"/kanji/{kanji_id}", lang),
+        )
 
         term_rows = connection.execute(
             """
@@ -2896,8 +3329,8 @@ def kanji_detail_page(
         or text(kanji["kun_readings"], "-") != "-"
         else ""
     )
-    body = f"""
-    <div class="grid">
+    live = LiveRegions()
+    header_html = f"""
       <section class="panel panel-wide">
         <h2{language_attrs(kanji_language)}>{escape(kanji["literal"])}</h2>
         <div class="chips">
@@ -2908,7 +3341,17 @@ def kanji_detail_page(
           <span class="chip">Fontes: {escape(kanji["distinct_sources"], "0")}</span>
           <span class="chip">Score: {escape(format_score(kanji["priority_score"]))}</span>
         </div>
-      </section>
+      </section>"""
+    summary_html = f"""
+        <ul class="meta-list">
+          <li><strong>Primeira vez</strong>{escape(format_datetime_display(kanji["first_seen_at"]))}</li>
+          <li><strong>Ultima vez</strong>{escape(format_datetime_display(kanji["last_seen_at"]))}</li>
+          <li><strong>Criado em</strong>{escape(format_datetime_display(kanji["created_at"]))}</li>
+          <li><strong>Atualizado em</strong>{escape(format_datetime_display(kanji["updated_at"]))}</li>
+        </ul>"""
+    body = f"""
+    <div class="grid">
+      {live.region("kanji-header", header_html)}
 
       <section class="panel panel-side">
         <h2>Atalhos</h2>
@@ -2919,37 +3362,42 @@ def kanji_detail_page(
         </div>
       </section>
 
+      {notice_banner(params or {})}
+      {live.region("kanji-knowledge", knowledge_html)}
+
       <section class="panel panel-wide">
         <h3>Termos relacionados</h3>
-        {truncation_note(len(term_rows), related_terms_total)}
-        {table_html(["Termo", "Idioma", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], related_term_rows)}
+        {live.region("related-terms", truncation_note(len(term_rows), related_terms_total) + table_html(["Termo", "Idioma", "Leitura", "Significado", "Ocorrencias", "Fontes", "Score"], related_term_rows))}
       </section>
 
       <section class="panel panel-side">
         <h3>Resumo</h3>
-        <ul class="meta-list">
-          <li><strong>Primeira vez</strong>{escape(format_datetime_display(kanji["first_seen_at"]))}</li>
-          <li><strong>Ultima vez</strong>{escape(format_datetime_display(kanji["last_seen_at"]))}</li>
-          <li><strong>Criado em</strong>{escape(format_datetime_display(kanji["created_at"]))}</li>
-          <li><strong>Atualizado em</strong>{escape(format_datetime_display(kanji["updated_at"]))}</li>
-        </ul>
+        {live.region("kanji-summary", summary_html)}
       </section>
 
       <section class="panel">
         <h3>Fontes que contem este {html.escape(character_noun)}</h3>
-        {truncation_note(len(source_rows), related_sources_total)}
-        {table_html(["Fonte", "Count", "Titulo", "Game", "Cena", "Quando"], related_source_rows)}
+        {live.region("related-sources", truncation_note(len(source_rows), related_sources_total) + table_html(["Fonte", "Count", "Titulo", "Game", "Cena", "Quando"], related_source_rows))}
       </section>
     </div>
     """
-    return layout(title=f"{characters} {kanji['literal']}", body=body, active_path="/kanji", lang=lang)
+    return PageView(
+        title=f"{characters} {kanji['literal']}",
+        body=body,
+        active_path="/kanji",
+        lang=lang,
+        regions=live.regions,
+        # New sources and links touching this character log it (source_kanji,
+        # kanji_stats); the related terms log their own changes.
+        watch=Watch.of(kanji=[kanji_id], term=[row["term_id"] for row in term_rows]),
+    )
 
 
-def term_detail_page(
+def term_detail_view(
     db_path: Path,
     term_id: int,
     params: dict[str, list[str]] | None = None,
-) -> str | None:
+) -> PageView | None:
     lang = current_language(params)
     with db_connect(db_path) as connection:
         term = connection.execute(
@@ -2979,6 +3427,12 @@ def term_detail_page(
         ).fetchone()
         if term is None:
             return None
+        knowledge_html = knowledge_panel(
+            connection,
+            knowledge.ITEM_TERM,
+            term_id,
+            next_path=language_href(f"/terms/{term_id}", lang),
+        )
 
         forms = connection.execute(
             """
@@ -3193,8 +3647,8 @@ def term_detail_page(
         if show_readings
         else ""
     )
-    body = f"""
-    <div class="grid">
+    live = LiveRegions()
+    header_html = f"""
       <section class="panel panel-wide">
         <h2{language_attrs(term_language)}>{escape(term["lemma"])}</h2>
         <div class="chips">
@@ -3203,8 +3657,8 @@ def term_detail_page(
           <span class="chip">Significado: {escape(term["meaning_pt"] or "-")}</span>
           <span class="chip">Classe: {escape(term["pos"] or "-")}</span>
         </div>
-      </section>
-
+      </section>"""
+    summary_html = f"""
       <section class="panel panel-side">
         <h2>Resumo</h2>
         <div class="stats">
@@ -3213,20 +3667,8 @@ def term_detail_page(
           <div class="stat"><span class="label">Formas</span><span class="value">{escape(term["distinct_forms"], "0")}</span></div>
           <div class="stat"><span class="label">Score</span><span class="value">{escape(format_score(term["priority_score"]))}</span></div>
         </div>
-      </section>
-
-      <section class="panel panel-wide">
-        <h3>Onde apareceu</h3>
-        {truncation_note(len(occurrences), occurrences_total)}
-        {table_html(["Fonte", "Forma vista", "Count", "Confianca", "Titulo", "Cena", "Quando"], occurrence_rows)}
-      </section>
-
-      <section class="panel panel-wide">
-        <h3>Segmentacao revisada</h3>
-        {truncation_note(len(segment_occurrences), segment_occurrences_total)}
-        {table_html(segment_headers, segment_occurrence_rows)}
-      </section>
-
+      </section>"""
+    forms_html = f"""
       <section class="panel panel-side">
         <h3>Formas registradas</h3>
         <div class="chips">{form_chips}</div>
@@ -3237,17 +3679,46 @@ def term_detail_page(
           <li><strong>Criado em</strong>{escape(format_datetime_display(term["created_at"]))}</li>
           <li><strong>Atualizado em</strong>{escape(format_datetime_display(term["updated_at"]))}</li>
         </ul>
+      </section>"""
+    body = f"""
+    <div class="grid">
+      {live.region("term-header", header_html)}
+
+      {live.region("term-summary", summary_html)}
+
+      {notice_banner(params or {})}
+      {live.region("term-knowledge", knowledge_html)}
+
+      <section class="panel panel-wide">
+        <h3>Onde apareceu</h3>
+        {live.region("occurrences", truncation_note(len(occurrences), occurrences_total) + table_html(["Fonte", "Forma vista", "Count", "Confianca", "Titulo", "Cena", "Quando"], occurrence_rows))}
       </section>
 
-      {kanji_panel}
+      <section class="panel panel-wide">
+        <h3>Segmentacao revisada</h3>
+        {live.region("segment-occurrences", truncation_note(len(segment_occurrences), segment_occurrences_total) + table_html(segment_headers, segment_occurrence_rows))}
+      </section>
+
+      {live.region("term-forms", forms_html)}
+
+      {live.region("derived-kanji", kanji_panel)}
 
       <section class="panel">
         <h3>Flashcards</h3>
-        {table_html(["Card", "Template", "Deck", "Status", "Frente"], flashcard_rows)}
+        {live.region("term-flashcards", table_html(["Card", "Template", "Deck", "Status", "Frente"], flashcard_rows))}
       </section>
     </div>
     """
-    return layout(title=f"Termo {term['lemma']}", body=body, active_path="/terms", lang=lang)
+    return PageView(
+        title=f"Termo {term['lemma']}",
+        body=body,
+        active_path="/terms",
+        lang=lang,
+        regions=live.regions,
+        # Links, forms, stats and cards of this term all log "term" for it;
+        # the derived characters' stats log "kanji".
+        watch=Watch.of(term=[term_id], kanji=[row["id"] for row in kanji_rows]),
+    )
 
 
 SOURCES_TABLE_HEADERS = ["ID", "Idioma", "Tipo", "Titulo", "Resolucao", "Cena", "Termos", "Quando", "Texto"]
@@ -3353,271 +3824,36 @@ def sources_table_markup(rows: list[dict[str, object]], lang: str = ALL_LANGUAGE
     return table_html(SOURCES_TABLE_HEADERS, sources_table_rows(rows, lang))
 
 
-def build_sources_payload(
-    *,
-    db_path: Path,
-    q: str,
-    limit: int,
-    pagination: PaginationState,
-    rows: list[dict[str, object]],
-    lang: str = ALL_LANGUAGES_CODE,
-) -> dict[str, object]:
+def sources_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
+    q, limit, pagination, rows = load_sources_rows(db_path, params)
+    lang = current_language(params)
+
+    extras = f'<input type="number" name="limit" value="{limit}" min="1" max="200">'
     base_params = {
         "q": q.strip() or None,
         "limit": limit if limit != 50 else None,
         "lang": lang if lang != ALL_LANGUAGES_CODE else None,
     }
-    revision = (
-        f"{database_revision_token(db_path)}:{pagination.page}:{pagination.total_count}:"
-        + ",".join(str(row["id"]) for row in rows)
-    )
-    return {
-        "revision": revision,
-        "count_label": results_summary_text(pagination),
-        "pagination_html": pagination_nav(
-            path="/sources",
-            base_params=base_params,
-            pagination=pagination,
-        ),
-        "table_html": sources_table_markup(rows, lang),
-    }
-
-
-def sources_live_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
-    q, limit, pagination, rows = load_sources_rows(db_path, params)
-    return build_sources_payload(
-        db_path=db_path,
-        q=q,
-        limit=limit,
-        pagination=pagination,
-        rows=rows,
-        lang=current_language(params),
-    )
-
-
-def auto_reload_script(db_path: Path, endpoint: str = "/live/revision", interval_ms: int = 4000) -> str:
-    endpoint_literal = json.dumps(endpoint, ensure_ascii=False)
-    revision_literal = json.dumps(database_revision_token(db_path), ensure_ascii=False)
-    interval_literal = json.dumps(interval_ms)
-    return f"""
-<script>
-  (() => {{
-    const endpoint = {endpoint_literal};
-    const pollIntervalMs = {interval_literal};
-    const sortStateKey =
-      "jpCatalog:auto-sort:" + window.location.pathname + window.location.search;
-    let currentRevision = {revision_literal};
-    let inFlight = false;
-
-    function hasFocusedField() {{
-      const active = document.activeElement;
-      return Boolean(active && active.matches("input, textarea, select"));
-    }}
-
-    function saveSortStates() {{
-      if (!window.jpCatalog || typeof window.jpCatalog.readSortState !== "function") {{
-        return;
-      }}
-      try {{
-        const states = Array.from(document.querySelectorAll("table.sortable-table")).map((table) =>
-          window.jpCatalog.readSortState(table)
-        );
-        window.sessionStorage.setItem(sortStateKey, JSON.stringify(states));
-      }} catch (_error) {{
-      }}
-    }}
-
-    function restoreSortStates() {{
-      if (!window.jpCatalog || typeof window.jpCatalog.applySortState !== "function") {{
-        return;
-      }}
-      try {{
-        const rawStates = window.sessionStorage.getItem(sortStateKey);
-        if (!rawStates) {{
-          return;
-        }}
-        window.sessionStorage.removeItem(sortStateKey);
-        const states = JSON.parse(rawStates);
-        if (!Array.isArray(states)) {{
-          return;
-        }}
-        const tables = Array.from(document.querySelectorAll("table.sortable-table"));
-        states.forEach((state, index) => {{
-          window.jpCatalog.applySortState(tables[index], state);
-        }});
-      }} catch (_error) {{
-      }}
-    }}
-
-    async function refreshPage() {{
-      if (
-        inFlight
-        || document.hidden
-        || hasFocusedField()
-        || (
-          window.jpCatalog
-          && typeof window.jpCatalog.isSyncingAnki === "function"
-          && window.jpCatalog.isSyncingAnki()
-        )
-      ) {{
-        return;
-      }}
-      inFlight = true;
-      try {{
-        const response = await fetch(endpoint, {{
-          headers: {{ "Accept": "application/json" }},
-          cache: "no-store",
-        }});
-        if (!response.ok) {{
-          return;
-        }}
-        const payload = await response.json();
-        const nextRevision = payload && typeof payload.revision === "string" ? payload.revision : "";
-        if (!nextRevision || nextRevision === currentRevision) {{
-          return;
-        }}
-        currentRevision = nextRevision;
-        saveSortStates();
-        window.location.reload();
-      }} catch (_error) {{
-      }} finally {{
-        inFlight = false;
-      }}
-    }}
-
-    restoreSortStates();
-    const timer = window.setInterval(refreshPage, pollIntervalMs);
-    document.addEventListener("visibilitychange", () => {{
-      if (!document.hidden) {{
-        refreshPage();
-      }}
-    }});
-    window.addEventListener("beforeunload", () => {{
-      window.clearInterval(timer);
-    }}, {{ once: true }});
-  }})();
-</script>
-"""
-
-
-def sources_live_script(endpoint: str) -> str:
-    endpoint_literal = json.dumps(endpoint, ensure_ascii=False)
-    return f"""
-<script>
-  (() => {{
-    const root = document.querySelector("[data-sources-live-root]");
-    if (!root) {{
-      return;
-    }}
-    const endpoint = {endpoint_literal};
-    const countNode = root.querySelector("[data-sources-count]");
-    const paginationNode = root.querySelector("[data-sources-pagination]");
-    const tableNode = root.querySelector("[data-sources-table]");
-    let currentRevision = root.dataset.liveRevision || "";
-    let inFlight = false;
-
-    async function refreshSources() {{
-      if (inFlight || document.hidden) {{
-        return;
-      }}
-      inFlight = true;
-      const existingTable = tableNode ? tableNode.querySelector("table.sortable-table") : null;
-      const previousSortState =
-        window.jpCatalog && typeof window.jpCatalog.readSortState === "function"
-          ? window.jpCatalog.readSortState(existingTable)
-          : null;
-      try {{
-        const response = await fetch(endpoint, {{
-          headers: {{ "Accept": "application/json" }},
-          cache: "no-store",
-        }});
-        if (!response.ok) {{
-          return;
-        }}
-        const payload = await response.json();
-        if (!payload || payload.revision === currentRevision) {{
-          return;
-        }}
-        currentRevision = payload.revision || "";
-        root.dataset.liveRevision = currentRevision;
-        if (countNode) {{
-          countNode.textContent = payload.count_label || "";
-        }}
-        if (paginationNode) {{
-          paginationNode.innerHTML = payload.pagination_html || "";
-        }}
-        if (tableNode) {{
-          tableNode.innerHTML = payload.table_html || "";
-          if (window.jpCatalog && typeof window.jpCatalog.initSortableTables === "function") {{
-            window.jpCatalog.initSortableTables(tableNode);
-            if (previousSortState && typeof window.jpCatalog.applySortState === "function") {{
-              const nextTable = tableNode.querySelector("table.sortable-table");
-              window.jpCatalog.applySortState(nextTable, previousSortState);
-            }}
-          }}
-        }}
-      }} catch (_error) {{
-      }} finally {{
-        inFlight = false;
-      }}
-    }}
-
-    const timer = window.setInterval(refreshSources, 4000);
-    document.addEventListener("visibilitychange", () => {{
-      if (!document.hidden) {{
-        refreshSources();
-      }}
-    }});
-    window.addEventListener("beforeunload", () => {{
-      window.clearInterval(timer);
-    }}, {{ once: true }});
-  }})();
-</script>
-"""
-
-
-def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
-    q, limit, pagination, rows = load_sources_rows(db_path, params)
-    lang = current_language(params)
-
-    extras = f'<input type="number" name="limit" value="{limit}" min="1" max="200">'
-    payload = build_sources_payload(
-        db_path=db_path,
-        q=q,
-        limit=limit,
-        pagination=pagination,
-        rows=rows,
-        lang=lang,
-    )
     reset_href = language_href("/sources", lang) if q.strip() or limit != 50 or pagination.page > 1 else None
-    live_params = {
-        "q": q.strip() or None,
-        "limit": limit if limit != 50 else None,
-        "page": pagination.page if pagination.page > 1 else None,
-        "lang": lang if lang != ALL_LANGUAGES_CODE else None,
-    }
-    live_query = urlencode(
-        [(key, str(value)) for key, value in live_params.items() if value is not None]
+    live = LiveRegions()
+    results = results_markup(
+        html.escape(results_summary_text(pagination)),
+        pagination_nav(path="/sources", base_params=base_params, pagination=pagination),
+        sources_table_markup(rows, lang),
     )
-    live_endpoint = f"/sources/live?{live_query}" if live_query else "/sources/live"
     body = f"""
     <div class="grid">
-      <section class="panel" data-sources-live-root data-live-revision="{html.escape(str(payload["revision"]))}">
+      <section class="panel">
         <h2>Fontes</h2>
         {search_form(action="/sources", label="Buscar em fontes", placeholder="Ex.: battle menu, config, texto OCR", q=q, extras=extras, reset_href=reset_href, lang=lang)}
-        <div class="results-toolbar">
-          <p class="results-summary" data-sources-count>{html.escape(str(payload["count_label"]))}</p>
-          <div data-sources-pagination>{payload["pagination_html"]}</div>
-        </div>
-        <div data-sources-table>{payload["table_html"]}</div>
+        {live.region("results", results)}
       </section>
     </div>
     """
-    return layout(
+    return PageView(
         title="Fontes",
         body=body,
         active_path="/sources",
-        extra_scripts=sources_live_script(live_endpoint),
         lang=lang,
         language_bar=language_bar_html(
             db_path,
@@ -3625,6 +3861,9 @@ def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
             lang=lang,
             extra_params={"q": q.strip() or None, "limit": limit if limit != 50 else None},
         ),
+        regions=live.regions,
+        # Linked-term counts change with every term link, which logs the source too.
+        watch=Watch.of("source"),
     )
 
 
@@ -3662,11 +3901,11 @@ def source_language_form(
     """
 
 
-def source_detail_page(
+def source_detail_view(
     db_path: Path,
     source_id: int,
     params: dict[str, list[str]] | None = None,
-) -> str | None:
+) -> PageView | None:
     params = params or {}
     lang = current_language(params)
     with db_connect(db_path) as connection:
@@ -3963,10 +4202,8 @@ def source_detail_page(
         if source["language_confidence"] is not None
         else ""
     )
-    body = f"""
-    <div class="grid">
-      <section class="panel panel-wide">
-        {notice_banner(params)}
+    live = LiveRegions()
+    meta_html = f"""
         <h2 dir="auto">{escape(source["title"] or "(sem titulo)")}</h2>
         <ul class="meta-list">
           <li><strong>Tipo</strong>{escape(source["source_type"])}</li>
@@ -3976,7 +4213,16 @@ def source_detail_page(
           <li><strong>Cena</strong>{escape(source["scene"] or "-")}</li>
           <li><strong>Capturado em</strong>{escape(format_datetime_display(source["captured_at"] or source["created_at"]))}</li>
           <li><strong>Arquivo</strong><span class="mono">{escape(source["source_path"] or "-")}</span></li>
-        </ul>
+        </ul>"""
+    translation_html = f"""
+        <p><strong>Status:</strong> {escape(source["translated_text_en_status"] or "missing")}</p>
+        <p><strong>Provider:</strong> {escape(source["translated_text_en_provider"] or "-")}</p>
+        <pre>{html.escape(text(source["translated_text_en"], "(sem tradução em inglês)"))}</pre>"""
+    body = f"""
+    <div class="grid">
+      <section class="panel panel-wide">
+        {notice_banner(params)}
+        {live.region("source-meta", meta_html)}
         {language_form}
       </section>
 
@@ -3999,14 +4245,12 @@ def source_detail_page(
 
       <section class="panel panel-wide">
         <h3>Texto bruto</h3>
-        <pre{language_attrs(source_language) if text(source["raw_text"], "") else ""}>{html.escape(text(source["raw_text"], "(sem texto bruto)"))}</pre>
+        {live.region("raw-text", f'<pre{language_attrs(source_language) if text(source["raw_text"], "") else ""}>{html.escape(text(source["raw_text"], "(sem texto bruto)"))}</pre>')}
       </section>
 
       <section class="panel panel-side">
         <h3>Tradução EN</h3>
-        <p><strong>Status:</strong> {escape(source["translated_text_en_status"] or "missing")}</p>
-        <p><strong>Provider:</strong> {escape(source["translated_text_en_provider"] or "-")}</p>
-        <pre>{html.escape(text(source["translated_text_en"], "(sem tradução em inglês)"))}</pre>
+        {live.region("translation", translation_html)}
         <form class="inline-action source-translate-form" action="/actions/sources/{source_id}/translate" method="post">
           {hidden_language_input(lang)}
           <button type="submit">{"Traduzir de novo" if source["translated_text_en"] else "Traduzir"}</button>
@@ -4015,34 +4259,47 @@ def source_detail_page(
 
       <section class="panel panel-side">
         <h3>Notas</h3>
-        <pre>{html.escape(text(source["notes"], "(sem notas)"))}</pre>
+        {live.region("notes", f'<pre>{html.escape(text(source["notes"], "(sem notas)"))}</pre>')}
       </section>
 
       <section class="panel panel-wide">
         <h3>Segmentos analisados (rascunho por idioma)</h3>
-        {table_html(["#", "Idioma", "Texto", "Candidatos", "Aprovados"], analysis_table_rows)}
-        {truncation_note(len(analysis_rows), len(analysis_rows)) if len(analysis_rows) >= DETAIL_TABLE_LIMIT else ""}
+        {live.region("analysis", table_html(["#", "Idioma", "Texto", "Candidatos", "Aprovados"], analysis_table_rows) + (truncation_note(len(analysis_rows), len(analysis_rows)) if len(analysis_rows) >= DETAIL_TABLE_LIMIT else ""))}
       </section>
 
       <section class="panel panel-wide">
         <h3>Segmentos revisados desta fonte</h3>
-        {table_html(segment_headers, segment_summary_rows)}
+        {live.region("segments", table_html(segment_headers, segment_summary_rows))}
       </section>
 
       <section class="panel panel-wide">
         <h3>Termos ligados a esta fonte</h3>
-        {table_html(term_headers, table_rows)}
+        {live.region("source-terms", table_html(term_headers, table_rows))}
       </section>
 
       <section class="panel panel-wide">
         <h3>Decomposicao termo a termo</h3>
-        {table_html(segmented_term_headers, segmented_term_table_rows)}
+        {live.region("segment-terms", table_html(segmented_term_headers, segmented_term_table_rows))}
       </section>
 
-      {kanji_panel}
+      {live.region("source-kanji", kanji_panel)}
     </div>
     """
-    return layout(title=f"Fonte {source_id}", body=body, active_path="/sources", lang=lang)
+    return PageView(
+        title=f"Fonte {source_id}",
+        body=body,
+        active_path="/sources",
+        lang=lang,
+        regions=live.regions,
+        # The worker fills term meanings after the source commit and the
+        # translation later still: the first logs each linked term, the second
+        # this source (source_translations).
+        watch=Watch.of(
+            source=[source_id],
+            term=[row["term_id"] for row in term_rows] + [row["term_id"] for row in segmented_term_rows],
+            kanji=[row["id"] for row in kanji_rows],
+        ),
+    )
 
 
 FLASHCARD_SEARCH_COLUMNS = (
@@ -4077,7 +4334,7 @@ def flashcard_filters(
     return filters, sql_params
 
 
-def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
+def flashcards_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
     q = first_value(params, "q")
     status = first_value(params, "status", "all")
     limit = parse_limit(first_value(params, "limit", "50"))
@@ -4181,6 +4438,7 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         "Fonte",
         "Frente",
     ]
+    live = LiveRegions()
     body = f"""
     <div class="grid">
       <section class="panel">
@@ -4188,19 +4446,14 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
         <h2>Flashcards</h2>
         {sync_anki_action(next_path=language_href("/flashcards", lang))}
         {search_form(action="/flashcards", label="Buscar cards", placeholder="Ex.: guardar, persona, progress", q=q, extras=extras, reset_href=reset_href, lang=lang)}
-        <div class="results-toolbar">
-          <p class="results-summary">{results_summary_text(pagination)}</p>
-          {pagination_markup}
-        </div>
-        {table_html(headers, table_rows)}
+        {live.region("results", results_markup(results_summary_text(pagination), pagination_markup, table_html(headers, table_rows)))}
       </section>
     </div>
     """
-    return layout(
+    return PageView(
         title="Flashcards",
         body=body,
         active_path="/flashcards",
-        extra_scripts=auto_reload_script(db_path),
         lang=lang,
         language_bar=language_bar_html(
             db_path,
@@ -4208,6 +4461,9 @@ def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
             lang=lang,
             extra_params={key: value for key, value in base_params.items() if key != "lang"},
         ),
+        regions=live.regions,
+        # Cards list their term's lemma and score, which change with the term.
+        watch=Watch.of("flashcard", "term"),
     )
 
 
@@ -4253,11 +4509,53 @@ def skip_process_button(process_name: str | None, rules: list[sqlite3.Row]) -> s
     return skip_rule_form("process", process, op="add", label="Ignorar app")
 
 
-def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
+# The stages capture_worker reports through WorkerJobProbe.begin, in order.
+CAPTURE_PROGRESS_LABELS = {
+    "ocr": "Lendo o texto (OCR)",
+    "analyze": "Analisando o texto",
+    "save": "Salvando a fonte e os termos",
+    "meanings": "Buscando significados",
+}
+
+
+def utc_iso(value: object | None) -> str:
+    """SQLite's CURRENT_TIMESTAMP (UTC, no zone) as an ISO string browsers parse as UTC."""
+    raw = text(value, "")
+    return f"{raw.replace(' ', 'T')}Z" if raw and "T" not in raw else raw
+
+
+def elapsed_clock(since: object | None) -> str:
+    """A counter the live script ticks every second; empty when the time is unknown."""
+    iso = utc_iso(since)
+    if not iso:
+        return "-"
+    return f'<span class="mono" data-elapsed-since="{html.escape(iso, quote=True)}">…</span>'
+
+
+def capture_progress_html(running_job: sqlite3.Row | None, queued_jobs: int) -> str:
+    queue_note = f'<p class="footer-note">Na fila: {int(queued_jobs)} captura(s).</p>'
+    if running_job is None:
+        return f'<p class="muted">Nenhuma captura sendo processada agora.</p>{queue_note}'
+    step = text(running_job["progress_step"], "")
+    step_label = CAPTURE_PROGRESS_LABELS.get(step, "Iniciando" if not step else step)
+    stage_clock = elapsed_clock(running_job["progress_at"]) if step else "-"
+    return f"""
+        <ul class="meta-list">
+          <li><strong>Job</strong>#{escape(running_job["id"])}</li>
+          <li><strong>Janela</strong>{language_text(truncate(text(running_job["window_title"], "-"), size=80), None)}</li>
+          <li><strong>Processo</strong>{escape(running_job["process_name"] or "-")}</li>
+          <li><strong>Etapa</strong>{html.escape(step_label)} ({stage_clock})</li>
+          <li><strong>Tempo total</strong>{elapsed_clock(running_job["updated_at"])}</li>
+        </ul>
+        {queue_note}"""
+
+
+def capture_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
     """Capture settings: which languages the worker keeps, the OCR plan, window profiles."""
     with db_connect(db_path) as connection:
         language_rows = list_language_rows(connection)
         capture_codes = lang_jp.capture_language_codes(connection)
+        catalog_settings = load_settings(connection)
         profiles = lang_jp.list_capture_profiles(connection)
         skip_rules = lang_jp.list_capture_skip_rules(connection)
         recent_jobs = connection.execute(
@@ -4273,10 +4571,22 @@ def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
             LIMIT 12
             """
         ).fetchall()
+        running_job = connection.execute(
+            """
+            SELECT id, window_title, process_name, progress_step, progress_at, updated_at
+            FROM capture_jobs
+            WHERE status = 'processing'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        queued_jobs = connection.execute(
+            "SELECT COUNT(*) FROM capture_jobs WHERE status = 'pending'"
+        ).fetchone()[0]
     override = os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV, "").strip()
-    plan = plan_ocr_engines(capture_codes)
+    plan = plan_ocr_engines(capture_codes, backend=str(catalog_settings["ocr.backend"]))
 
-    gloss_language = languages.base_language_code(lang_jp.DEFAULT_TERM_TRANSLATION_TARGET)
+    gloss_language = lang_jp.gloss_language_code(catalog_settings)
     checkboxes = []
     for row in language_rows:
         code = str(row["code"])
@@ -4352,8 +4662,14 @@ def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
         f'<option value="{html.escape(str(row["code"]))}">{html.escape(get_language(str(row["code"])).name)} ({html.escape(str(row["code"]))})</option>'
         for row in language_rows
     )
+    live = LiveRegions()
     body = f"""
     <div class="grid">
+      <section class="panel panel-wide">
+        <h2>Captura em andamento</h2>
+        {live.region("capture-progress", capture_progress_html(running_job, queued_jobs))}
+      </section>
+
       <section class="panel panel-wide">
         {notice_banner(params)}
         <h2>Idiomas capturados</h2>
@@ -4375,6 +4691,7 @@ def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
         <ul class="meta-list">{engines_html}</ul>
         {unsupported_html}
         <p class="footer-note">Captura atual: {html.escape(", ".join(capture_codes))}</p>
+        <p class="footer-note"><a href="/settings#ocr">Ajustes de OCR</a> (motor, tamanho da imagem, confianca).</p>
       </section>
 
       <section class="panel panel-wide">
@@ -4416,16 +4733,76 @@ def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
       <section class="panel panel-wide">
         <h2>Capturas recentes</h2>
         <p>Titulo e processo da janela em primeiro plano em cada captura: use-os para criar perfis.</p>
-        {table_html(["Job", "Status", "Janela", "Processo", "Perfil", "Fonte", "Quando"], job_rows)}
+        {live.region("recent-jobs", table_html(["Job", "Status", "Janela", "Processo", "Perfil", "Fonte", "Quando"], job_rows))}
       </section>
     </div>
     """
-    return layout(
+    return PageView(
         title="Captura",
         body=body,
         active_path="/capture",
+        lang=ALL_LANGUAGES_CODE,
         language_bar=language_bar_html(db_path, active_path="/capture", lang=ALL_LANGUAGES_CODE),
+        regions=live.regions,
+        watch=Watch.of("job"),
     )
+
+
+def settings_view(db_path: Path, params: dict[str, list[str]]) -> PageView:
+    """Every setting of the registry (settings.py), one form per section.
+
+    The forms are static; what changes under them (a value set from the tray or
+    the CLI) shows in each section's live summary and in the index.
+    """
+    with db_connect(db_path) as connection:
+        snapshot = load_settings(connection)
+        language_options = [
+            (str(row["code"]), get_language(str(row["code"])).name)
+            for row in list_language_rows(connection)
+        ]
+    # A notice about one section is shown in that section, where the save landed.
+    noticed_section = first_value(params, "section", "")
+    live = LiveRegions()
+    sections = []
+    for section in app_settings.SECTIONS:
+        notice = notice_banner(params) if section.key == noticed_section else ""
+        sections.append(
+            f"""
+      <section class="panel settings-section" id="{html.escape(section.key, quote=True)}">
+        {notice}
+        <h2>{html.escape(section.label)}</h2>
+        <p>{html.escape(section.help)}</p>
+        {live.region(f"settings-{section.key}", web_settings.section_summary_html(section, snapshot))}
+        {web_settings.section_form_html(section, snapshot)}
+      </section>"""
+        )
+    top_notice = notice_banner(params) if noticed_section not in {s.key for s in app_settings.SECTIONS} else ""
+    body = f"""
+    <div class="grid">
+      <section class="panel">
+        {top_notice}
+        <h2>Ajustes</h2>
+        <p>Valem para o worker, o overlay e o tray sem reiniciar nada: cada um le os ajustes do banco quando vai usa-los. Os mesmos valores aparecem no menu do tray e em <code>lang_jp.py list-settings</code>.</p>
+        {live.region("settings-index", web_settings.section_index_html(snapshot))}
+      </section>
+      {"".join(sections)}
+    </div>
+    {web_settings.language_datalist_html(language_options)}
+    """
+    return PageView(
+        title="Ajustes",
+        body=body,
+        active_path="/settings",
+        lang=ALL_LANGUAGES_CODE,
+        language_bar=language_bar_html(db_path, active_path="/settings", lang=ALL_LANGUAGES_CODE),
+        regions=live.regions,
+        watch=Watch.of("setting"),
+    )
+
+
+def api_settings_payload(db_path: Path) -> dict[str, object]:
+    with db_connect(db_path) as connection:
+        return web_settings.settings_api_payload(load_settings(connection))
 
 
 def api_capture_payload(db_path: Path) -> dict[str, object]:
@@ -4433,7 +4810,8 @@ def api_capture_payload(db_path: Path) -> dict[str, object]:
         capture_codes = lang_jp.capture_language_codes(connection)
         profiles = lang_jp.list_capture_profiles(connection)
         skip_patterns = lang_jp.capture_skip_patterns(connection)
-    plan = plan_ocr_engines(capture_codes)
+        catalog_settings = load_settings(connection)
+    plan = plan_ocr_engines(capture_codes, backend=str(catalog_settings["ocr.backend"]))
     return {
         "capture_languages": list(capture_codes),
         "override_env": os.environ.get(lang_jp.CAPTURE_LANGUAGES_ENV) or None,
@@ -4499,7 +4877,7 @@ def api_page_meta(pagination: PaginationState, lang: str, **extra: object) -> di
 
 
 def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
-    """Terms as JSON: ``?lang=``, ``?q=``, ``?order=priority|recent|lemma``, ``?limit=``, ``?page=``."""
+    """Terms as JSON: ``?lang=``, ``?q=``, ``?knowledge=<status>``, ``?order=priority|recent|lemma``, ``?limit=``, ``?page=``."""
     q = first_value(params, "q")
     order = first_value(params, "order", "priority")
     limit = parse_limit(first_value(params, "limit", "50"), maximum=500)
@@ -4520,6 +4898,11 @@ def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, 
         search_sql, search_params = folded_like_filter(("lemma", "reading", "meaning_pt"), q)
         filters.append(search_sql)
         sql_params.extend(search_params)
+    knowledge_status = web_knowledge.filter_value(first_value(params, web_knowledge.FILTER_PARAM))
+    knowledge_sql, knowledge_params = web_knowledge.filter_clause(knowledge_status)
+    if knowledge_sql:
+        filters.append(knowledge_sql)
+        sql_params.extend(knowledge_params)
     where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
     with db_connect(db_path) as connection:
         total_count = connection.execute(
@@ -4532,7 +4915,8 @@ def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, 
             SELECT
                 id, language_code, lemma, reading, meaning_pt, pos,
                 total_occurrences, distinct_sources, distinct_forms,
-                priority_score, first_seen_at, last_seen_at
+                priority_score, first_seen_at, last_seen_at,
+                knowledge_status, knowledge_score
             FROM v_terms_overview
             {where_clause}
             ORDER BY {order_clause}
@@ -4541,7 +4925,7 @@ def api_terms_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, 
             [*sql_params, pagination.limit, pagination.offset],
         ).fetchall()
     return {
-        "meta": api_page_meta(pagination, lang, q=q, order=order),
+        "meta": api_page_meta(pagination, lang, q=q, order=order, knowledge=knowledge_status),
         "terms": [dict(row) for row in rows],
     }
 
@@ -4553,7 +4937,8 @@ def api_term_detail_payload(db_path: Path, term_id: int) -> dict[str, object] | 
             SELECT
                 v.id, v.language_code, v.lemma, v.reading, v.meaning_pt, v.pos, t.notes,
                 v.total_occurrences, v.distinct_sources, v.distinct_forms,
-                v.priority_score, v.first_seen_at, v.last_seen_at
+                v.priority_score, v.first_seen_at, v.last_seen_at,
+                v.knowledge_status, v.knowledge_score
             FROM v_terms_overview AS v
             JOIN terms AS t ON t.id = v.id
             WHERE v.id = ?
@@ -4589,7 +4974,11 @@ def api_term_detail_payload(db_path: Path, term_id: int) -> dict[str, object] | 
             """,
             (term_id,),
         ).fetchall()
+        evidence = knowledge.load_evidence(connection, knowledge.ITEM_TERM, term_id)
     payload = dict(term)
+    payload["knowledge"] = web_knowledge.api_entry(
+        payload.pop("knowledge_status"), payload.pop("knowledge_score"), evidence
+    )
     payload["language"] = api_language_entry_from_profile(str(term["language_code"]))
     payload["forms"] = [dict(row) for row in forms]
     payload["occurrences"] = [dict(row) for row in occurrences]
@@ -4676,6 +5065,138 @@ def api_flashcards_payload(db_path: Path, params: dict[str, list[str]]) -> dict[
     }
 
 
+# ---------------------------------------------------------------------------
+# Pages and live updates
+#
+# Every page is a view builder in PAGE_ROUTES. The same URL renders the full
+# HTML page, or, when the live updater asks for FRAGMENTS_MEDIA_TYPE, the JSON
+# map of its live regions (web_views.fragments_payload). The updater learns when
+# to ask from /live/changes, which reads the trigger-written change log.
+# ---------------------------------------------------------------------------
+
+FRAGMENTS_MEDIA_TYPE = "application/vnd.lang.fragments+json"
+
+
+def catalog_revision_at(db_path: Path) -> int:
+    """The change-log revision, read on its own read-only connection.
+
+    Read before a page's queries run, so a change that lands while the page
+    renders is still reported by the next poll.
+    """
+    try:
+        with closing(lang_jp.db_connect_read_only(db_path)) as connection:
+            return catalog_changes.current_revision(connection)
+    except sqlite3.OperationalError:
+        # No database or no log yet: the first write creates both.
+        return 0
+
+
+def live_changes_payload(db_path: Path, params: dict[str, list[str]]) -> dict[str, object]:
+    """Answer one poll; raises ``ValueError`` on a malformed ``since`` or ``watch``."""
+    since = int(first_value(params, "since", "0"))
+    if since < 0:
+        raise ValueError("since must not be negative")
+    watch = Watch.decode(first_value(params, "watch", ""))
+    try:
+        with closing(lang_jp.db_connect_read_only(db_path)) as connection:
+            status = catalog_changes.changes_since(connection, since, watch)
+    except sqlite3.OperationalError:
+        status = catalog_changes.ChangeStatus(revision=0, changed=since != 0, reset=since != 0)
+    return {"revision": status.revision, "changed": status.changed, "reset": status.reset}
+
+
+def render_page(view: PageView, revision: int) -> str:
+    return layout(
+        title=view.title,
+        body=view.body,
+        active_path=view.active_path,
+        lang=view.lang,
+        language_bar=view.header_language_bar(),
+        live_watch=view.watch,
+        live_revision=revision,
+    )
+
+
+def render_view_html(db_path: Path, build: Callable[[], PageView | None]) -> str | None:
+    revision = catalog_revision_at(db_path)
+    view = build()
+    return None if view is None else render_page(view, revision)
+
+
+def dashboard_page(db_path: Path, params: dict[str, list[str]] | None = None) -> str:
+    return render_view_html(db_path, lambda: dashboard_view(db_path, params))  # type: ignore[return-value]
+
+
+def terms_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    return render_view_html(db_path, lambda: terms_view(db_path, params))  # type: ignore[return-value]
+
+
+def kanji_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    return render_view_html(db_path, lambda: kanji_view(db_path, params))  # type: ignore[return-value]
+
+
+def sources_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    return render_view_html(db_path, lambda: sources_view(db_path, params))  # type: ignore[return-value]
+
+
+def flashcards_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    return render_view_html(db_path, lambda: flashcards_view(db_path, params))  # type: ignore[return-value]
+
+
+def capture_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    return render_view_html(db_path, lambda: capture_view(db_path, params))  # type: ignore[return-value]
+
+
+def settings_page(db_path: Path, params: dict[str, list[str]]) -> str:
+    return render_view_html(db_path, lambda: settings_view(db_path, params))  # type: ignore[return-value]
+
+
+def term_detail_page(db_path: Path, term_id: int, params: dict[str, list[str]] | None = None) -> str | None:
+    return render_view_html(db_path, lambda: term_detail_view(db_path, term_id, params))
+
+
+def kanji_detail_page(db_path: Path, kanji_id: int, params: dict[str, list[str]] | None = None) -> str | None:
+    return render_view_html(db_path, lambda: kanji_detail_view(db_path, kanji_id, params))
+
+
+def source_detail_page(db_path: Path, source_id: int, params: dict[str, list[str]] | None = None) -> str | None:
+    return render_view_html(db_path, lambda: source_detail_view(db_path, source_id, params))
+
+
+@dataclass(frozen=True)
+class PageRoute:
+    """A page URL: ``/terms`` or, with ``entity_prefix``, ``/terms/<id>``."""
+
+    path: str
+    build: Callable[..., PageView | None]
+    entity_prefix: bool = False
+    invalid_message: str = "Pagina nao encontrada."
+    missing_message: str = "Pagina nao encontrada."
+
+    def match(self, path: str) -> tuple[bool, str | None]:
+        """Whether ``path`` is this route, and the raw id segment for entity routes."""
+        if not self.entity_prefix:
+            return path == self.path, None
+        prefix = self.path + "/"
+        if path.startswith(prefix) and "/" not in path[len(prefix):]:
+            return True, path[len(prefix):]
+        return False, None
+
+
+PAGE_ROUTES: tuple[PageRoute, ...] = (
+    PageRoute("/", dashboard_view),
+    PageRoute("/capture", capture_view),
+    PageRoute("/settings", settings_view),
+    PageRoute("/terms", terms_view),
+    PageRoute("/terms", term_detail_view, True, "Termo invalido.", "Termo nao encontrado."),
+    PageRoute("/kanji", kanji_view),
+    PageRoute("/kanji", kanji_detail_view, True, "Kanji invalido.", "Kanji nao encontrado."),
+    PageRoute("/sources", sources_view),
+    PageRoute("/sources", source_detail_view, True, "Fonte invalida.", "Fonte nao encontrada."),
+    PageRoute("/flashcards", flashcards_view),
+)
+
+
 class CatalogRequestHandler(BaseHTTPRequestHandler):
     db_path: Path = DEFAULT_DB_PATH
 
@@ -4684,11 +5205,11 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         path = parsed.path.rstrip("/") or "/"
 
-        if path == "/":
-            self.respond_html(dashboard_page(self.db_path, params))
-            return
-        if path == "/live/revision":
-            self.respond_json(live_revision_payload(self.db_path))
+        if path == "/live/changes":
+            try:
+                self.respond_json(live_changes_payload(self.db_path, params))
+            except ValueError as exc:
+                self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         if path == "/api/languages":
             self.respond_json(api_languages_payload(self.db_path))
@@ -4696,8 +5217,8 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/capture":
             self.respond_json(api_capture_payload(self.db_path))
             return
-        if path == "/capture":
-            self.respond_html(capture_page(self.db_path, params))
+        if path == "/api/settings":
+            self.respond_json(api_settings_payload(self.db_path))
             return
         if path == "/api/terms":
             self.respond_json(api_terms_payload(self.db_path, params))
@@ -4719,40 +5240,6 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/actions/sync-anki/status":
             self.respond_sync_anki_job_status(params)
             return
-        if path == "/terms":
-            self.respond_html(terms_page(self.db_path, params))
-            return
-        if path.startswith("/terms/"):
-            term_id = self.parse_int_tail(path, "/terms/")
-            if term_id is None:
-                self.respond_not_found("Termo invalido.")
-                return
-            page = term_detail_page(self.db_path, term_id, params)
-            if page is None:
-                self.respond_not_found("Termo nao encontrado.")
-                return
-            self.respond_html(page)
-            return
-        if path == "/kanji":
-            self.respond_html(kanji_page(self.db_path, params))
-            return
-        if path.startswith("/kanji/"):
-            kanji_id = self.parse_int_tail(path, "/kanji/")
-            if kanji_id is None:
-                self.respond_not_found("Kanji invalido.")
-                return
-            page = kanji_detail_page(self.db_path, kanji_id, params)
-            if page is None:
-                self.respond_not_found("Kanji nao encontrado.")
-                return
-            self.respond_html(page)
-            return
-        if path == "/sources":
-            self.respond_html(sources_page(self.db_path, params))
-            return
-        if path == "/sources/live":
-            self.respond_json(sources_live_payload(self.db_path, params))
-            return
         if path.startswith("/sources/") and path.endswith("/image"):
             source_id = self.parse_int_tail(path[:-6], "/sources/")
             if source_id is None:
@@ -4760,22 +5247,42 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
                 return
             self.respond_source_image(source_id)
             return
-        if path.startswith("/sources/"):
-            source_id = self.parse_int_tail(path, "/sources/")
-            if source_id is None:
-                self.respond_not_found("Fonte invalida.")
-                return
-            page = source_detail_page(self.db_path, source_id, params)
-            if page is None:
-                self.respond_not_found("Fonte nao encontrada.")
-                return
-            self.respond_html(page)
-            return
-        if path == "/flashcards":
-            self.respond_html(flashcards_page(self.db_path, params))
-            return
 
+        for route in PAGE_ROUTES:
+            matched, raw_id = route.match(path)
+            if matched:
+                self.respond_page(route, raw_id, params)
+                return
         self.respond_not_found("Pagina nao encontrada.")
+
+    def wants_fragments(self) -> bool:
+        return FRAGMENTS_MEDIA_TYPE in (self.headers.get("Accept") or "").lower()
+
+    def respond_page(self, route: PageRoute, raw_id: str | None, params: dict[str, list[str]]) -> None:
+        """Render a page route as HTML, or as its live regions for the live updater."""
+        fragments = self.wants_fragments()
+        args: tuple[object, ...] = (self.db_path,)
+        if route.entity_prefix:
+            try:
+                args += (int(raw_id or ""),)
+            except ValueError:
+                self.respond_page_missing(route.invalid_message, fragments=fragments)
+                return
+        revision = catalog_revision_at(self.db_path)
+        view = route.build(*args, params)
+        if view is None:
+            self.respond_page_missing(route.missing_message, fragments=fragments)
+            return
+        if fragments:
+            self.respond_json(fragments_payload(view, revision))
+            return
+        self.respond_html(render_page(view, revision))
+
+    def respond_page_missing(self, message: str, *, fragments: bool) -> None:
+        if fragments:
+            self.respond_json({"error": message}, status=HTTPStatus.NOT_FOUND)
+            return
+        self.respond_not_found(message)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -4787,8 +5294,14 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         if path == "/actions/sync-kanji-anki":
             self.run_sync_anki_action()
             return
+        if path == web_knowledge.ACTION_PATH:
+            self.run_knowledge_action()
+            return
         if path == "/actions/capture-languages":
             self.run_capture_languages_action()
+            return
+        if path == "/actions/settings":
+            self.run_settings_action()
             return
         if path == "/actions/capture-skip-rules":
             self.run_capture_skip_rule_action()
@@ -4915,6 +5428,34 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             return
         self.redirect(self.append_notice("/capture", message=message, level="info"))
 
+    def run_settings_action(self) -> None:
+        """Save or reset one section of /settings (see web_settings.apply_settings_form)."""
+        # Blank values matter here: an empty hotkey turns the hotkey off.
+        form_data = self.read_form_data(keep_blank_values=True)
+        section_key = first_value(form_data, "section", "")
+
+        def back(message: str, level: str) -> str:
+            target = build_query_path("/settings", {"section": section_key})
+            notice_path = self.append_notice(target, message=message, level=level)
+            return f"{notice_path}#{section_key}" if section_key.isidentifier() else notice_path
+
+        try:
+            with db_connect(self.db_path) as connection:
+                result = web_settings.apply_settings_form(connection, form_data)
+                connection.commit()
+        except SystemExit as exc:
+            if self.prefers_json_response():
+                self.respond_json({"message": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.redirect(back(str(exc), "error"))
+            return
+        if self.prefers_json_response():
+            self.respond_json(
+                {"message": result.message, "section": result.section.key, "settings": result.values}
+            )
+            return
+        self.redirect(back(result.message, "info"))
+
     def run_capture_skip_rule_action(self) -> None:
         form_data = self.read_form_data()
         op = first_value(form_data, "op", "add").strip()
@@ -4986,6 +5527,39 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             self.respond_json({"message": message})
             return
         self.redirect(self.append_notice("/capture", message=message, level="info"))
+
+    def run_knowledge_action(self) -> None:
+        form_data = self.read_form_data()
+        item_kind = first_value(form_data, "kind")
+        operation = first_value(form_data, "op")
+        next_path = first_value(form_data, "next", "/") or "/"
+        try:
+            item_id = int(first_value(form_data, "id"))
+        except ValueError:
+            self.respond_not_found("Item invalido.")
+            return
+        if item_kind not in knowledge.ITEM_TABLES or operation not in (
+            web_knowledge.ACTION_MARK,
+            web_knowledge.ACTION_CLEAR,
+        ):
+            self.respond_not_found("Acao de conhecimento invalida.")
+            return
+        try:
+            with db_connect(self.db_path) as connection:
+                if operation == web_knowledge.ACTION_MARK:
+                    knowledge.mark_known(connection, item_kind, item_id)
+                    message = "Marcado como conhecido."
+                else:
+                    knowledge.clear_mark(connection, item_kind, item_id)
+                    message = "Marcacao removida."
+                status, score = knowledge.load_status(connection, item_kind, item_id)
+        except ValueError as exc:
+            self.respond_not_found(str(exc))
+            return
+        if self.prefers_json_response():
+            self.respond_json({"message": message, "status": status, "score": score})
+            return
+        self.redirect(self.append_notice(next_path, message=message, level="info"))
 
     def run_source_language_action(self, source_id: int) -> None:
         form_data = self.read_form_data()
@@ -5085,7 +5659,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def read_form_data(self) -> dict[str, list[str]]:
+    def read_form_data(self, *, keep_blank_values: bool = False) -> dict[str, list[str]]:
         content_length = self.headers.get("Content-Length")
         if content_length is None:
             return {}
@@ -5094,7 +5668,7 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             return {}
         raw_body = self.rfile.read(length).decode("utf-8")
-        return parse_qs(raw_body)
+        return parse_qs(raw_body, keep_blank_values=keep_blank_values)
 
     def run_catalog_command(self, *command_parts: str) -> subprocess.CompletedProcess[str]:
         return run_catalog_command_for_db(self.db_path, *command_parts)
@@ -5154,9 +5728,23 @@ class CatalogRequestHandler(BaseHTTPRequestHandler):
             self.redirect(self.append_notice(next_path, message=message, level="error"))
             return
 
+        knowledge_result = self.run_catalog_command("sync-knowledge")
+        knowledge_lines = command_output_lines(
+            stdout=knowledge_result.stdout,
+            stderr=knowledge_result.stderr,
+        )
+        if knowledge_result.returncode != 0:
+            message = sync_failure_message(
+                knowledge_lines,
+                "Falha ao ler o progresso de estudo do Anki.",
+            )
+            self.redirect(self.append_notice(next_path, message=message, level="error"))
+            return
+
         term_message = sync_result_message(term_lines, "Termos sincronizados.")
         kanji_message = sync_result_message(kanji_lines, "Kanji sincronizados.")
-        message = f"{term_message} {kanji_message}"
+        knowledge_message = last_output_line(knowledge_lines, "Progresso de estudo lido.")
+        message = f"{term_message} {kanji_message} {knowledge_message}"
         self.redirect(self.append_notice(next_path, message=message, level="info"))
 
 

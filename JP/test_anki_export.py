@@ -22,12 +22,17 @@ TESTS_ROOT = Path(__file__).resolve().parent
 if str(TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(TESTS_ROOT))
 
+import anki_connect
 import lang_jp
 from lang_jp import SCHEMA_PATH, db_connect
 
 
 def strip_html(value: str) -> str:
     return re.sub(r"<[^>]+>", "", value or "").strip()
+
+
+class FakeAnkiError(Exception):
+    """An action AnkiConnect would answer with an error."""
 
 
 class FakeAnki:
@@ -38,6 +43,8 @@ class FakeAnki:
         self.decks: set[str] = set()
         self.add_note_options: list[dict[str, object]] = []
         self.repositioned: list[list[int]] = []
+        self.requests: list[str] = []  # one entry per HTTP request
+        self.nested_actions: list[str] = []  # actions carried inside `multi` requests
         self.next_id = 1000
 
     def add_existing(self, *, deck: str, front: str, back: str, tags: list[str]) -> int:
@@ -53,10 +60,15 @@ class FakeAnki:
         return note_id
 
     def _matches(self, note: dict[str, object], query: str) -> bool:
-        deck = re.search(r'deck:"((?:[^"\\]|\\.)*)"', query)
+        # `deck:"X" -deck:"X::*"` is how the sync asks for a deck without its subdecks.
+        deck_pattern = r'deck:"((?:[^"\\]|\\.)*)"'
+        without_subdecks = re.search("-" + deck_pattern, query) is not None
+        query = re.sub("-" + deck_pattern, "", query)
+        deck = re.search(deck_pattern, query)
         if deck:
             name = deck.group(1).replace('\\"', '"')
-            if note["deck"] != name and not str(note["deck"]).startswith(name + "::"):
+            in_subdeck = str(note["deck"]).startswith(name + "::")
+            if note["deck"] != name and (without_subdecks or not in_subdeck):
                 return False
         model = re.search(r'note:"([^"]*)"', query)
         if model and note["model"] != model.group(1):
@@ -82,9 +94,38 @@ class FakeAnki:
                 return True
         return False
 
-    def __call__(self, *, host: str, port: int, action: str, params: dict | None = None) -> object:
-        del host, port
-        params = params or {}
+    def __call__(
+        self,
+        *,
+        host: str,
+        port: int,
+        action: str,
+        params: dict | None = None,
+        timeout: float = 0,
+    ) -> object:
+        del host, port, timeout
+        self.requests.append(action)
+        try:
+            return self._run(action, params or {})
+        except FakeAnkiError:
+            if action == "addNote":
+                return None  # anki_connect.request turns the duplicate error into None
+            raise
+
+    def _run(self, action: str, params: dict) -> object:
+        if action == "multi":
+            replies = []
+            for nested in params["actions"]:
+                # The sync versions every nested action so each one answers with
+                # a result/error envelope, as AnkiConnect does from version 5 on.
+                assert nested["version"] == 6, nested
+                self.nested_actions.append(nested["action"])
+                try:
+                    result = self._run(nested["action"], nested.get("params") or {})
+                    replies.append({"result": result, "error": None})
+                except FakeAnkiError as exc:
+                    replies.append({"result": None, "error": str(exc)})
+            return replies
         if action == "version":
             return 6
         if action == "modelNames":
@@ -96,7 +137,16 @@ class FakeAnki:
             return {"actions": ["repositionNewCards"]}
         if action == "findNotes":
             return [note_id for note_id, note in self.notes.items() if self._matches(note, params["query"])]
+        if action == "findCards":
+            return [
+                card_id
+                for note in self.notes.values()
+                if self._matches(note, params["query"])
+                for card_id in note["cards"]
+            ]
         if action == "notesInfo":
+            # Like the real AnkiConnect, an unknown id yields an empty object in
+            # its slot rather than being left out of the list.
             return [
                 {
                     "noteId": note_id,
@@ -108,8 +158,9 @@ class FakeAnki:
                     },
                     "cards": list(self.notes[note_id]["cards"]),
                 }
-                for note_id in params["notes"]
                 if note_id in self.notes
+                else {}
+                for note_id in params["notes"]
             ]
         if action == "cardsInfo":
             return [{"cardId": card_id, "type": 0} for card_id in params["cards"]]
@@ -117,7 +168,7 @@ class FakeAnki:
             note = params["note"]
             self.add_note_options.append(dict(note.get("options") or {}))
             if self._is_duplicate(note):
-                return None  # anki_connect_request turns the duplicate error into None
+                raise FakeAnkiError("cannot create note because it is a duplicate")
             note_id = self.next_id
             self.next_id += 1
             self.notes[note_id] = {
@@ -566,7 +617,7 @@ class KanjiCardTest(AnkiExportTestCase):
 
 class AnkiConnectSyncTest(AnkiExportTestCase):
     def run_sync(self, fake: FakeAnki, **overrides: object) -> None:
-        with mock.patch.object(lang_jp, "anki_connect_request", fake), mock.patch("builtins.print"):
+        with mock.patch.object(anki_connect, "request", fake), mock.patch("builtins.print"):
             lang_jp.sync_anki(self.sync_args(**overrides))
 
     def card_note_ids(self) -> dict[tuple[str, str], int | None]:
@@ -661,6 +712,152 @@ class AnkiConnectSyncTest(AnkiExportTestCase):
         self.assertEqual(len(fake.notes), 1)
         self.assertEqual(self.card_note_ids()[("ja", "山")], existing)
         self.assertIn("lang_ja", fake.notes[existing]["tags"])
+
+    def test_note_deleted_in_anki_is_recreated(self) -> None:
+        connection = self.connect()
+        try:
+            self.add_term(connection, language_code="ja", lemma="山", reading="ヤマ", meaning="montanha")
+            self.generate(connection)
+        finally:
+            connection.close()
+
+        fake = FakeAnki()
+        self.run_sync(fake)
+        stale = self.card_note_ids()[("ja", "山")]
+        del fake.notes[stale]
+        connection = self.connect()
+        try:
+            connection.execute("UPDATE flashcards SET export_status = 'pending'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.run_sync(fake)
+        recreated = self.card_note_ids()[("ja", "山")]
+        self.assertNotEqual(recreated, stale)
+        self.assertEqual(list(fake.notes), [recreated])
+
+    WRITE_ACTIONS = {"addNote", "updateNoteFields", "changeDeck", "addTags", "removeTags"}
+
+    def mark_all_pending(self) -> None:
+        connection = self.connect()
+        try:
+            connection.execute("UPDATE flashcards SET export_status = 'pending'")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def writes(self, fake: FakeAnki) -> list[str]:
+        return [action for action in fake.nested_actions if action in self.WRITE_ACTIONS]
+
+    def test_requests_do_not_grow_with_the_number_of_cards(self) -> None:
+        request_counts = []
+        for card_count in (2, 40):
+            with self.subTest(card_count=card_count):
+                connection = self.connect()
+                try:
+                    connection.execute("DELETE FROM terms")
+                    for number in range(card_count):
+                        self.add_term(connection, language_code="es", lemma=f"palabra{number}")
+                    self.generate(connection)
+                finally:
+                    connection.close()
+                fake = FakeAnki()
+                self.run_sync(fake)
+                self.assertEqual(len(fake.notes), card_count)
+                self.assertTrue(all(self.card_note_ids().values()))
+                # No write ever travels as a request of its own.
+                self.assertFalse(self.WRITE_ACTIONS & set(fake.requests))
+                request_counts.append(len(fake.requests))
+        self.assertEqual(request_counts[0], request_counts[1])
+
+    def test_resyncing_cards_anki_already_has_writes_nothing(self) -> None:
+        connection = self.connect()
+        try:
+            self.add_term(connection, language_code="es", lemma="casa", meaning="casa")
+            self.add_term(connection, language_code="ja", lemma="山", reading="ヤマ", meaning="montanha")
+            self.generate(connection)
+        finally:
+            connection.close()
+
+        fake = FakeAnki()
+        self.run_sync(fake)
+        self.assertEqual(self.writes(fake), ["addNote", "addNote"])
+        linked = self.card_note_ids()
+
+        # Anki keeps whatever capitalisation a tag was first typed with.
+        for note in fake.notes.values():
+            note["tags"] = [tag.capitalize() for tag in note["tags"]]
+
+        fake.nested_actions.clear()
+        self.mark_all_pending()
+        self.run_sync(fake)
+        self.assertEqual(self.writes(fake), [])
+        self.assertEqual(self.card_note_ids(), linked)
+        connection = self.connect()
+        try:
+            statuses = {row[0] for row in connection.execute("SELECT export_status FROM flashcards")}
+        finally:
+            connection.close()
+        self.assertEqual(statuses, {"exported"})
+
+    def test_note_changed_in_anki_gets_only_the_differences_fixed(self) -> None:
+        connection = self.connect()
+        try:
+            self.add_term(connection, language_code="es", lemma="casa", meaning="casa")
+            self.add_term(connection, language_code="es", lemma="perro", meaning="cão")
+            self.add_term(connection, language_code="es", lemma="gato", meaning="gato")
+            self.generate(connection)
+            backs = dict(
+                connection.execute(
+                    "SELECT t.lemma, f.back_text FROM flashcards f JOIN terms t ON t.id = f.term_id"
+                ).fetchall()
+            )
+        finally:
+            connection.close()
+
+        fake = FakeAnki()
+        self.run_sync(fake)
+        note_ids = self.card_note_ids()
+        casa, perro, gato = (note_ids[("es", lemma)] for lemma in ("casa", "perro", "gato"))
+        fake.notes[casa]["fields"]["Back"] = "edited by hand"
+        fake.notes[perro]["deck"] = "Lang::Spanish::Later"
+        fake.notes[gato]["tags"].remove("lang_es")
+        fake.notes[gato]["tags"].append("stray")
+
+        fake.nested_actions.clear()
+        self.mark_all_pending()
+        self.run_sync(fake)
+        self.assertEqual(
+            sorted(self.writes(fake)),
+            ["addTags", "changeDeck", "removeTags", "updateNoteFields"],
+        )
+        self.assertEqual(fake.notes[casa]["fields"]["Back"], backs["casa"])
+        self.assertEqual(fake.deck_of(perro), "Lang::Spanish")
+        self.assertIn("lang_es", fake.notes[gato]["tags"])
+        self.assertNotIn("stray", fake.notes[gato]["tags"])
+        self.assertEqual(self.card_note_ids(), note_ids)
+
+    def test_same_front_twice_in_one_sync_shares_the_note(self) -> None:
+        connection = self.connect()
+        try:
+            self.add_term(connection, language_code="es", lemma="casa", meaning="casa")
+            self.add_term(connection, language_code="es", lemma="hogar", meaning="lar")
+            self.generate(connection)
+            # Two cards ending up with one front, which generation normally prevents.
+            connection.execute(
+                "UPDATE flashcards SET front_text = (SELECT MIN(front_text) FROM flashcards)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        fake = FakeAnki()
+        self.run_sync(fake)
+        note_ids = self.card_note_ids()
+        self.assertEqual(len(fake.notes), 1)
+        self.assertEqual(note_ids[("es", "casa")], note_ids[("es", "hogar")])
+        self.assertIsNotNone(note_ids[("es", "casa")])
 
     def test_single_language_sync_only_reorders_its_own_deck(self) -> None:
         connection = self.connect()

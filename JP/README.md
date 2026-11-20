@@ -5,6 +5,8 @@ Local foundation for cataloging vocabulary from game screenshots and text, in an
 ## Files
 - `schema.sql`: SQLite schema.
 - `lang_jp.py`: CLI for sources, terms, and recurrence.
+- `settings.py`: registry of every user-tunable setting (type, default, range, label); values live in the `settings` table. See [Settings](#settings).
+- `web_settings.py`: the `/settings` page of the web UI, rendered from that registry.
 - `languages.py`: language registry, offline language detection, mixed-text splitting and per-language analyzers (Sudachi for Japanese, a generic tokenizer for word-delimited languages, jieba/pythainlp when installed).
 - `capture_worker.py`: Python OCR + linguistic-analysis worker for passive capture jobs. Picks the OCR engines from the capture language set, merges their output and sorts every block per language.
 - `translate_overlay.py`: reading overlay started by the tray daemon: reads the primary monitor with the capture OCR engines and draws translations, furigana or word-by-word glosses over the text.
@@ -79,11 +81,11 @@ python .\lang_jp.py enable-language --code de --deck-name "Lang::Deutsch"
 
 Detection is offline: script ranges decide CJK, Hangul, Cyrillic, Arabic, Hebrew, Greek, Thai and Devanagari; stop words and diacritics tell Latin-script languages apart. Mixed lines are split into script runs, so a Korean line with an English button label produces one Korean and one English segment. Pass `--candidates` to restrict detection to the languages you actually study.
 
-Japanese keeps JMdict meanings, Sudachi analysis, kanji and romaji. Other languages get lemmas from `simplemma` (installed by both requirement files; lower-cased surface as fallback), meanings from machine translation of the lemma into `LANG_JP_TERM_TRANSLATION_TARGET` (default `pt`), and, when the profile has readings, a Latin reading through the romanizer hook: pinyin for Chinese (`pypinyin`, optional), Revised Romanization for Korean and a transliteration table for Russian and Ukrainian (both built in). Chinese uses `jieba` when installed and falls back to character runs.
+Japanese keeps JMdict meanings, Sudachi analysis, kanji and romaji. Other languages get lemmas from `simplemma` (installed by both requirement files; lower-cased surface as fallback), meanings from machine translation of the lemma into the meaning language (setting `translation.meaning_language`, default `pt`), and, when the profile has readings, a Latin reading through the romanizer hook: pinyin for Chinese (`pypinyin`, optional), Revised Romanization for Korean and a transliteration table for Russian and Ukrainian (both built in). Chinese uses `jieba` when installed and falls back to character runs.
 
 ### Passive capture in every language
 
-The passive capture catalogs every language that appears on screen; nothing is dropped only because of its language. Which languages are kept lives in the database (`languages.enabled` plus `languages.capture_enabled`), defaults to every built-in profile except the gloss language (`LANG_JP_TERM_TRANSLATION_TARGET`, `pt` by default: meanings are written in it, so its screens are not study material), and is edited from three places that all write the same flags:
+The passive capture catalogs every language that appears on screen; nothing is dropped only because of its language. Which languages are kept lives in the database (`languages.enabled` plus `languages.capture_enabled`), defaults to every built-in profile except the gloss language (setting `translation.meaning_language`, `pt` by default: meanings are written in it, so its screens are not study material), and is edited from three places that all write the same flags:
 
 - the tray menu `Capture languages` (checkbox per language, `Capture every language`, `Capture Japanese only`);
 - the web page `/capture` (also lists the OCR plan, the capture profiles and the recent captures with their window titles);
@@ -91,13 +93,13 @@ The passive capture catalogs every language that appears on screen; nothing is d
 
 The worker reads the set per job, so changes apply to the next capture without a restart. `LANG_CAPTURE_LANGUAGES` is no longer required; when set in the worker environment it overrides the database for that run.
 
-Latin-script lines are detected against every language, not only the captured ones, and the screen's Latin text as a whole sets a prior that decides short strings with no stop word ("Seguir", "Mostrar mais"). A Portuguese screen with Portuguese off is therefore rejected instead of being filed as Spanish or English. Non-Japanese lines read with OCR confidence below `LANG_JP_MIN_TERM_CONFIDENCE` (default 0.5) are kept as segments without candidates. The word tokenizer skips links, e-mail addresses, @handles, #hashtags, letters stuck to numbers (`21k`) and oddly cased tokens (`kStrear`, `YouTube`), and folds all-caps lines and all-caps words longer than five letters to lower case. Single letters that are not words in their language and Latin lemmas without a vowel (unless written in capitals) are blacklisted.
+Latin-script lines are detected against every language, not only the captured ones, and the screen's Latin text as a whole sets a prior that decides short strings with no stop word ("Seguir", "Mostrar mais"). A Portuguese screen with Portuguese off is therefore rejected instead of being filed as Spanish or English. Non-Japanese lines read with OCR confidence below the setting `ocr.min_term_confidence` (default 0.5) are kept as segments without candidates. The word tokenizer skips links, e-mail addresses, @handles, #hashtags, letters stuck to numbers (`21k`) and oddly cased tokens (`kStrear`, `YouTube`), and folds all-caps lines and all-caps words longer than five letters to lower case. Single letters that are not words in their language and Latin lemmas without a vowel (unless written in capitals) are blacklisted.
 
-OCR engines follow the set automatically (`LANG_JP_OCR_BACKEND=auto`, the default): `meikiocr` alone when only `ja` is enabled, otherwise `meikiocr` for the Japanese pass plus one EasyOCR reader per compatible language group (all Latin-script languages share one reader; `ko`, `zh`, `th`, Cyrillic, Arabic and Devanagari each get their own, paired with English when English is enabled). Readers are cached for the life of the worker, EasyOCR detection runs once per capture and later readers only re-read boxes nobody read confidently, and the blocks of every engine are merged by bounding-box overlap and text similarity. Greek and Hebrew have no EasyOCR model, so their text only enters through `ingest-text`. `LANG_JP_OCR_BACKEND=meikiocr` or `easyocr` still force the old single-engine flows.
+OCR engines follow the set automatically (setting `ocr.backend` = `auto`, the default): `meikiocr` alone when only `ja` is enabled, otherwise `meikiocr` for the Japanese pass plus one EasyOCR reader per compatible language group (all Latin-script languages share one reader; `ko`, `zh`, `th`, Cyrillic, Arabic and Devanagari each get their own, paired with English when English is enabled). Readers are cached for the life of the worker, EasyOCR detection runs once per capture and later readers only re-read boxes nobody read confidently, and the blocks of every engine are merged by bounding-box overlap and text similarity. Greek and Hebrew have no EasyOCR model, so their text only enters through `ingest-text`. Setting `ocr.backend` to `meikiocr` or `easyocr` still forces the old single-engine flows; the worker reloads its models for the next job, no restart needed.
 
-The multi-reader flow reads captures at up to `LANG_JP_MULTI_OCR_MAX_SIDE` (default 3840, so a 4K screen is read at full size); the tray's `OCR size` (`LANG_JP_OCR_MAX_SIDE`) only applies to the single-engine EasyOCR flow. Desktop text shrunk to 1600px came out as garbage and left almost every box to the slower readers: on a 4K screen with every language on, full size took about 45s instead of 245s. A later reader's text never replaces another one when it looks like a lookalike misreading of Latin text (a lone Cyrillic or Greek letter, a word mixing them with Latin, Devanagari or Arabic digits next to Latin text). With many languages on, a capture takes tens of seconds, so prefer `Cadence: After source ready` over a short fixed interval.
+The multi-reader flow reads captures at up to `ocr.multi_max_side` (default 3840, so a 4K screen is read at full size); the tray's `OCR size` (setting `ocr.max_side`) only applies to the single-engine EasyOCR flow. Desktop text shrunk to 1600px came out as garbage and left almost every box to the slower readers: on a 4K screen with every language on, full size took about 45s instead of 245s. A later reader's text never replaces another one when it looks like a lookalike misreading of Latin text (a lone Cyrillic or Greek letter, a word mixing them with Latin, Devanagari or Arabic digits next to Latin text). With many languages on, a capture takes tens of seconds, so prefer `Cadence: After source ready` over a short fixed interval.
 
-Auto-promotion only creates terms for words the language's `simplemma` dictionary knows; the rest (OCR misreadings, names) stay pending candidates for review. Japanese, Korean, Chinese, Thai and Vietnamese have no such dictionary and promote as before. Meanings of new terms are machine-translated after the source is committed, one short write per term, so the daemon can keep enqueueing. Whole-source translations are no longer made for every capture: open a source in the catalog and press **Traduzir** (`POST /actions/sources/<id>/translate`), which translates its lines in a few batched requests and stores the result. `LANG_JP_ENABLE_SOURCE_TRANSLATION=1` brings back the background queue in the worker. No window is skipped by default; see [Skipping windows](#skipping-windows-capture-blacklist).
+Auto-promotion only creates terms for words the language's `simplemma` dictionary knows; the rest (OCR misreadings, names) stay pending candidates for review. Japanese, Korean, Chinese, Thai and Vietnamese have no such dictionary and promote as before. Meanings of new terms are machine-translated after the source is committed, one short write per term, so the daemon can keep enqueueing. Whole-source translations are no longer made for every capture: open a source in the catalog and press **Traduzir** (`POST /actions/sources/<id>/translate`), which translates its lines in a few batched requests and stores the result. The setting `translation.translate_every_capture` brings back the background queue in the worker. No window is skipped by default; see [Skipping windows](#skipping-windows-capture-blacklist).
 
 Capture profiles pin a window to a fixed language set: the daemon records the foreground window title and process name with every job (`capture_jobs.window_title`, `capture_jobs.process_name`, off with `record_foreground_window = false`), and a matching profile fixes the languages for that capture, skipping detection when it has a single language. Sources from the capture get the window title as title and the profile name as game.
 
@@ -131,7 +133,7 @@ Searches (`q`) ignore case in every script (`água` finds `ÁGUA`, `привет
 ### Anki across languages
 
 - **Decks.** Each card goes to its language's deck (`languages.deck_name`, default `Lang::<Name>`); characters share the word deck of their language (kanji in `Lang::Japanese`, hanzi in `Lang::Chinese`). `--deck-name` still forces one deck for everything.
-- **What `--language all` generates.** Every enabled language except the gloss language (`LANG_JP_TERM_TRANSLATION_TARGET`, `pt` by default), whose cards would show the same word on both sides. `generate-flashcards --language pt` still creates them on request. Existing cards are exported and synced whatever their language.
+- **What `--language all` generates.** Every enabled language except the gloss language (setting `translation.meaning_language`, `pt` by default), whose cards would show the same word on both sides. `generate-flashcards --language pt` still creates them on request. Existing cards are exported and synced whatever their language.
 - **Fields.** Readings appear only for languages that have them: kana plus romaji for Japanese, then `Pinyin` (zh), `Romanization` (ko) or `Transliteration` (ru, uk). Character cards exist only for languages with characters, and on/kun readings are Japanese-only. Term meanings are in the gloss language, kanji meanings stay in English. Non-Japanese fields carry `lang="xx" dir="auto"`, so Arabic and Hebrew render right to left and Han text picks the right font. Japanese fields are byte-identical to before.
 - **Tags.** Every note gets `lang_xx` (Japanese notes also keep `jp`). Older cards that only have `jp` get `lang_ja` on export and sync.
 - **Identity.** AnkiConnect notes are found by their stored note id, then by the `term_N` tag, then by front text in the deck. A front match never links a note tagged for another language. Japanese keeps Anki's collection-wide duplicate check; other languages check duplicates per deck, so `ser` (es) and `ser` (it) both get a note.
@@ -142,7 +144,50 @@ Databases created before this change are upgraded in place on the next command: 
 
 On Windows, the single entry point is `..\open_lang.cmd` from the repository root. It builds `desktop_capture_daemon.exe` when Cargo is available (otherwise it reuses an existing build), starts the tray daemon, and opens the catalog in the browser. If the daemon is already running, it only opens the catalog.
 
+To start the tray daemon automatically at logon (20 seconds after sign-in, without opening the browser), run `powershell -ExecutionPolicy Bypass -File ..\register_startup.ps1` once from the repository root. It registers a per-user scheduled task named "Lang tray daemon"; pass `-DelaySeconds N` to change the delay or `-Remove` to unregister it.
+
+However the daemon is opened (shortcut, `open_lang.cmd`, the logon task), it starts the capture service by itself `capture.autostart_delay_seconds` seconds later (default 20), unless the service was started, paused or stopped by hand in the meantime. Turn it off with the setting `capture.autostart` (web UI `/settings`, or `lang_jp.py set-setting capture.autostart 0`); both apply the next time the daemon opens.
+
 The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-open-browser` on `web_port` (default 8766), restarts it with backoff if it exits, and stops it on Quit. If something else is already serving that port (for example a manual `browse`), the daemon reuses it instead of starting a second server. Web server output goes to `data/catalog_web.log`. Use `Open Lang` in the tray menu, or double-click the tray icon, to open the catalog. Only one daemon runs at a time; launching it again just opens the catalog. To follow the capture log live, use `Tail logs` in the tray menu.
+
+## Live updates in the web UI
+
+Catalog pages update themselves while the capture worker runs: a new source shows up in the lists, a source page fills in its term meanings and its English translation as they arrive, and `/capture` shows the job being processed, its stage and how long it has been running. Nothing reloads; only the parts of a page whose content changed are swapped, and sort order, scroll position and whatever you are typing stay as they were.
+
+How it works:
+
+- **Change log.** SQLite triggers append an entity key (`source`, `term`, `kanji`, `flashcard`, `language`, `setting`, `job`) to the `catalog_changes` table on every write to a table the UI shows, whoever writes it: the worker, the CLI, a web action or the Anki sync. The triggers are generated from `CHANGE_SPECS` in `catalog_changes.py` and kept in sync on every connection. Capture jobs only log `job`, so rejected frames and job-status churn never wake a catalog page. The log keeps its last 20,000 rows.
+- **Pages watch what they show.** Each page is a view (`web_views.PageView`) with named live regions and a watch set: a list page watches its kind (`term`), a source page watches itself plus its linked terms and characters.
+- **Polling.** The browser asks `/live/changes?since=<revision>&watch=...` every 2.5 s while the tab is visible (one indexed query on a read-only connection). Only when something watched changed does it fetch the same URL with `Accept: application/vnd.lang.fragments+json` and swap the regions whose hash differs. A region holding the focused field, or any region while the Anki sync runs, waits until focus leaves it.
+- **Job progress.** The worker records the stage a job enters (`ocr`, `analyze`, `save`, `meanings`) in `capture_jobs.progress_step` and `progress_at`; the log lines in `capture_daemon.log` are unchanged.
+
+## Settings
+
+OCR options, capture cadence, translation switches, the reading overlay and the hotkeys are **settings**. `settings.py` declares each one once (key, type, default, allowed range, the text shown for it); the values live in the `settings` table of the catalog database, where only values that differ from the default have a row.
+
+They are edited from three places that all write the same rows:
+
+- **Web UI:** `/settings` ("Ajustes" in the menu; "Open settings (web)" in the tray). One form per section, generated from the registry. A save writes only the fields you changed, and each section shows the values in use, updated live when the tray or the CLI changes one.
+- **Tray:** `Capture interval`, `Cadence`, `OCR size`, `Toggle debug mode` and the `Reading overlay` submenu.
+- **CLI:** `python .\lang_jp.py list-settings`, `set-setting <key> <value>` (`on`/`off` for switches), `reset-setting <key>`.
+
+Nothing needs a restart: the worker reads one snapshot per job, the overlay reads one per press, and the tray re-reads the table every few seconds. Changing an engine setting (`ocr.backend`, `ocr.easyocr_gpu`, `ocr.easyocr_languages`) makes the worker reload its OCR models on the next job. The three hotkeys are the exception: the tray registers them when it starts, so use `Restart app` after changing one.
+
+| Section | Settings |
+| --- | --- |
+| `ocr` | `backend`, `easyocr_gpu`, `max_side`, `multi_max_side`, `min_confidence`, `min_term_confidence`; advanced: `confident_read`, `meikiocr_min_char_confidence`, `horizontal_min_ratio`, `horizontal_max_angle`, `region_padding`, `max_regions`, `easyocr_languages`, `progress_interval_seconds` |
+| `capture` | `interval_seconds`, `after_source_ready`, `auto_promote_terms`, `debug_log`; advanced: `stale_job_hours` |
+| `translation` | `auto_term_meanings`, `meaning_language`, `translate_every_capture`, `source_language`, `overlay_language`; advanced: `term_timeout_seconds` |
+| `overlay` | `enabled`, `mode`, `languages`, `scale` |
+| `hotkeys` | `manual_capture`, `overlay_toggle`, `overlay_mode` |
+
+`GET /api/settings` returns every setting with its value, default and where the value comes from.
+
+**Environment pins.** The old `LANG_JP_*` and `LANG_OVERLAY_*` variables still work, as pins for one-off runs: when one is set (and valid) it wins over the database and the page shows that setting read-only, naming the variable. `list-settings` shows `(env LANG_JP_...)` for a pinned setting. The daemon no longer starts the worker with `LANG_JP_OCR_MAX_SIDE` or `LANG_JP_CAPTURE_DEBUG`.
+
+**Not settings.** Where things are and how processes are spawned (database path, spool and log paths, Python executables, `web_port`, `auto_start_worker`, `auto_process_jobs`, dedupe) stay in `desktop_capture_daemon\capture_daemon.toml`: the daemon needs them before it can open the database. `LANG_JP_JMDICT_DB_PATH` stays an environment variable for the same reason. Capture languages, capture profiles and skip rules keep their own tables and the `/capture` page.
+
+**Adding a setting:** add a `Setting(...)` to `REGISTRY` in `settings.py` and read it from the `Settings` snapshot where it is used. The page, the API, the CLI and the validation pick it up from the registry.
 
 ## Passive capture workflow
 1. Prepare a dedicated Python 3.12 environment for the capture worker and install `requirements-capture.txt`.
@@ -156,12 +201,12 @@ The daemon supervises the catalog web server: it runs `lang_jp.py browse --no-op
    - `python .\lang_jp.py ignore-source --source-id N`
    - `python .\lang_jp.py delete-source --source-id N [--delete-image]` (permanent; terms stay, their stats are recalculated; also on the source page in the web UI)
 
-The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example` (including `record_foreground_window`).
+The daemon reads `desktop_capture_daemon\capture_daemon.toml` when present. A starter template lives at `desktop_capture_daemon\capture_daemon.toml.example` (including `record_foreground_window`). It holds paths and process options only; the capture interval, cadence, OCR size and hotkeys are [settings](#settings). The keys `interval_seconds`, `capture_after_source_ready`, `ocr_max_side`, `manual_capture_hotkey`, `overlay_hotkey`, `overlay_mode_hotkey` and `overlay_state_path` are no longer read from the file; the first six are reported in the log with the setting that replaced them.
 
 The tray menu now exposes both capture cadences:
 - `Cadence: Fixed interval`: captures on the selected interval, but while a worker is running it skips a tick when its last frame is still waiting to be read (`skip capture reason=previous_frame_waiting` in the log). OCR of a full screen takes 30-50 s on the CPU, so a short interval no longer piles up spool PNGs the worker never reaches; it takes at most one frame ahead of the worker. `Capture now` and the hotkey always capture, and with no worker running frames are kept for a later `Process pending queue`.
 - `Cadence: After source ready`: waits until the daemon's last capture job has finished turning into a source before taking the next screenshot. An older backlog does not block it. This mode works best with `auto_start_worker = false` and `auto_process_jobs = true`.
-- `manual_capture_hotkey` in `desktop_capture_daemon\capture_daemon.toml`: binds a global shortcut to the same `Capture now` action in the tray. Example: `Ctrl+Shift+F8`.
+- Setting `hotkeys.manual_capture`: binds a global shortcut to the same `Capture now` action in the tray. Example: `set-setting hotkeys.manual_capture Ctrl+Shift+F8`, then `Restart app`.
 - `Capture languages`: a checkbox per registered language plus `Capture every language` and `Capture Japanese only`. The choice is stored in the database and shared with the web UI and the CLI.
 
 At the moment, the automatic worker is optimized for normal horizontal text in screenshots. It is not tuned for manga-style vertical text.
@@ -240,16 +285,18 @@ or Esc, to clear it; it also clears when the foreground window changes.
 While the overlay is up, **Ctrl+scroll wheel** or **Ctrl+= / Ctrl+-** (main or
 numpad keys) make the labels bigger or smaller, and **Ctrl+0** resets them. The
 current labels are redrawn at the new size without reading the screen again, and
-the size is saved (`scale` in `data/translate_overlay.toml`, 0.5x to 3x). These
+the size is saved (setting `overlay.scale`, 0.5x to 3x). These
 keys, like Esc, are only taken while the overlay is showing, so browser zoom
 works as usual the rest of the time.
 
 Tray menu, **Reading overlay**: switch it on or off, pick the mode, and choose
-"Read Japanese only (fast)" or the capture language set. Those choices live in
-`data/translate_overlay.toml`, shared by the tray and the overlay, so the menu
-and the mode hotkey stay in sync and nothing needs a restart. The overlay logs to
-`data/translate_overlay.log` ("Open overlay log" in the menu). Hotkeys are set in
-`capture_daemon.toml` (`overlay_hotkey`, `overlay_mode_hotkey`).
+"Read Japanese only (fast)" or the capture language set. Those choices are the
+`overlay.*` [settings](#settings), shared by the tray, the overlay and the
+`/settings` page, so the menu and the mode hotkey stay in sync and nothing needs
+a restart. The overlay logs to `data/translate_overlay.log` ("Open overlay log"
+in the menu). The hotkeys are the settings `hotkeys.overlay_toggle` and
+`hotkeys.overlay_mode`. A `data/translate_overlay.toml` left from before is no
+longer read.
 
 It also runs on its own:
 
@@ -259,10 +306,10 @@ It also runs on its own:
 ..\.venv-capture312\Scripts\python.exe .\translate_overlay.py --image .\data\ocr_bench\png\1159.png
 ```
 
-- Target language `en` (`--target`, `LANG_OVERLAY_TARGET`; `pt` switches to Portuguese). Lines already in the target language are left alone. Nothing is written to the catalog.
+- Target language `en` (setting `translation.overlay_language`, or `--target` for one run; `pt` switches to Portuguese). Lines already in the target language are left alone. Nothing is written to the catalog.
 - Japanese only (meikiocr) takes about 0.3 s of OCR on a 4K screen; the full
   22-language capture set also runs EasyOCR and takes about 12 s on CPU.
-  `--languages ja,en` overrides the state file.
+  `--languages ja,en` overrides the `overlay.languages` setting.
 - The overlay window is click-through and excluded from screen capture
   (`WDA_EXCLUDEFROMCAPTURE`), so the passive capture never OCRs it.
 - Translation uses the same Google endpoint as the source translation backlog. When it
@@ -323,6 +370,11 @@ py -3.12 .\single_image_ocr.py `
 - `list-flashcards`, `export-anki-tsv`, and `sync-anki` use the current `term_stats.priority_score`, so upload/review order stays aligned with the latest score instead of the original card creation id.
 - `sync-anki` also repositions existing Anki new cards by the current score when AnkiConnect exposes the custom `repositionNewCards` action.
 - `sync-anki` creates decks on demand and keeps track of the linked Anki note id.
+- `sync-anki` reads what the target decks already hold in a few requests, then sends only what differs (new notes, changed fields, misplaced cards, tag differences), about 100 changes per AnkiConnect `multi` request. A card Anki already has as the catalog wants it costs no request and is reported as `unchanged`.
+- `sync-knowledge` reads back how well each term and kanji is known from the review state of the exported cards (read-only; new cards are never fetched). It fills `knowledge_evidence` (one row per item and source) and `knowledge` (the consolidated status: `learning`, `young`, `mature`, `known`; no row means `unknown`). The web "Sincronizar com o Anki" action runs it as its last step.
+- `mark-known --term-id N` / `--kanji-id N` declares an item known whatever Anki says; `--clear` withdraws it. The term and kanji pages have the same button.
+- `list-terms --knowledge unknown` (also `list-kanji`, `/terms?knowledge=`, `/kanji?knowledge=`, `/api/terms?knowledge=`) lists what is next to learn, highest score first.
+- A new source of fluency data is a provider: a module implementing `knowledge.KnowledgeProvider` (see `knowledge_anki.py`) plus one entry in `knowledge_providers` in `lang_jp.py`. Pages and the API only read the consolidated `knowledge` table.
 - `sync-anki-words` regenerates vocabulary flashcards before syncing, so missing term cards are created and existing ones are refreshed in one step.
 - `generate-kanji-flashcards` and `sync-anki-kanji` use the word deck of the character's language (`Lang::Japanese` for kanji), so kanji and vocabulary share the same new-card queue. Both accept `--language`.
 - `refresh-kanji-metadata` fetches canonical kanji meanings plus `on/kun` readings from `kanjiapi.dev`.

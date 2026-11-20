@@ -51,6 +51,7 @@ from lang_jp import (
     update_source_record,
     upsert_source_translation,
 )
+from settings import load_settings
 
 
 REBUILD_POPULATION_SQL = """
@@ -419,12 +420,15 @@ def fill_missing_term_meanings(
     attempted = 0
     filled = 0
     empty_in_a_row = 0
+    settings = load_settings(connection)
     for row in terms_missing_meanings(connection, source_ids):
         if term_blacklist_reason(row["lemma"], reading=row["reading"], pos=row["pos"]):
             continue
         attempted += 1
         meaning_pt = normalize_token(
-            auto_translate_term_meaning_pt(row["lemma"], reading=row["reading"], pos=row["pos"])
+            auto_translate_term_meaning_pt(
+                row["lemma"], reading=row["reading"], pos=row["pos"], settings=settings
+            )
         )
         if not meaning_pt:
             empty_in_a_row += 1
@@ -558,10 +562,9 @@ def main() -> None:
     if not jmdict_db.is_file() and not (args.dry_run or args.skip_meanings):
         raise SystemExit(f"JMdict database not found: {jmdict_db}")
     lang_jp.JMDICT_DB_PATH = jmdict_db
-    # Promotion would look up each new term's meaning as it creates it; the meaning step
-    # after the loop does that once per term instead and stops if the translator is down.
-    auto_translate_term_meanings = lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS
-    lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = False
+    # Promotion never looks meanings up (auto_promote_source_terms creates terms without
+    # one); the meaning step after the loop does it once per term and stops if the
+    # translator is down.
     progress_path = args.progress_file or default_progress_path(db_path)
     capture_worker.DEFAULT_LOG_PATH = args.log_file or default_log_path(db_path)
 
@@ -648,7 +651,6 @@ def main() -> None:
                 if source_id in population_ids
             ]
             started_at = time.perf_counter()
-            lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = auto_translate_term_meanings
             attempted, filled, complete = fill_missing_term_meanings(connection, rebuilt_ids)
             print(
                 f"Filled {filled} of {attempted} missing term meanings "

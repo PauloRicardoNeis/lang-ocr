@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -15,6 +16,7 @@ import capture_worker
 import lang_jp
 from lang_jp import SCHEMA_PATH, db_connect
 from ocr_backends import OcrBlock, OcrEnginePlan, plausible_reading, recognize_with_shared_detection
+from settings import Settings, set_setting
 
 _LOG_DIR = tempfile.TemporaryDirectory()
 _LOG_PATCH = patch.object(capture_worker, "DEFAULT_LOG_PATH", Path(_LOG_DIR.name) / "worker.log")
@@ -102,7 +104,9 @@ class StubEngine:
         self._blocks = blocks
         self.calls = 0
 
-    def extract_blocks(self, image_path, *, prepared=False, progress_label=None, echo_stdout=False):
+    def extract_blocks(
+        self, image_path, *, prepared=False, progress_label=None, echo_stdout=False, settings=None
+    ):
         self.calls += 1
         return list(self._blocks)
 
@@ -163,7 +167,7 @@ class DominantLanguageTest(unittest.TestCase):
 
 class PipelineCacheTest(unittest.TestCase):
     def test_pipeline_reuses_adapters_and_analyzers_per_language_set(self) -> None:
-        with patch.object(capture_worker, "build_capture_ocr_adapter", side_effect=lambda name, enabled_languages: object()) as build:
+        with patch.object(capture_worker, "build_capture_ocr_adapter", side_effect=lambda name, enabled_languages, settings=None: object()) as build:
             pipeline = capture_worker.CapturePipeline()
             first = pipeline.ocr_for(("ja", "en"))
             second = pipeline.ocr_for(("ja", "en"))
@@ -177,6 +181,59 @@ class PipelineCacheTest(unittest.TestCase):
         self.assertIs(analyzer_a, analyzer_b)
         self.assertEqual(analyzer_forced.forced_language, "ko")
 
+    def test_engine_settings_reload_the_models_and_other_settings_do_not(self) -> None:
+        base = Settings.defaults({})
+        with (
+            patch.object(
+                capture_worker,
+                "build_capture_ocr_adapter",
+                side_effect=lambda name, enabled_languages, settings=None: object(),
+            ) as build,
+            patch.object(capture_worker, "clear_backend_cache") as clear_cache,
+            patch.object(capture_worker, "append_worker_log"),
+        ):
+            pipeline = capture_worker.CapturePipeline()
+            first = pipeline.ocr_for(("ja",), base)
+            same = pipeline.ocr_for(("ja",), base.replace(ocr__min_confidence=0.9, ocr__max_side=0))
+            self.assertEqual(clear_cache.call_count, 0)
+            reloaded = pipeline.ocr_for(("ja",), base.replace(ocr__backend="easyocr"))
+            on_cpu = pipeline.ocr_for(("ja",), base.replace(ocr__backend="easyocr", ocr__easyocr_gpu="cpu"))
+        self.assertIs(first, same)
+        self.assertIsNot(first, reloaded)
+        self.assertIsNot(reloaded, on_cpu)
+        self.assertEqual(clear_cache.call_count, 2)
+        self.assertEqual(build.call_count, 3)
+        self.assertEqual(build.call_args.kwargs["settings"]["ocr.easyocr_gpu"], "cpu")
+
+    def test_backend_comes_from_the_setting_unless_named(self) -> None:
+        easyocr = Settings.defaults({}).replace(ocr__backend="easyocr")
+        with (
+            patch.object(capture_worker, "EasyOcrAdapter") as legacy,
+            patch.object(capture_worker, "MeikiOcrAdapter") as meiki,
+        ):
+            capture_worker.build_capture_ocr_adapter(enabled_languages=("ja",), settings=easyocr)
+            self.assertEqual((legacy.call_count, meiki.call_count), (1, 0))
+            capture_worker.build_capture_ocr_adapter("meikiocr", enabled_languages=("ja",), settings=easyocr)
+            self.assertEqual((legacy.call_count, meiki.call_count), (1, 1))
+
+
+class EasyOcrFilterSettingsTest(unittest.TestCase):
+    def test_min_confidence_and_orientation_come_from_the_settings(self) -> None:
+        blocks = [block("Press START", 10, 10, 200, 40, conf=0.4), block("Options", 10, 60, 40, 200, conf=0.9)]
+        defaults = Settings.defaults({})
+        kept, stats = capture_worker.filter_easyocr_blocks(blocks, ("en",), settings=defaults)
+        self.assertEqual([item.text for item in kept], ["Press START"])
+        self.assertEqual(stats["vertical"], 1)
+
+        strict = defaults.replace(ocr__min_confidence=0.5)
+        kept, stats = capture_worker.filter_easyocr_blocks(blocks, ("en",), settings=strict)
+        self.assertEqual(kept, [])
+        self.assertEqual(stats["low_confidence"], 1)
+
+        any_shape = defaults.replace(ocr__horizontal_min_ratio=0.1, ocr__horizontal_max_angle=90)
+        kept, _ = capture_worker.filter_easyocr_blocks(blocks, ("en",), settings=any_shape)
+        self.assertEqual(sorted(item.text for item in kept), ["Options", "Press START"])
+
 
 class ProcessJobTest(unittest.TestCase):
     """The real worker loop with OCR replaced by a stub: window metadata, profiles, languages."""
@@ -185,8 +242,9 @@ class ProcessJobTest(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.db_path = self.root / "worker.sqlite3"
-        self._auto_translate = lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = False
+        # No network: term meanings are not machine-translated in these tests.
+        self._settings_env = patch.dict(os.environ, {"LANG_JP_AUTO_TRANSLATE_TERM_MEANINGS": "0"})
+        self._settings_env.start()
         connection = db_connect(self.db_path)
         try:
             connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -197,7 +255,7 @@ class ProcessJobTest(unittest.TestCase):
         capture_worker.DEFAULT_CAPTURE_DIR = self.root / "captures"
 
     def tearDown(self) -> None:
-        lang_jp.DEFAULT_AUTO_TRANSLATE_TERM_MEANINGS = self._auto_translate
+        self._settings_env.stop()
         capture_worker.DEFAULT_CAPTURE_DIR = self._capture_dir
         self.temp_dir.cleanup()
 
@@ -251,6 +309,61 @@ class ProcessJobTest(unittest.TestCase):
         self.assertEqual(source["game"], "Spanish RPG")
         self.assertEqual([row["language_code"] for row in segments], ["es"])
         self.assertEqual([(row["language_code"], row["lemma"]) for row in terms], [("es", "no"), ("es", "poder"), ("es", "ser")])
+
+    def run_spanish_job(self, name: str, pipeline, *, conf: float = 0.4) -> str:
+        """Enqueue and process one Spanish capture read at ``conf``; returns the job status."""
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            job_id = self.enqueue(connection, name, window_title="Menu", process_name="game.exe")
+            connection.commit()
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("No puede ser", 10, 10, 200, 40, conf=conf)])
+        with patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=pipeline)
+        connection = db_connect(self.db_path)
+        try:
+            return str(
+                connection.execute("SELECT status FROM capture_jobs WHERE id = ?", (job_id,)).fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+    def store_setting(self, key: str, value: object) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            set_setting(connection, key, value)
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_a_setting_changed_between_jobs_applies_to_the_next_job(self) -> None:
+        pipeline = capture_worker.CapturePipeline()
+        # Read at 0.4, below the default term confidence of 0.5: no candidates.
+        self.assertEqual(self.run_spanish_job("first", pipeline), "rejected")
+        self.store_setting("ocr.min_term_confidence", 0.3)
+        self.assertEqual(self.run_spanish_job("second", pipeline), "accepted")
+
+    def test_an_environment_pin_wins_over_the_stored_setting(self) -> None:
+        self.store_setting("ocr.min_term_confidence", 0.3)
+        with patch.dict(os.environ, {"LANG_JP_MIN_TERM_CONFIDENCE": "0.9"}):
+            status = self.run_spanish_job("pinned", capture_worker.CapturePipeline())
+        self.assertEqual(status, "rejected")
+
+    def test_auto_promotion_can_be_turned_off(self) -> None:
+        self.store_setting("capture.auto_promote_terms", False)
+        status = self.run_spanish_job("manual", capture_worker.CapturePipeline(), conf=0.9)
+        self.assertEqual(status, "accepted")
+        connection = db_connect(self.db_path)
+        try:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM terms").fetchone()[0], 0)
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM source_analysis_candidates WHERE approval_status = 'pending'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertGreater(pending, 0)
 
     def test_term_meanings_are_translated_without_holding_the_write_lock(self) -> None:
         connection = db_connect(self.db_path)
@@ -427,6 +540,119 @@ class ProcessJobTest(unittest.TestCase):
             connection.close()
         self.assertEqual(job["status"], "rejected")
         self.assertEqual((sources, terms), (0, 0))
+
+    def logged_entities(self, since: int) -> list[str]:
+        connection = db_connect(self.db_path)
+        try:
+            return [
+                row["entity"]
+                for row in connection.execute(
+                    "SELECT entity FROM catalog_changes WHERE id > ? ORDER BY id", (since,)
+                )
+            ]
+        finally:
+            connection.close()
+
+    def test_rejected_frames_log_only_job_changes(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            self.enqueue(connection, "blank", window_title="Desktop", process_name="explorer.exe")
+            connection.commit()
+            start = connection.execute("SELECT COALESCE(MAX(id), 0) FROM catalog_changes").fetchone()[0]
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("Seguir", 10, 10, 200, 40, conf=0.2)])
+        with patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        self.assertEqual(set(self.logged_entities(start)), {"job"})
+
+    def test_accepted_job_logs_its_source_and_terms_then_their_meanings(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            self.enqueue(connection, "menu", window_title="Menu", process_name="game.exe")
+            connection.commit()
+            start = connection.execute("SELECT COALESCE(MAX(id), 0) FROM catalog_changes").fetchone()[0]
+        finally:
+            connection.close()
+        stub = StubEngine("stub", [block("No puede ser", 10, 10, 200, 40, conf=0.9)])
+        with (
+            patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub),
+            patch.object(capture_worker, "auto_translate_term_meaning_pt", side_effect=lambda lemma, **_: f"pt:{lemma}"),
+        ):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        entities = self.logged_entities(start)
+        self.assertIn("source", entities)
+        self.assertIn("term", entities)
+        connection = db_connect(self.db_path)
+        try:
+            term_ids = {row[0] for row in connection.execute("SELECT id FROM terms")}
+            # The meanings are filled after the source commit; each fill logs its term.
+            last_source = connection.execute(
+                "SELECT MAX(id) FROM catalog_changes WHERE entity = 'source'"
+            ).fetchone()[0]
+            meaning_terms = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT entity_id FROM catalog_changes WHERE entity = 'term' AND id > ?", (last_source,)
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(meaning_terms, term_ids)
+
+    def test_job_row_follows_the_stage_the_worker_is_in(self) -> None:
+        connection = db_connect(self.db_path)
+        try:
+            lang_jp.set_capture_languages(connection, ["es"])
+            job_id = self.enqueue(connection, "menu", window_title="Menu", process_name="game.exe")
+            connection.commit()
+        finally:
+            connection.close()
+        seen: list[tuple[str, str]] = []
+        record = capture_worker.job_progress_recorder
+
+        def spy(db_path, recorded_job_id):
+            inner = record(db_path, recorded_job_id)
+
+            def stage(name: str) -> None:
+                inner(name)
+                check = db_connect(db_path)
+                try:
+                    row = check.execute(
+                        "SELECT status, progress_step FROM capture_jobs WHERE id = ?", (recorded_job_id,)
+                    ).fetchone()
+                finally:
+                    check.close()
+                seen.append((row["status"], row["progress_step"]))
+
+            return stage
+
+        stub = StubEngine("stub", [block("No puede ser", 10, 10, 200, 40, conf=0.9)])
+        with (
+            patch.object(capture_worker, "build_capture_ocr_adapter", return_value=stub),
+            patch.object(capture_worker, "job_progress_recorder", side_effect=spy),
+            patch.object(capture_worker, "auto_translate_term_meaning_pt", return_value="x"),
+        ):
+            capture_worker.process_job_once(self.db_path, translator=None, pipeline=capture_worker.CapturePipeline())
+        self.assertEqual(
+            seen,
+            [("processing", "ocr"), ("processing", "analyze"), ("processing", "save"), ("accepted", "meanings")],
+        )
+        connection = db_connect(self.db_path)
+        try:
+            job = connection.execute("SELECT progress_at FROM capture_jobs WHERE id = ?", (job_id,)).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNotNone(job["progress_at"])
+
+    def test_progress_failures_never_fail_the_job(self) -> None:
+        def broken(_stage: str) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        probe = capture_worker.WorkerJobProbe(1, on_progress=broken)
+        probe.begin("ocr")  # logged, not raised
 
 
 if __name__ == "__main__":

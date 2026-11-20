@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import languages
@@ -45,6 +46,7 @@ from lang_jp import (
     recalculate_term_stats,
     recover_stale_capture_jobs,
     resolve_repo_local_path,
+    set_capture_job_progress,
     stable_text_hash,
     store_segment_candidates,
     upsert_source_translation,
@@ -54,6 +56,7 @@ from ocr_backends import (
     EasyOcrBackend,
     OcrBlock,
     OcrEnginePlan,
+    clear_backend_cache,
     contains_japanese_chars,
     filter_ocr_line_boxes,
     get_easyocr_backend,
@@ -65,9 +68,11 @@ from ocr_backends import (
     plan_ocr_engines,
     recognize_with_shared_detection,
     resolve_capture_ocr_backend,
+    resolve_easyocr_languages,
     scale_ocr_blocks,
     sort_ocr_blocks_reading_order,
 )
+from settings import Settings, load_settings
 
 
 # The database decides which languages are captured (languages.capture_enabled);
@@ -80,44 +85,15 @@ DEFAULT_CAPTURE_LANGUAGES = languages.enabled_capture_languages(
 DEFAULT_CAPTURE_DIR = ROOT / "data" / "captures"
 DEFAULT_LOG_PATH = ROOT / "data" / "capture_daemon.log"
 DEFAULT_POLL_INTERVAL = 2.0
-DEFAULT_STALE_CAPTURE_JOB_HOURS = float(
-    os.environ.get("LANG_JP_CAPTURE_STALE_JOB_HOURS", "4")
-)
-DEBUG_ENABLED = os.environ.get("LANG_JP_CAPTURE_DEBUG") == "1"
-# LANG_JP_OCR_BACKEND picks the engine (meikiocr by default, easyocr for comparison).
-# The downscale, confidence, orientation and region settings below apply to EasyOCR only.
-DEFAULT_OCR_MAX_SIDE = int(os.environ.get("LANG_JP_OCR_MAX_SIDE", "1600"))
-# The multi-reader flow (EasyOCR readers sharing one detection pass) reads at up
-# to this size instead: desktop UI text shrunk to 1600px comes out as garbage
-# ("Ethossunor" for EthosSurvivor) and low confidence sends every box to every
-# reader. On a 4K capture full size was faster overall (40s vs 245s for 7 readers).
-DEFAULT_MULTI_OCR_MAX_SIDE = int(os.environ.get("LANG_JP_MULTI_OCR_MAX_SIDE", "3840"))
-DEFAULT_OCR_PROGRESS_INTERVAL = float(os.environ.get("LANG_JP_OCR_PROGRESS_INTERVAL", "5"))
-DEFAULT_OCR_MIN_CONFIDENCE = float(os.environ.get("LANG_JP_OCR_MIN_CONFIDENCE", "0.30"))
-# A box read with at least this confidence by one EasyOCR reader is not sent to the next ones.
-DEFAULT_OCR_CONFIDENT_READ = float(os.environ.get("LANG_JP_OCR_CONFIDENT_READ", "0.7"))
-DEFAULT_OCR_HORIZONTAL_MIN_RATIO = float(os.environ.get("LANG_JP_OCR_HORIZONTAL_MIN_RATIO", "1.2"))
-DEFAULT_OCR_HORIZONTAL_MAX_ANGLE = float(os.environ.get("LANG_JP_OCR_HORIZONTAL_MAX_ANGLE", "18"))
-DEFAULT_OCR_REGION_PADDING = int(os.environ.get("LANG_JP_OCR_REGION_PADDING", "12"))
-DEFAULT_OCR_MAX_REGIONS = int(os.environ.get("LANG_JP_OCR_MAX_REGIONS", "3"))
-# Non-Japanese OCR lines read below this confidence keep their segment but give
-# no candidates: on real screens they are mostly garbage ("Lcqallc", "Googic").
-DEFAULT_MIN_TERM_CONFIDENCE = float(os.environ.get("LANG_JP_MIN_TERM_CONFIDENCE", "0.5"))
-# Windows whose captures are rejected before OCR live in the database
+# Every tunable of the capture (OCR backend and thresholds, image sizes, the
+# translation switches, the debug log, ...) is a setting: settings.py declares
+# them and the ``settings`` table stores them. A job reads one ``Settings``
+# snapshot when it is claimed and hands it down, so a change made from the web
+# UI, the tray or the CLI applies to the next job without restarting the worker.
+# Callers without a database (diagnostics, tests) get ``Settings.defaults()``.
+# Windows whose captures are rejected before OCR live in the database too
 # (``capture_skip_rules``, empty by default); see the "Capture blacklist"
 # section of lang_jp.py for every rule that skips or rejects a capture.
-DEFAULT_AUTO_PROMOTE_SOURCE_TERMS = (
-    os.environ.get("LANG_JP_AUTO_PROMOTE_SOURCE_TERMS", "1") != "0"
-)
-# Source translations are made on demand from the web UI (the "Traduzir" button
-# on a source page). Set LANG_JP_ENABLE_SOURCE_TRANSLATION=1 to go back to
-# queueing one for every capture.
-DEFAULT_ENABLE_SOURCE_TRANSLATION = (
-    os.environ.get("LANG_JP_ENABLE_SOURCE_TRANSLATION", "0") == "1"
-)
-DEFAULT_SOURCE_TRANSLATION_TARGET = os.environ.get(
-    "LANG_JP_SOURCE_TRANSLATION_TARGET", "en"
-)
 JOB_PROGRESS_BAR_WIDTH = 12
 JOB_PROGRESS_PERCENT_BY_STEP_STATUS: dict[tuple[str, str | None], int] = {
     ("start", None): 0,
@@ -326,9 +302,25 @@ class DiagnosticProbe:
 
 
 class WorkerJobProbe:
-    def __init__(self, job_id: int) -> None:
+    """Times one job: ``mark`` logs a finished step, ``begin`` reports the stage now running.
+
+    ``on_progress`` receives each ``begin`` stage (the worker stores it on the
+    job row for the live capture page); a failure there is logged, never raised,
+    since progress reporting must not fail a capture.
+    """
+
+    def __init__(self, job_id: int, *, on_progress: Callable[[str], None] | None = None) -> None:
         self._job_id = job_id
         self._started_at = time.perf_counter()
+        self._on_progress = on_progress
+
+    def begin(self, stage: str) -> None:
+        if self._on_progress is None:
+            return
+        try:
+            self._on_progress(stage)
+        except Exception as exc:  # noqa: BLE001 - progress is best effort
+            append_worker_log(build_log_event(job_log_prefix(self._job_id, "progress"), stage=stage, error=exc))
 
     def elapsed_ms(self) -> int:
         return int((time.perf_counter() - self._started_at) * 1000)
@@ -356,7 +348,7 @@ class WorkerJobProbe:
 class GoogleGtxSourceTranslator:
     provider_name = "google_gtx"
 
-    def __init__(self, *, target_language: str = DEFAULT_SOURCE_TRANSLATION_TARGET) -> None:
+    def __init__(self, *, target_language: str) -> None:
         self.target_language = target_language
 
     def translate_lines(self, lines: list[str], *, source_language: str = "ja") -> str:
@@ -417,6 +409,33 @@ def contains_japanese_text(value: str | None) -> bool:
 def resolve_capture_languages(connection) -> tuple[str, ...]:
     """Languages the worker keeps right now: env override, else the database flags."""
     return capture_language_codes(connection)
+
+
+def read_settings(db_path: Path) -> Settings:
+    """The current settings snapshot, on a connection of its own."""
+    connection = db_connect(db_path)
+    try:
+        return load_settings(connection)
+    finally:
+        connection.close()
+
+
+def engine_settings_key(settings: Settings) -> tuple[object, ...]:
+    """The settings baked into loaded OCR models; a change means reloading them."""
+    return (
+        settings["ocr.backend"],
+        settings["ocr.easyocr_gpu"],
+        settings["ocr.easyocr_languages"],
+    )
+
+
+def source_translator(settings: Settings) -> "GoogleGtxSourceTranslator | None":
+    """The translator that queues a translation for every capture, when that is on."""
+    if not settings["translation.translate_every_capture"]:
+        return None
+    return GoogleGtxSourceTranslator(
+        target_language=str(settings["translation.source_language"])
+    )
 
 
 def resolve_job_languages(
@@ -504,8 +523,11 @@ def delete_if_exists(path: Path) -> None:
         pass
 
 
-def prepare_ocr_input_image(image_path: Path) -> tuple[Path, str | None, Path | None]:
-    max_side = DEFAULT_OCR_MAX_SIDE
+def prepare_ocr_input_image(
+    image_path: Path,
+    *,
+    max_side: int,
+) -> tuple[Path, str | None, Path | None]:
     if max_side <= 0:
         return image_path, None, None
 
@@ -647,7 +669,7 @@ def run_with_progress_logs(
     func,
     *,
     echo_stdout: bool = False,
-    interval_seconds: float = DEFAULT_OCR_PROGRESS_INTERVAL,
+    interval_seconds: float,
 ):
     started_at = time.perf_counter()
     rss_mb, private_mb = current_process_memory_mb()
@@ -704,8 +726,13 @@ def run_with_progress_logs(
 
 def filter_easyocr_blocks(
     blocks: list[OcrBlock],
-    enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+    enabled_languages: tuple[str, ...],
+    *,
+    settings: Settings,
 ) -> tuple[list[OcrBlock], dict[str, int]]:
+    min_confidence = float(settings["ocr.min_confidence"])  # type: ignore[arg-type]
+    min_ratio = float(settings["ocr.horizontal_min_ratio"])  # type: ignore[arg-type]
+    max_angle = float(settings["ocr.horizontal_max_angle"])  # type: ignore[arg-type]
     stats = {
         "detected": len(blocks),
         "kept": 0,
@@ -721,7 +748,7 @@ def filter_easyocr_blocks(
         if not text:
             stats["empty"] += 1
             continue
-        if block.confidence is not None and block.confidence < DEFAULT_OCR_MIN_CONFIDENCE:
+        if block.confidence is not None and block.confidence < min_confidence:
             stats["low_confidence"] += 1
             continue
         if not contains_target_language_text(text, enabled_languages=enabled_languages):
@@ -732,8 +759,8 @@ def filter_easyocr_blocks(
             continue
         if not is_horizontal_bbox(
             block.bbox,
-            min_ratio=DEFAULT_OCR_HORIZONTAL_MIN_RATIO,
-            max_abs_angle_degrees=DEFAULT_OCR_HORIZONTAL_MAX_ANGLE,
+            min_ratio=min_ratio,
+            max_abs_angle_degrees=max_angle,
         ):
             stats["vertical"] += 1
             continue
@@ -765,7 +792,7 @@ def crop_image_region(
     top: int,
     right: int,
     bottom: int,
-    padding: int = DEFAULT_OCR_REGION_PADDING,
+    padding: int,
 ):
     width, height = image.size
     return image.crop(
@@ -827,10 +854,10 @@ def score_region(
 
 
 class EasyOcrAdapter:
-    """Legacy single-engine EasyOCR flow (``LANG_JP_OCR_BACKEND=easyocr``).
+    """Legacy single-engine EasyOCR flow (setting ``ocr.backend`` = easyocr).
 
     Reads the downscaled capture, groups boxes into regions, re-reads the best
-    regions and keeps the top ones. Languages come from ``LANG_JP_EASYOCR_LANGS``.
+    regions and keeps the top ones. Languages come from ``ocr.easyocr_languages``.
     """
 
     downscales_input = True
@@ -839,9 +866,14 @@ class EasyOcrAdapter:
         self,
         *,
         enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+        settings: Settings | None = None,
     ) -> None:
+        settings = settings or Settings.defaults()
         self.enabled_languages = tuple(enabled_languages) or (DEFAULT_LANGUAGE_CODE,)
-        self._engine = EasyOcrBackend()
+        self._engine = EasyOcrBackend(
+            resolve_easyocr_languages(str(settings["ocr.easyocr_languages"])),
+            gpu_mode=str(settings["ocr.easyocr_gpu"]),
+        )
         append_worker_log(
             build_log_event(
                 "worker",
@@ -851,10 +883,6 @@ class EasyOcrAdapter:
                 gpu_mode=getattr(self._engine, "gpu_mode", None),
                 languages=",".join(getattr(self._engine, "languages", ())),
                 capture_languages=",".join(self.enabled_languages),
-                min_conf=DEFAULT_OCR_MIN_CONFIDENCE,
-                min_ratio=DEFAULT_OCR_HORIZONTAL_MIN_RATIO,
-                max_angle=DEFAULT_OCR_HORIZONTAL_MAX_ANGLE,
-                max_regions=DEFAULT_OCR_MAX_REGIONS,
             )
         )
 
@@ -865,25 +893,36 @@ class EasyOcrAdapter:
         prepared: bool = False,
         progress_label: str | None = None,
         echo_stdout: bool = False,
+        settings: Settings | None = None,
     ) -> list[OcrBlock]:
+        settings = settings or Settings.defaults()
         cleanup_path: Path | None = None
         if not prepared:
-            image_path, note, cleanup_path = prepare_ocr_input_image(image_path)
+            image_path, note, cleanup_path = prepare_ocr_input_image(
+                image_path, max_side=int(settings["ocr.max_side"])  # type: ignore[call-overload]
+            )
             if note:
                 append_worker_log(prefix_log_context(progress_label, note))
+        max_regions = int(settings["ocr.max_regions"])  # type: ignore[call-overload]
+        interval_seconds = float(settings["ocr.progress_interval_seconds"])  # type: ignore[arg-type]
 
         def do_read() -> list[OcrBlock]:
             return self._engine.read_blocks(image_path)
 
         label = progress_label or build_log_event("step=ocr", image=image_path)
         try:
-            detected_blocks = run_with_progress_logs(label, do_read, echo_stdout=echo_stdout)
-            kept_blocks, stats = filter_easyocr_blocks(detected_blocks, self.enabled_languages)
+            detected_blocks = run_with_progress_logs(
+                label, do_read, echo_stdout=echo_stdout, interval_seconds=interval_seconds
+            )
+            kept_blocks, stats = filter_easyocr_blocks(
+                detected_blocks, self.enabled_languages, settings=settings
+            )
             grouped_regions = group_ocr_blocks_into_regions(kept_blocks)
             append_worker_log(
                 build_log_event(
                     label,
                     status="filter",
+                    min_conf=settings["ocr.min_confidence"],
                     boxes=stats["detected"],
                     kept=stats["kept"],
                     regions=len(grouped_regions),
@@ -914,10 +953,11 @@ class EasyOcrAdapter:
                         top=region.top,
                         right=region.right,
                         bottom=region.bottom,
+                        padding=int(settings["ocr.region_padding"]),  # type: ignore[call-overload]
                     )
                     rerun_blocks = self._engine.read_blocks(crop)
                     rerun_kept_blocks, rerun_stats = filter_easyocr_blocks(
-                        rerun_blocks, self.enabled_languages
+                        rerun_blocks, self.enabled_languages, settings=settings
                     )
                     region_text = "\n".join(block.text for block in rerun_kept_blocks if block.text)
                     region_confidence: float | None = None
@@ -948,7 +988,7 @@ class EasyOcrAdapter:
                         image_height=image_height,
                         blocks_in_region=len(region.blocks),
                     )
-                    if DEBUG_ENABLED:
+                    if settings["capture.debug_log"]:
                         append_worker_log(
                             build_log_event(
                                 label,
@@ -973,15 +1013,15 @@ class EasyOcrAdapter:
                         )
                     )
                 scored_regions.sort(key=lambda item: item[0], reverse=True)
-                if DEFAULT_OCR_MAX_REGIONS > 0:
-                    scored_regions = scored_regions[:DEFAULT_OCR_MAX_REGIONS]
+                if max_regions > 0:
+                    scored_regions = scored_regions[:max_regions]
                 final_blocks = sort_ocr_blocks_reading_order([item[2] for item in scored_regions])
             append_worker_log(
                 build_log_event(
                     label,
                     status="select",
                     regions=len(final_blocks),
-                    limit=DEFAULT_OCR_MAX_REGIONS,
+                    limit=max_regions,
                     scores=",".join(f"{item[0]:.2f}" for item in scored_regions),
                 )
             )
@@ -1010,7 +1050,6 @@ class MeikiOcrAdapter:
                 step="ocr_init",
                 engine="meikiocr",
                 provider=self._engine.provider,
-                min_char_conf=self._engine.min_char_confidence,
             )
         )
 
@@ -1021,13 +1060,24 @@ class MeikiOcrAdapter:
         prepared: bool = False,
         progress_label: str | None = None,
         echo_stdout: bool = False,
+        settings: Settings | None = None,
     ) -> list[OcrBlock]:
+        settings = settings or Settings.defaults()
         # `prepared` is accepted for parity with EasyOcrAdapter; there is no input to prepare.
+        min_char_confidence = float(settings["ocr.meikiocr_min_char_confidence"])  # type: ignore[arg-type]
+
         def do_read():
-            return self._engine.read_line_boxes(image_path)
+            return self._engine.read_line_boxes(
+                image_path, min_char_confidence=min_char_confidence
+            )
 
         label = progress_label or build_log_event("step=ocr", image=image_path)
-        line_boxes = run_with_progress_logs(label, do_read, echo_stdout=echo_stdout)
+        line_boxes = run_with_progress_logs(
+            label,
+            do_read,
+            echo_stdout=echo_stdout,
+            interval_seconds=float(settings["ocr.progress_interval_seconds"]),  # type: ignore[arg-type]
+        )
         kept_boxes, stats = filter_ocr_line_boxes(line_boxes, language_codes=("ja",))
         blocks = [
             block.with_text(normalize_token(block.text))
@@ -1049,7 +1099,7 @@ class MeikiOcrAdapter:
         return blocks
 
 
-def downscale_for_easyocr(image, *, max_side: int = DEFAULT_OCR_MAX_SIDE):
+def downscale_for_easyocr(image, *, max_side: int):
     """``(image, factor)``: the image EasyOCR reads and how to map its boxes back."""
     from PIL import Image
 
@@ -1080,11 +1130,12 @@ class EasyOcrGroupAdapter:
         group: tuple[str, ...],
         *,
         enabled_languages: tuple[str, ...] = DEFAULT_CAPTURE_LANGUAGES,
+        gpu_mode: str | None = None,
     ) -> None:
         self.group = tuple(group)
         self.enabled_languages = tuple(enabled_languages) or (DEFAULT_LANGUAGE_CODE,)
         self.engine_name = "easyocr:" + "+".join(self.group)
-        self._engine = get_easyocr_backend(self.group)
+        self._engine = get_easyocr_backend(self.group, gpu_mode=gpu_mode)
         append_worker_log(
             build_log_event(
                 "worker",
@@ -1092,8 +1143,6 @@ class EasyOcrGroupAdapter:
                 engine=self.engine_name,
                 gpu=getattr(self._engine, "gpu_enabled", None),
                 capture_languages=",".join(self.enabled_languages),
-                min_conf=DEFAULT_OCR_MIN_CONFIDENCE,
-                max_side=DEFAULT_OCR_MAX_SIDE,
             )
         )
 
@@ -1104,30 +1153,40 @@ class EasyOcrGroupAdapter:
         prepared: bool = False,
         progress_label: str | None = None,
         echo_stdout: bool = False,
+        settings: Settings | None = None,
     ) -> list[OcrBlock]:
+        settings = settings or Settings.defaults()
         try:
             from PIL import Image
         except ImportError as exc:
             raise SystemExit("Pillow is required to prepare OCR input images.") from exc
 
         label = progress_label or build_log_event("step=ocr", image=image_path)
+        max_side = int(settings["ocr.max_side"])  # type: ignore[call-overload]
 
         def do_read() -> tuple[list[OcrBlock], float]:
             with Image.open(image_path) as image_file:
                 rgb = image_file.convert("RGB")
-            target, factor = downscale_for_easyocr(rgb)
+            target, factor = downscale_for_easyocr(rgb, max_side=max_side)
             return self._engine.read_blocks(target), factor
 
         detected_blocks, factor = run_with_progress_logs(
-            f"{label} engine={self.engine_name}", do_read, echo_stdout=echo_stdout
+            f"{label} engine={self.engine_name}",
+            do_read,
+            echo_stdout=echo_stdout,
+            interval_seconds=float(settings["ocr.progress_interval_seconds"]),  # type: ignore[arg-type]
         )
-        kept_blocks, stats = filter_easyocr_blocks(detected_blocks, self.enabled_languages)
+        kept_blocks, stats = filter_easyocr_blocks(
+            detected_blocks, self.enabled_languages, settings=settings
+        )
         blocks = scale_ocr_blocks(kept_blocks, factor)
         append_worker_log(
             build_log_event(
                 label,
                 status="filter",
                 engine=self.engine_name,
+                min_conf=settings["ocr.min_confidence"],
+                max_side=max_side,
                 boxes=stats["detected"],
                 kept=stats["kept"],
                 drop_off_lang=stats["off_language"],
@@ -1154,6 +1213,7 @@ class MultiEngineOcrAdapter:
         plan: OcrEnginePlan,
         *,
         enabled_languages: tuple[str, ...] | None = None,
+        gpu_mode: str | None = None,
     ) -> None:
         self.plan = plan
         self.enabled_languages = tuple(enabled_languages or plan.language_codes)
@@ -1162,7 +1222,9 @@ class MultiEngineOcrAdapter:
             self.engines.append(MeikiOcrAdapter())
         for group in plan.easyocr_groups:
             self.engines.append(
-                EasyOcrGroupAdapter(group, enabled_languages=self.enabled_languages)
+                EasyOcrGroupAdapter(
+                    group, enabled_languages=self.enabled_languages, gpu_mode=gpu_mode
+                )
             )
         self.engine_name = "+".join(engine.engine_name for engine in self.engines) or "none"
         append_worker_log(
@@ -1186,6 +1248,7 @@ class MultiEngineOcrAdapter:
         *,
         label: str,
         echo_stdout: bool,
+        settings: Settings,
     ) -> list[OcrBlock]:
         """All EasyOCR readers over one shared detection pass (see ``recognize_with_shared_detection``)."""
         engines = self.easyocr_engines
@@ -1196,10 +1259,12 @@ class MultiEngineOcrAdapter:
         except ImportError as exc:
             raise SystemExit("Pillow is required to prepare OCR input images.") from exc
 
+        max_side = int(settings["ocr.multi_max_side"])  # type: ignore[call-overload]
+
         def do_read() -> tuple[list[OcrBlock], float]:
             with Image.open(image_path) as image_file:
                 rgb = image_file.convert("RGB")
-            target, factor = downscale_for_easyocr(rgb, max_side=DEFAULT_MULTI_OCR_MAX_SIDE)
+            target, factor = downscale_for_easyocr(rgb, max_side=max_side)
             color, grey = EasyOcrBackend.prepare_arrays(target)
 
             def on_pass(backend, sent: int, improved: int) -> None:
@@ -1217,21 +1282,28 @@ class MultiEngineOcrAdapter:
                 [engine._engine for engine in engines],
                 color,
                 grey,
-                confident=DEFAULT_OCR_CONFIDENT_READ,
+                confident=float(settings["ocr.confident_read"]),  # type: ignore[arg-type]
                 on_pass=on_pass,
             )
             return blocks, factor
 
         engine_label = "easyocr:" + "|".join("+".join(engine.group) for engine in engines)
         detected_blocks, factor = run_with_progress_logs(
-            f"{label} engine={engine_label}", do_read, echo_stdout=echo_stdout
+            f"{label} engine={engine_label}",
+            do_read,
+            echo_stdout=echo_stdout,
+            interval_seconds=float(settings["ocr.progress_interval_seconds"]),  # type: ignore[arg-type]
         )
-        kept_blocks, stats = filter_easyocr_blocks(detected_blocks, self.enabled_languages)
+        kept_blocks, stats = filter_easyocr_blocks(
+            detected_blocks, self.enabled_languages, settings=settings
+        )
         append_worker_log(
             build_log_event(
                 label,
                 status="filter",
                 engine=engine_label,
+                min_conf=settings["ocr.min_confidence"],
+                max_side=max_side,
                 boxes=stats["detected"],
                 kept=stats["kept"],
                 drop_off_lang=stats["off_language"],
@@ -1250,7 +1322,9 @@ class MultiEngineOcrAdapter:
         prepared: bool = False,
         progress_label: str | None = None,
         echo_stdout: bool = False,
+        settings: Settings | None = None,
     ) -> list[OcrBlock]:
+        settings = settings or Settings.defaults()
         label = progress_label or build_log_event("step=ocr", image=image_path)
         groups: list[list[OcrBlock]] = []
         names: list[str] = []
@@ -1264,11 +1338,16 @@ class MultiEngineOcrAdapter:
                         prepared=prepared,
                         progress_label=progress_label,
                         echo_stdout=echo_stdout,
+                        settings=settings,
                     )
                 )
                 names.append(getattr(engine, "engine_name", type(engine).__name__))
         if self.easyocr_engines:
-            groups.append(self._read_easyocr_groups(image_path, label=label, echo_stdout=echo_stdout))
+            groups.append(
+                self._read_easyocr_groups(
+                    image_path, label=label, echo_stdout=echo_stdout, settings=settings
+                )
+            )
             names.append("easyocr")
         merged = merge_engine_blocks(groups)
         append_worker_log(
@@ -1290,21 +1369,26 @@ def build_capture_ocr_adapter(
     name: str | None = None,
     *,
     enabled_languages: tuple[str, ...] | None = None,
+    settings: Settings | None = None,
 ) -> CaptureOcrAdapter:
     """OCR engines for the enabled languages (plan item C4).
 
+    The backend is ``name`` when given, otherwise the ``ocr.backend`` setting.
     ``auto`` (default): meikiocr alone for a Japanese-only set, otherwise
     meikiocr plus one EasyOCR reader per compatible language group, merged.
     ``meikiocr`` / ``easyocr`` force the old single-engine flows.
     """
+    settings = settings or Settings.defaults()
     codes = tuple(enabled_languages or DEFAULT_CAPTURE_LANGUAGES)
-    backend = resolve_capture_ocr_backend(name)
+    backend = resolve_capture_ocr_backend(name or str(settings["ocr.backend"]))
     if backend == "easyocr":
-        return EasyOcrAdapter(enabled_languages=codes)
+        return EasyOcrAdapter(enabled_languages=codes, settings=settings)
     plan = plan_ocr_engines(codes, backend=backend)
     if plan.use_meikiocr and not plan.easyocr_groups:
         return MeikiOcrAdapter()
-    return MultiEngineOcrAdapter(plan, enabled_languages=codes)
+    return MultiEngineOcrAdapter(
+        plan, enabled_languages=codes, gpu_mode=str(settings["ocr.easyocr_gpu"])
+    )
 
 
 class LanguageSegmentAnalyzer:
@@ -1345,12 +1429,18 @@ class LanguageSegmentAnalyzer:
         self,
         connection,
         blocks: list[OcrBlock],
+        *,
+        settings: Settings | None = None,
     ) -> list[list[tuple[dict[str, Any], list[dict[str, Any]]]]]:
         """Analyze a whole screen: its Latin text as a whole settles the short strings."""
+        settings = settings or Settings.defaults()
         prior = None
         if self.forced_language is None:
             prior = languages.latin_language_prior(block.text for block in blocks)
-        return [self.analyze_block(connection, block, prior=prior) for block in blocks]
+        return [
+            self.analyze_block(connection, block, prior=prior, settings=settings)
+            for block in blocks
+        ]
 
     def analyze_block(
         self,
@@ -1358,10 +1448,13 @@ class LanguageSegmentAnalyzer:
         block: OcrBlock,
         *,
         prior: str | None = None,
+        settings: Settings | None = None,
     ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
         normalized_text = normalize_token(block.text)
         if not normalized_text:
             return []
+        settings = settings or Settings.defaults()
+        min_term_confidence = float(settings["ocr.min_term_confidence"])  # type: ignore[arg-type]
         runs = languages.analyze_text(
             normalized_text,
             language=self.forced_language or languages.AUTO_LANGUAGE_CODE,
@@ -1392,7 +1485,7 @@ class LanguageSegmentAnalyzer:
             tokens = run.tokens
             if (
                 block.confidence is not None
-                and block.confidence < DEFAULT_MIN_TERM_CONFIDENCE
+                and block.confidence < min_term_confidence
                 and languages.base_language_code(run.language_code) != DEFAULT_LANGUAGE_CODE
             ):
                 tokens = []
@@ -1436,18 +1529,48 @@ class CapturePipeline:
     profiles), so each job asks for the adapter matching its languages. Readers
     are cached inside ``ocr_backends`` as well, so switching sets never reloads
     a model that is already in memory.
+
+    The engine settings (backend, GPU mode, legacy EasyOCR languages) are baked
+    into loaded models. When a job arrives with different ones, every adapter
+    and cached reader is dropped and rebuilt for the new values.
     """
 
     def __init__(self, *, backend: str | None = None) -> None:
+        # A backend name given here pins it, whatever the ``ocr.backend`` setting says.
         self.backend = backend
+        self._engine_key: tuple[object, ...] | None = None
         self._adapters: dict[tuple[str, ...], CaptureOcrAdapter] = {}
         self._analyzers: dict[tuple[tuple[str, ...], str | None], LanguageSegmentAnalyzer] = {}
 
-    def ocr_for(self, codes: tuple[str, ...]) -> CaptureOcrAdapter:
+    def _sync_engines(self, settings: Settings) -> None:
+        key = engine_settings_key(settings)
+        if self._engine_key is not None and key != self._engine_key:
+            self._adapters.clear()
+            clear_backend_cache()
+            append_worker_log(
+                build_log_event(
+                    "worker",
+                    step="engines_reload",
+                    backend=settings["ocr.backend"],
+                    gpu_mode=settings["ocr.easyocr_gpu"],
+                    easyocr_languages=settings["ocr.easyocr_languages"],
+                )
+            )
+        self._engine_key = key
+
+    def ocr_for(
+        self,
+        codes: tuple[str, ...],
+        settings: Settings | None = None,
+    ) -> CaptureOcrAdapter:
+        settings = settings or Settings.defaults()
+        self._sync_engines(settings)
         key = tuple(codes) or (DEFAULT_LANGUAGE_CODE,)
         adapter = self._adapters.get(key)
         if adapter is None:
-            adapter = build_capture_ocr_adapter(self.backend, enabled_languages=key)
+            adapter = build_capture_ocr_adapter(
+                self.backend, enabled_languages=key, settings=settings
+            )
             self._adapters[key] = adapter
         return adapter
 
@@ -1469,9 +1592,10 @@ class CapturePipeline:
         connection = db_connect(db_path)
         try:
             codes = resolve_capture_languages(connection)
+            settings = load_settings(connection)
         finally:
             connection.close()
-        self.ocr_for(codes)
+        self.ocr_for(codes, settings)
         self.analyzer_for(codes)
         return codes
 
@@ -1583,9 +1707,15 @@ def skipped_capture_window(
     return capture_skip_reason(patterns, window_title=window_title, process_name=process_name)
 
 
-def auto_promote_source_terms(connection, source_id: int) -> tuple[int, int]:
-    """Promote a new source's candidates without marking it reviewed (LANG_JP_AUTO_PROMOTE_SOURCE_TERMS)."""
-    if not DEFAULT_AUTO_PROMOTE_SOURCE_TERMS:
+def auto_promote_source_terms(
+    connection,
+    source_id: int,
+    *,
+    settings: Settings | None = None,
+) -> tuple[int, int]:
+    """Promote a new source's candidates without marking it reviewed (setting ``capture.auto_promote_terms``)."""
+    settings = settings or load_settings(connection)
+    if not settings["capture.auto_promote_terms"]:
         return 0, 0
     # Only words the language's dictionary knows are promoted automatically; OCR
     # misreadings ("Frobably", "Ethossunor") stay pending for review. Languages
@@ -1625,6 +1755,7 @@ def fill_source_term_meanings(db_path: Path, source_id: int) -> int:
             """,
             (source_id,),
         ).fetchall()
+        settings = load_settings(connection)
         filled = 0
         for row in rows:
             # No transaction is open while the translator is called.
@@ -1634,6 +1765,7 @@ def fill_source_term_meanings(db_path: Path, source_id: int) -> int:
                     reading=row["reading"],
                     pos=row["pos"],
                     language_code=row["language_code"],
+                    settings=settings,
                 )
             )
             if not meaning_pt:
@@ -1654,6 +1786,20 @@ def fill_source_term_meanings(db_path: Path, source_id: int) -> int:
         connection.close()
 
 
+def job_progress_recorder(db_path: Path, job_id: int) -> Callable[[str], None]:
+    """Store each stage a job enters on its row, in a short write of its own."""
+
+    def record(stage: str) -> None:
+        connection = db_connect(db_path)
+        try:
+            set_capture_job_progress(connection, job_id=job_id, step=stage)
+            connection.commit()
+        finally:
+            connection.close()
+
+    return record
+
+
 def process_job_once(
     db_path: Path,
     *,
@@ -1661,6 +1807,7 @@ def process_job_once(
     analyzer: LanguageSegmentAnalyzer | None = None,
     translator: GoogleGtxSourceTranslator | None,
     pipeline: CapturePipeline | None = None,
+    settings: Settings | None = None,
 ) -> bool:
     """Process one capture job.
 
@@ -1668,10 +1815,15 @@ def process_job_once(
     database capture set and the matching OCR adapter and analyzer are picked per
     job. Explicit ``ocr``/``analyzer`` arguments pin them instead (tests, forced
     single-engine runs).
+
+    The job runs on one ``settings`` snapshot: the caller's, or the one read
+    from the database when the job is claimed.
     """
     connection = db_connect(db_path)
     try:
         job = claim_next_capture_job(connection)
+        if job is not None and settings is None:
+            settings = load_settings(connection)
         window_title = job_field(job, "window_title") if job is not None else None
         process_name = job_field(job, "process_name") if job is not None else None
         enabled_languages: tuple[str, ...]
@@ -1692,18 +1844,19 @@ def process_job_once(
         connection.close()
     if job is None:
         return False
+    assert settings is not None
 
     if ocr is None or analyzer is None:
         active_pipeline = pipeline or CapturePipeline()
         if ocr is None:
-            ocr = active_pipeline.ocr_for(enabled_languages)
+            ocr = active_pipeline.ocr_for(enabled_languages, settings)
         if analyzer is None:
             analyzer = active_pipeline.analyzer_for(
                 enabled_languages, forced_language=forced_language
             )
 
     job_id = int(job["id"])
-    probe = WorkerJobProbe(job_id)
+    probe = WorkerJobProbe(job_id, on_progress=job_progress_recorder(db_path, job_id))
     temp_image_path = resolve_repo_local_path(job["temp_image_path"])
     if temp_image_path is None:
         temp_image_path = Path(str(job["temp_image_path"]))
@@ -1787,9 +1940,11 @@ def process_job_once(
         finally:
             connection.close()
 
+        probe.begin("ocr")
         blocks = ocr.extract_blocks(
             temp_image_path,
             progress_label=job_log_prefix(job_id, "ocr"),
+            settings=settings,
         )
         normalized_blocks, raw_text = blocks_with_text(blocks)
         ocr_text_hash = stable_text_hash(raw_text)
@@ -1806,9 +1961,12 @@ def process_job_once(
         )
         analyzed_blocks: list[list[tuple[dict[str, Any], list[dict[str, Any]]]]] = []
         if target_found:
+            probe.begin("analyze")
             connection = db_connect(db_path)
             try:
-                analyzed_blocks = analyzer.analyze_blocks(connection, normalized_blocks)
+                analyzed_blocks = analyzer.analyze_blocks(
+                    connection, normalized_blocks, settings=settings
+                )
             finally:
                 connection.close()
             # Text that passed the quick check can still turn out to be in a language
@@ -1845,6 +2003,7 @@ def process_job_once(
             )
             return True
 
+        probe.begin("save")
         final_path = build_capture_path(captured_at, image_sha256)
         final_path.parent.mkdir(parents=True, exist_ok=True)
         if final_path.exists():
@@ -1909,6 +2068,7 @@ def process_job_once(
             promoted_terms, promoted_candidates = auto_promote_source_terms(
                 connection,
                 source_id,
+                settings=settings,
             )
             probe.mark(
                 "promote",
@@ -1928,6 +2088,7 @@ def process_job_once(
         finally:
             connection.close()
         if promoted_terms:
+            probe.begin("meanings")
             probe.mark("meanings", filled=fill_source_term_meanings(db_path, source_id))
         if translator is not None and raw_text:
             connection = db_connect(db_path)
@@ -2180,21 +2341,25 @@ def diagnose_image(
         probe.mark("image_decoded", note=f"size={image.width}x{image.height} mode={image.mode}")
 
     enabled_languages = DEFAULT_CAPTURE_LANGUAGES
+    settings = Settings.defaults()
     if db_path.exists():
         connection = db_connect(db_path)
         try:
             enabled_languages = resolve_capture_languages(connection)
+            settings = load_settings(connection)
         finally:
             connection.close()
     probe.mark("languages", note=f"languages={','.join(enabled_languages)}")
 
     probe.mark("before_ocr_init")
-    ocr = build_capture_ocr_adapter(enabled_languages=enabled_languages)
+    ocr = build_capture_ocr_adapter(enabled_languages=enabled_languages, settings=settings)
     probe.mark("after_ocr_init")
 
     probe.mark("before_ocr_predict")
     if ocr.downscales_input:
-        ocr_input_path, resize_note, cleanup_path = prepare_ocr_input_image(image_path)
+        ocr_input_path, resize_note, cleanup_path = prepare_ocr_input_image(
+            image_path, max_side=int(settings["ocr.max_side"])  # type: ignore[call-overload]
+        )
     else:
         ocr_input_path, resize_note, cleanup_path = image_path, None, None
     if resize_note:
@@ -2205,6 +2370,7 @@ def diagnose_image(
             prepared=True,
             progress_label=build_log_event("diagnose", step="ocr", image=ocr_input_path),
             echo_stdout=True,
+            settings=settings,
         )
     finally:
         if cleanup_path is not None:
@@ -2231,7 +2397,7 @@ def diagnose_image(
         candidate_total = 0
         with db_connect(db_path) as connection:
             for block in normalized_blocks:
-                for _, candidates in analyzer.analyze_block(connection, block):
+                for _, candidates in analyzer.analyze_block(connection, block, settings=settings):
                     candidate_total += len(candidates)
         probe.mark(
             "after_analysis",
@@ -2263,8 +2429,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recover-stale-after-hours",
         type=float,
-        default=DEFAULT_STALE_CAPTURE_JOB_HOURS,
-        help="Recover processing jobs older than this threshold before starting normal work.",
+        default=None,
+        help=(
+            "Recover processing jobs older than this threshold before starting normal work "
+            "(default: the capture.stale_job_hours setting)."
+        ),
     )
     parser.add_argument(
         "--no-recover-stale-jobs",
@@ -2312,8 +2481,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    boot_settings = read_settings(args.db) if args.db.exists() else Settings.defaults()
     append_worker_log(
-        f"capture worker booted mode={args.command} db={args.db} debug={DEBUG_ENABLED}"
+        f"capture worker booted mode={args.command} db={args.db} "
+        f"debug={bool(boot_settings['capture.debug_log'])}"
     )
     if args.mode == "diagnose":
         diagnose_image(
@@ -2325,9 +2496,12 @@ def main() -> None:
         return
 
     if not args.no_recover_stale_jobs:
+        stale_after_hours = args.recover_stale_after_hours
+        if stale_after_hours is None:
+            stale_after_hours = float(boot_settings["capture.stale_job_hours"])  # type: ignore[arg-type]
         recover_stale_capture_jobs_on_startup(
             args.db,
-            older_than_hours=args.recover_stale_after_hours,
+            older_than_hours=stale_after_hours,
         )
 
     # Engines and analyzers are picked per job from the database capture set (and
@@ -2342,17 +2516,29 @@ def main() -> None:
             override=os.environ.get(CAPTURE_LANGUAGES_ENV) or None,
         )
     )
-    translator = (
-        GoogleGtxSourceTranslator(target_language=DEFAULT_SOURCE_TRANSLATION_TARGET)
-        if DEFAULT_ENABLE_SOURCE_TRANSLATION
-        else None
-    )
+
+    def run_queues_once() -> tuple[bool, bool, Settings]:
+        """One pass over both queues on a fresh settings snapshot: (job, translation, settings)."""
+        settings = read_settings(args.db)
+        translator = source_translator(settings)
+        if process_job_once(
+            args.db, translator=translator, pipeline=pipeline, settings=settings
+        ):
+            return True, False, settings
+        translated = process_pending_translation_once(args.db, translator=translator)
+        return False, translated, settings
 
     if args.mode == "once":
-        processed = process_job_once(args.db, translator=translator, pipeline=pipeline)
+        settings = read_settings(args.db)
+        processed = process_job_once(
+            args.db,
+            translator=source_translator(settings),
+            pipeline=pipeline,
+            settings=settings,
+        )
         if not processed:
             print("No pending capture jobs.")
-            if DEBUG_ENABLED:
+            if settings["capture.debug_log"]:
                 append_worker_log("capture worker idle: no pending capture jobs")
         return
 
@@ -2360,15 +2546,10 @@ def main() -> None:
         drained_jobs = 0
         drained_translations = 0
         while True:
-            processed = process_job_once(
-                args.db,
-                translator=translator,
-                pipeline=pipeline,
-            )
+            processed, translated, _ = run_queues_once()
             if processed:
                 drained_jobs += 1
                 continue
-            translated = process_pending_translation_once(args.db, translator=translator)
             if translated:
                 drained_translations += 1
                 continue
@@ -2380,22 +2561,13 @@ def main() -> None:
 
     idle_polls = 0
     while True:
-        processed = process_job_once(
-            args.db,
-            translator=translator,
-            pipeline=pipeline,
-        )
-        if processed:
-            idle_polls = 0
-            continue
-
-        translated = process_pending_translation_once(args.db, translator=translator)
-        if translated:
+        processed, translated, settings = run_queues_once()
+        if processed or translated:
             idle_polls = 0
             continue
 
         idle_polls += 1
-        if DEBUG_ENABLED and idle_polls >= 15:
+        if settings["capture.debug_log"] and idle_polls >= 15:
             append_worker_log(
                 "capture worker idle: still waiting for pending capture jobs or translations"
             )
